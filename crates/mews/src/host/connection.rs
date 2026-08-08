@@ -1,0 +1,943 @@
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, RwLock},
+};
+
+use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
+use serde_json::Value;
+use tokio::sync::{Semaphore, mpsc, oneshot};
+
+use mews_agent::{
+    AgentCapabilities, CancellationToken, ContextDocument, ContextSnapshot, LifecycleHook,
+    ProgressReporter, ToolCall, ToolResult,
+};
+use mews_host::ToolRegistry;
+use mews_protocol::{
+    AcpEvent, Agent, AgentReplica, AgentRevision, HarnessDescriptor, HostId, HostToHub, HubToHost,
+    HubTransferStart, RequestId, ToolDefinition,
+};
+
+use super::lifecycle::handle_host_request_streaming;
+
+enum HostReply {
+    Tool(Value),
+    Directory(std::path::PathBuf),
+    AgentSynchronized,
+    AgentReplica(Option<AgentReplica>),
+    ProjectContext(String),
+    Hook(Value),
+    Prompt(Option<String>),
+    HubTransfer(Option<u64>),
+    Configured,
+    Harnesses(Vec<HarnessDescriptor>),
+    Acp(mews_acp::AcpSessionOutcome),
+}
+struct PendingRequest {
+    reply: oneshot::Sender<Result<HostReply, String>>,
+    acp_events: Option<mpsc::UnboundedSender<AcpEvent>>,
+}
+type PendingRequests = Arc<std::sync::Mutex<HashMap<RequestId, PendingRequest>>>;
+
+pub struct RemoteAcpRun {
+    pub harness: String,
+    pub harness_options: std::collections::BTreeMap<String, String>,
+    pub tools: Vec<String>,
+    pub cwd: std::path::PathBuf,
+    pub prompt: String,
+    pub recovery_prompt: String,
+    pub session_id: Option<String>,
+}
+
+#[async_trait]
+pub trait HostControl: Send + Sync {
+    fn host_id(&self) -> &HostId;
+    fn harness_descriptor(&self, name: &str) -> Option<HarnessDescriptor>;
+    async fn attest_directory(&self, path: &Path) -> Result<std::path::PathBuf>;
+    async fn synchronize_agent(
+        &self,
+        agent: &Agent,
+        revision: &AgentRevision,
+        expected_replica: Option<&AgentReplica>,
+    ) -> Result<()>;
+    async fn agent_replica(&self, slug: &str) -> Result<Option<AgentReplica>>;
+    async fn begin_hub_transfer(&self, transfer: HubTransferStart) -> Result<()>;
+    async fn write_hub_transfer(&self, offset: u64, data: Vec<u8>) -> Result<u64>;
+    async fn commit_hub_transfer(&self) -> Result<()>;
+    async fn arm_hub_transfer(&self, move_nonce: &str) -> Result<()>;
+    async fn activate_hub_transfer(&self) -> Result<()>;
+    async fn configure_relay(
+        &self,
+        active: bool,
+        stop_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<()>;
+    async fn update_relay_candidates(&self, relay_urls: Vec<String>) -> Result<()>;
+    async fn refresh_harness_catalog(&self) -> Result<Vec<HarnessDescriptor>>;
+    async fn run_acp(
+        &self,
+        run: RemoteAcpRun,
+        events: mpsc::UnboundedSender<AcpEvent>,
+    ) -> Result<mews_acp::AcpSessionOutcome>;
+    async fn resolve_acp_permission(
+        &self,
+        permission_id: String,
+        option_id: Option<String>,
+    ) -> Result<()>;
+    async fn acknowledge_acp_session_binding(&self, acknowledgement_id: String) -> Result<()>;
+}
+
+/// Composition boundary for a connected Host that provides both control-plane
+/// operations and the neutral execution environment used by agent runs.
+pub trait HostExecutor: HostControl + AgentCapabilities {
+    fn agent_capabilities(&self) -> &dyn AgentCapabilities;
+}
+
+impl<T: HostControl + AgentCapabilities> HostExecutor for T {
+    fn agent_capabilities(&self) -> &dyn AgentCapabilities {
+        self
+    }
+}
+
+/// Hub-side handle for any Host transport. Only serialized protocol frames
+/// cross this boundary; tools remain owned by the Host.
+pub struct ConnectedHost {
+    id: HostId,
+    tools: Arc<RwLock<Vec<ToolDefinition>>>,
+    harnesses: Arc<RwLock<Vec<HarnessDescriptor>>>,
+    sender: mpsc::Sender<HubToHost>,
+    pending: PendingRequests,
+    capacity: Arc<Semaphore>,
+}
+
+impl ConnectedHost {
+    pub(crate) fn tool_catalog(&self) -> Vec<ToolDefinition> {
+        self.tools
+            .read()
+            .expect("Host tool catalog poisoned")
+            .clone()
+    }
+
+    /// The most recently published Host-local Harness catalog. This is live
+    /// connection state, not durable Hub configuration.
+    pub(crate) fn harness_catalog(&self) -> Vec<HarnessDescriptor> {
+        self.harnesses
+            .read()
+            .expect("Host Harness catalog poisoned")
+            .clone()
+    }
+
+    pub(crate) async fn execute_tool(
+        &self,
+        tool: &str,
+        arguments: Value,
+        cwd: &Path,
+    ) -> Result<Value> {
+        match self
+            .request(HubToHost::ExecuteTool {
+                request_id: RequestId::new(),
+                tool: tool.to_owned(),
+                arguments,
+                canonical_cwd: cwd.to_path_buf(),
+            })
+            .await?
+        {
+            HostReply::Tool(value) => Ok(value),
+            _ => bail!("Host returned the wrong response type"),
+        }
+    }
+
+    async fn execute_hook(&self, hook: &str, payload: Value, cwd: &Path) -> Result<Value> {
+        match self
+            .request(HubToHost::ExecuteHook {
+                request_id: RequestId::new(),
+                hook: hook.to_owned(),
+                payload,
+                canonical_cwd: cwd.to_path_buf(),
+            })
+            .await?
+        {
+            HostReply::Hook(payload) => Ok(payload),
+            _ => bail!("Host returned the wrong response type"),
+        }
+    }
+
+    async fn fetch_project_context(&self, cwd: &Path) -> Result<String> {
+        match self
+            .request(HubToHost::ReadProjectContext {
+                request_id: RequestId::new(),
+                canonical_cwd: cwd.to_path_buf(),
+            })
+            .await?
+        {
+            HostReply::ProjectContext(context) => Ok(context),
+            _ => bail!("Host returned the wrong response type"),
+        }
+    }
+
+    async fn fetch_prompt(&self, cwd: &Path, name: &str) -> Result<Option<String>> {
+        match self
+            .request(HubToHost::ReadPrompt {
+                request_id: RequestId::new(),
+                name: name.to_owned(),
+                canonical_cwd: cwd.to_path_buf(),
+            })
+            .await?
+        {
+            HostReply::Prompt(content) => Ok(content),
+            _ => bail!("Host returned the wrong response type"),
+        }
+    }
+
+    pub async fn in_process(id: HostId, registry: ToolRegistry) -> Result<Self> {
+        let tools = registry.definitions();
+        let harnesses = mews_host::HarnessCatalog::discover(None)?.descriptors();
+        let (hub_sender, host_receiver) = mpsc::channel(32);
+        let (host_sender, hub_receiver) = mpsc::channel(32);
+        tokio::spawn(serve_host(
+            registry,
+            harnesses.clone(),
+            host_receiver,
+            host_sender,
+        ));
+        Self::from_channels_with_catalog(id, tools, harnesses, hub_sender, hub_receiver).await
+    }
+
+    pub async fn from_channels(
+        id: HostId,
+        initial_tools: Vec<ToolDefinition>,
+        sender: mpsc::Sender<HubToHost>,
+        receiver: mpsc::Receiver<HostToHub>,
+    ) -> Result<Self> {
+        Self::from_channels_with_catalog(id, initial_tools, Vec::new(), sender, receiver).await
+    }
+
+    pub async fn from_channels_with_catalog(
+        id: HostId,
+        initial_tools: Vec<ToolDefinition>,
+        initial_harnesses: Vec<HarnessDescriptor>,
+        sender: mpsc::Sender<HubToHost>,
+        mut receiver: mpsc::Receiver<HostToHub>,
+    ) -> Result<Self> {
+        let tools = Arc::new(RwLock::new(initial_tools));
+        let harnesses = Arc::new(RwLock::new(initial_harnesses));
+        let pending: PendingRequests = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let response_tools = Arc::clone(&tools);
+        let response_harnesses = Arc::clone(&harnesses);
+        let response_pending = Arc::clone(&pending);
+        tokio::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                // Enforce the same versioned and bounded boundary used by a
+                // network Host even when both ends share this process.
+                let message = match mews_protocol::encode(message)
+                    .and_then(|bytes| mews_protocol::decode(&bytes))
+                {
+                    Ok(message) => message,
+                    Err(_) => break,
+                };
+                match message {
+                    HostToHub::ConfigurationResult { request_id, error } => {
+                        if let Some(reply) = response_pending
+                            .lock()
+                            .expect("Host pending requests poisoned")
+                            .remove(&request_id)
+                        {
+                            let _ = reply
+                                .reply
+                                .send(error.map_or(Ok(HostReply::Configured), Err));
+                        }
+                    }
+                    HostToHub::Ready { tools, harnesses } => {
+                        *response_tools.write().expect("Host tool catalog poisoned") = tools;
+                        *response_harnesses
+                            .write()
+                            .expect("Host Harness catalog poisoned") = harnesses;
+                    }
+                    HostToHub::ToolCatalogChanged { tools } => {
+                        *response_tools.write().expect("Host tool catalog poisoned") = tools;
+                    }
+                    HostToHub::HarnessCatalogChanged { harnesses } => {
+                        *response_harnesses
+                            .write()
+                            .expect("Host Harness catalog poisoned") = harnesses;
+                    }
+                    HostToHub::HarnessCatalog {
+                        request_id,
+                        harnesses,
+                        error,
+                    } => {
+                        if error.is_none() {
+                            *response_harnesses
+                                .write()
+                                .expect("Host Harness catalog poisoned") = harnesses.clone();
+                        }
+                        if let Some(reply) = response_pending
+                            .lock()
+                            .expect("Host pending requests poisoned")
+                            .remove(&request_id)
+                        {
+                            let _ = reply
+                                .reply
+                                .send(error.map_or(Ok(HostReply::Harnesses(harnesses)), Err));
+                        }
+                    }
+                    HostToHub::ToolResult {
+                        request_id,
+                        result,
+                        error,
+                    } => {
+                        if let Some(reply) = response_pending
+                            .lock()
+                            .expect("Host pending requests poisoned")
+                            .remove(&request_id)
+                        {
+                            let _ = reply
+                                .reply
+                                .send(error.map_or(Ok(HostReply::Tool(result)), Err));
+                        }
+                    }
+                    HostToHub::HookResult {
+                        request_id,
+                        payload,
+                        error,
+                    } => {
+                        if let Some(reply) = response_pending
+                            .lock()
+                            .expect("Host pending requests poisoned")
+                            .remove(&request_id)
+                        {
+                            let result = match (payload, error) {
+                                (Some(payload), None) => Ok(HostReply::Hook(payload)),
+                                (_, Some(error)) => Err(error),
+                                _ => Err("Host returned an empty hook result".into()),
+                            };
+                            let _ = reply.reply.send(result);
+                        }
+                    }
+                    HostToHub::AcpResult {
+                        request_id,
+                        answer,
+                        acp_session_id,
+                        session_replaced,
+                        error,
+                    } => {
+                        if let Some(pending) = response_pending
+                            .lock()
+                            .expect("Host pending requests poisoned")
+                            .remove(&request_id)
+                        {
+                            let result = match (answer, acp_session_id, error) {
+                                (Some(answer), Some(session_id), None) => {
+                                    Ok(HostReply::Acp(mews_acp::AcpSessionOutcome {
+                                        answer,
+                                        session_id,
+                                        session_replaced,
+                                    }))
+                                }
+                                (_, _, Some(error)) => Err(error),
+                                _ => Err("Host returned an empty ACP result".into()),
+                            };
+                            let _ = pending.reply.send(result);
+                        }
+                    }
+                    HostToHub::AcpEvent { request_id, event } => {
+                        if let Some(sender) = response_pending
+                            .lock()
+                            .expect("Host pending requests poisoned")
+                            .get(&request_id)
+                            .and_then(|pending| pending.acp_events.as_ref())
+                        {
+                            let _ = sender.send(event);
+                        }
+                    }
+                    HostToHub::AcpPermissionRequested {
+                        request_id,
+                        request,
+                    } => {
+                        if let Some(sender) = response_pending
+                            .lock()
+                            .expect("Host pending requests poisoned")
+                            .get(&request_id)
+                            .and_then(|pending| pending.acp_events.as_ref())
+                        {
+                            let _ = sender.send(AcpEvent::PermissionRequested { request });
+                        }
+                    }
+                    HostToHub::DirectoryAttested {
+                        request_id,
+                        canonical_path,
+                        error,
+                    } => {
+                        if let Some(reply) = response_pending
+                            .lock()
+                            .expect("Host pending requests poisoned")
+                            .remove(&request_id)
+                        {
+                            let response = match (canonical_path, error) {
+                                (Some(path), None) => Ok(HostReply::Directory(path)),
+                                (_, Some(error)) => Err(error),
+                                _ => Err("Host returned an invalid directory attestation".into()),
+                            };
+                            let _ = reply.reply.send(response);
+                        }
+                    }
+                    HostToHub::AgentSynchronized { request_id, error } => {
+                        if let Some(reply) = response_pending
+                            .lock()
+                            .expect("Host pending requests poisoned")
+                            .remove(&request_id)
+                        {
+                            let _ = reply
+                                .reply
+                                .send(error.map_or(Ok(HostReply::AgentSynchronized), Err));
+                        }
+                    }
+                    HostToHub::AgentReplica {
+                        request_id,
+                        replica,
+                        error,
+                    } => {
+                        if let Some(reply) = response_pending
+                            .lock()
+                            .expect("Host pending requests poisoned")
+                            .remove(&request_id)
+                        {
+                            let _ = reply
+                                .reply
+                                .send(error.map_or(Ok(HostReply::AgentReplica(replica)), Err));
+                        }
+                    }
+                    HostToHub::ProjectContext {
+                        request_id,
+                        context,
+                        error,
+                    } => {
+                        if let Some(reply) = response_pending
+                            .lock()
+                            .expect("Host pending requests poisoned")
+                            .remove(&request_id)
+                        {
+                            let response = match (context, error) {
+                                (Some(context), None) => Ok(HostReply::ProjectContext(context)),
+                                (_, Some(error)) => Err(error),
+                                _ => Err("Host returned invalid project context".into()),
+                            };
+                            let _ = reply.reply.send(response);
+                        }
+                    }
+                    HostToHub::Prompt {
+                        request_id,
+                        content,
+                        error,
+                    } => {
+                        if let Some(reply) = response_pending
+                            .lock()
+                            .expect("Host pending requests poisoned")
+                            .remove(&request_id)
+                        {
+                            let _ = reply
+                                .reply
+                                .send(error.map_or(Ok(HostReply::Prompt(content)), Err));
+                        }
+                    }
+                    HostToHub::HubTransferResult {
+                        request_id,
+                        next_offset,
+                        error,
+                    } => {
+                        if let Some(reply) = response_pending
+                            .lock()
+                            .expect("Host pending requests poisoned")
+                            .remove(&request_id)
+                        {
+                            let _ = reply
+                                .reply
+                                .send(error.map_or(Ok(HostReply::HubTransfer(next_offset)), Err));
+                        }
+                    }
+                    HostToHub::Pong { .. } => {}
+                }
+            }
+            for (_, reply) in response_pending
+                .lock()
+                .expect("Host pending requests poisoned")
+                .drain()
+            {
+                let _ = reply.reply.send(Err("Host disconnected".into()));
+            }
+        });
+        Ok(Self {
+            id,
+            tools,
+            harnesses,
+            sender,
+            pending,
+            capacity: Arc::new(Semaphore::new(32)),
+        })
+    }
+}
+
+#[async_trait]
+impl HostControl for ConnectedHost {
+    fn host_id(&self) -> &HostId {
+        &self.id
+    }
+
+    fn harness_descriptor(&self, name: &str) -> Option<HarnessDescriptor> {
+        self.harness_catalog()
+            .into_iter()
+            .find(|descriptor| descriptor.name == name)
+    }
+
+    async fn attest_directory(&self, path: &Path) -> Result<std::path::PathBuf> {
+        match self
+            .request(HubToHost::AttestDirectory {
+                request_id: RequestId::new(),
+                path: path.to_path_buf(),
+            })
+            .await?
+        {
+            HostReply::Directory(path) => Ok(path),
+            HostReply::Tool(_) => bail!("Host returned the wrong response type"),
+            HostReply::AgentSynchronized => bail!("Host returned the wrong response type"),
+            HostReply::AgentReplica(_) => bail!("Host returned the wrong response type"),
+            HostReply::ProjectContext(_) => bail!("Host returned the wrong response type"),
+            HostReply::Hook(_) => bail!("Host returned the wrong response type"),
+            HostReply::HubTransfer(_) => bail!("Host returned the wrong response type"),
+            HostReply::Configured => bail!("Host returned the wrong response type"),
+            HostReply::Prompt(_) => bail!("Host returned the wrong response type"),
+            HostReply::Harnesses(_) => bail!("Host returned the wrong response type"),
+            HostReply::Acp(_) => bail!("Host returned the wrong response type"),
+        }
+    }
+
+    async fn synchronize_agent(
+        &self,
+        agent: &Agent,
+        revision: &AgentRevision,
+        expected_replica: Option<&AgentReplica>,
+    ) -> Result<()> {
+        match self
+            .request(HubToHost::SynchronizeAgent {
+                request_id: RequestId::new(),
+                agent: agent.clone(),
+                revision: revision.clone(),
+                expected_replica: expected_replica.cloned(),
+            })
+            .await?
+        {
+            HostReply::AgentSynchronized => Ok(()),
+            _ => bail!("Host returned the wrong response type"),
+        }
+    }
+
+    async fn agent_replica(&self, slug: &str) -> Result<Option<AgentReplica>> {
+        match self
+            .request(HubToHost::ReadAgentReplica {
+                request_id: RequestId::new(),
+                slug: slug.to_owned(),
+            })
+            .await?
+        {
+            HostReply::AgentReplica(replica) => Ok(replica),
+            _ => bail!("Host returned the wrong response type"),
+        }
+    }
+
+    async fn begin_hub_transfer(&self, transfer: HubTransferStart) -> Result<()> {
+        match self
+            .request(HubToHost::BeginHubTransfer {
+                request_id: RequestId::new(),
+                transfer,
+            })
+            .await?
+        {
+            HostReply::HubTransfer(None) => Ok(()),
+            _ => bail!("Host returned the wrong response type"),
+        }
+    }
+
+    async fn write_hub_transfer(&self, offset: u64, data: Vec<u8>) -> Result<u64> {
+        match self
+            .request(HubToHost::WriteHubTransfer {
+                request_id: RequestId::new(),
+                offset,
+                data,
+            })
+            .await?
+        {
+            HostReply::HubTransfer(Some(offset)) => Ok(offset),
+            _ => bail!("Host returned the wrong response type"),
+        }
+    }
+
+    async fn commit_hub_transfer(&self) -> Result<()> {
+        match self
+            .request(HubToHost::CommitHubTransfer {
+                request_id: RequestId::new(),
+            })
+            .await?
+        {
+            HostReply::HubTransfer(None) => Ok(()),
+            _ => bail!("Host returned the wrong response type"),
+        }
+    }
+
+    async fn arm_hub_transfer(&self, move_nonce: &str) -> Result<()> {
+        match self
+            .request(HubToHost::ArmHubTransfer {
+                request_id: RequestId::new(),
+                move_nonce: move_nonce.to_owned(),
+            })
+            .await?
+        {
+            HostReply::HubTransfer(None) => Ok(()),
+            _ => bail!("Host returned the wrong response type"),
+        }
+    }
+
+    async fn activate_hub_transfer(&self) -> Result<()> {
+        match self
+            .request(HubToHost::ActivateHubTransfer {
+                request_id: RequestId::new(),
+            })
+            .await?
+        {
+            HostReply::HubTransfer(None) => Ok(()),
+            _ => bail!("Host returned the wrong response type"),
+        }
+    }
+
+    async fn configure_relay(
+        &self,
+        active: bool,
+        stop_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<()> {
+        match self
+            .request(HubToHost::ConfigureRelay {
+                request_id: RequestId::new(),
+                active,
+                stop_at,
+            })
+            .await?
+        {
+            HostReply::Configured => Ok(()),
+            _ => bail!("Host returned the wrong response type"),
+        }
+    }
+
+    async fn update_relay_candidates(&self, relay_urls: Vec<String>) -> Result<()> {
+        match self
+            .request(HubToHost::UpdateRelayCandidates {
+                request_id: RequestId::new(),
+                relay_urls,
+            })
+            .await?
+        {
+            HostReply::Configured => Ok(()),
+            _ => bail!("Host returned the wrong response type"),
+        }
+    }
+
+    async fn refresh_harness_catalog(&self) -> Result<Vec<HarnessDescriptor>> {
+        match self
+            .request(HubToHost::RefreshHarnessCatalog {
+                request_id: RequestId::new(),
+            })
+            .await?
+        {
+            HostReply::Harnesses(harnesses) => Ok(harnesses),
+            _ => bail!("Host returned the wrong response type"),
+        }
+    }
+
+    async fn run_acp(
+        &self,
+        run: RemoteAcpRun,
+        events: mpsc::UnboundedSender<AcpEvent>,
+    ) -> Result<mews_acp::AcpSessionOutcome> {
+        let reply = self
+            .request_with_events(
+                HubToHost::RunAcp {
+                    request_id: RequestId::new(),
+                    harness: run.harness,
+                    harness_options: run.harness_options,
+                    tools: run.tools,
+                    canonical_cwd: run.cwd,
+                    prompt: run.prompt,
+                    recovery_prompt: run.recovery_prompt,
+                    acp_session_id: run.session_id,
+                },
+                events,
+            )
+            .await?;
+        match reply {
+            HostReply::Acp(answer) => Ok(answer),
+            _ => bail!("Host returned the wrong response type"),
+        }
+    }
+
+    async fn resolve_acp_permission(
+        &self,
+        permission_id: String,
+        option_id: Option<String>,
+    ) -> Result<()> {
+        self.sender
+            .send(HubToHost::ResolveAcpPermission {
+                permission_id,
+                option_id,
+            })
+            .await
+            .context("Host disconnected")
+    }
+
+    async fn acknowledge_acp_session_binding(&self, acknowledgement_id: String) -> Result<()> {
+        self.sender
+            .send(HubToHost::AcknowledgeAcpSessionBinding { acknowledgement_id })
+            .await
+            .context("Host disconnected")
+    }
+}
+
+#[async_trait(?Send)]
+impl AgentCapabilities for ConnectedHost {
+    async fn context(&self, cwd: &Path) -> Result<ContextSnapshot> {
+        let content = self.fetch_project_context(cwd).await?;
+        Ok(ContextSnapshot {
+            documents: vec![ContextDocument {
+                path: cwd.join("<host-context>"),
+                content,
+            }],
+            ..ContextSnapshot::default()
+        })
+    }
+
+    async fn read_prompt(&self, cwd: &Path, name: &str) -> Result<Option<String>> {
+        self.fetch_prompt(cwd, name).await
+    }
+
+    fn tools(&self) -> Vec<mews_agent::ToolDefinition> {
+        self.tool_catalog()
+    }
+
+    fn extension_tools(&self) -> Vec<mews_agent::ToolDefinition> {
+        // The Host protocol currently publishes one catalog. Its four native
+        // MEWS names are fixed and extensions may not shadow them, so this is
+        // a safe projection until the protocol carries a separate catalog.
+        self.tool_catalog()
+            .into_iter()
+            .filter(|tool| !matches!(tool.name.as_str(), "read" | "write" | "edit" | "bash"))
+            .collect()
+    }
+
+    async fn execute(
+        &self,
+        call: &ToolCall,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+        _progress: &dyn ProgressReporter,
+    ) -> Result<ToolResult> {
+        cancellation.check()?;
+        Ok(ToolResult::success(
+            self.execute_tool(&call.name, call.arguments.clone(), cwd)
+                .await?,
+        ))
+    }
+
+    async fn hook(&self, hook: LifecycleHook, payload: Value, cwd: &Path) -> Result<Value> {
+        let name = match hook {
+            LifecycleHook::RunStart => "run_start",
+            LifecycleHook::BeforeModel => "before_model",
+            LifecycleHook::BeforeTool => "before_tool",
+            LifecycleHook::AfterTool => "after_tool",
+            LifecycleHook::AfterTurn => "after_turn",
+            LifecycleHook::RunEnd => "run_end",
+        };
+        self.execute_hook(name, payload, cwd).await
+    }
+}
+
+impl ConnectedHost {
+    async fn request(&self, request: HubToHost) -> Result<HostReply> {
+        self.request_inner(request, None).await
+    }
+
+    async fn request_with_events(
+        &self,
+        request: HubToHost,
+        events: mpsc::UnboundedSender<AcpEvent>,
+    ) -> Result<HostReply> {
+        self.request_inner(request, Some(events)).await
+    }
+
+    async fn request_inner(
+        &self,
+        request: HubToHost,
+        acp_events: Option<mpsc::UnboundedSender<AcpEvent>>,
+    ) -> Result<HostReply> {
+        let request = mews_protocol::decode(&mews_protocol::encode(request)?)?;
+        let request_id = match &request {
+            HubToHost::ExecuteTool { request_id, .. }
+            | HubToHost::ExecuteHook { request_id, .. }
+            | HubToHost::AttestDirectory { request_id, .. } => request_id.clone(),
+            HubToHost::SynchronizeAgent { request_id, .. } => request_id.clone(),
+            HubToHost::ReadAgentReplica { request_id, .. } => request_id.clone(),
+            HubToHost::ReadProjectContext { request_id, .. } => request_id.clone(),
+            HubToHost::ReadPrompt { request_id, .. } => request_id.clone(),
+            HubToHost::RefreshHarnessCatalog { request_id } => request_id.clone(),
+            HubToHost::RunAcp { request_id, .. } => request_id.clone(),
+            HubToHost::BeginHubTransfer { request_id, .. }
+            | HubToHost::WriteHubTransfer { request_id, .. }
+            | HubToHost::CommitHubTransfer { request_id }
+            | HubToHost::ArmHubTransfer { request_id, .. }
+            | HubToHost::ActivateHubTransfer { request_id } => request_id.clone(),
+            HubToHost::ConfigureRelay { request_id, .. }
+            | HubToHost::UpdateRelayCandidates { request_id, .. } => request_id.clone(),
+            HubToHost::Ping { .. } => bail!("Ping is not a correlated Host request"),
+            HubToHost::ResolveAcpPermission { .. } => {
+                bail!("permission decisions are not correlated Host requests")
+            }
+            HubToHost::AcknowledgeAcpSessionBinding { .. } => {
+                bail!("ACP Session acknowledgements are not correlated Host requests")
+            }
+        };
+        let _permit = self.capacity.acquire().await.context("Host link closed")?;
+        let (sender, receiver) = oneshot::channel();
+        self.pending
+            .lock()
+            .expect("Host pending requests poisoned")
+            .insert(
+                request_id.clone(),
+                PendingRequest {
+                    reply: sender,
+                    acp_events,
+                },
+            );
+        let _completion = PendingCompletion {
+            request_id,
+            pending: Arc::clone(&self.pending),
+        };
+        self.sender
+            .send(request)
+            .await
+            .context("Host disconnected")?;
+        tokio::time::timeout(std::time::Duration::from_secs(3605), receiver)
+            .await
+            .context("Host request timed out")?
+            .context("Host disconnected before replying")?
+            .map_err(anyhow::Error::msg)
+    }
+}
+
+struct PendingCompletion {
+    request_id: RequestId,
+    pending: PendingRequests,
+}
+
+impl Drop for PendingCompletion {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .expect("Host pending requests poisoned")
+            .remove(&self.request_id);
+    }
+}
+
+async fn serve_host(
+    registry: ToolRegistry,
+    harnesses: Vec<HarnessDescriptor>,
+    mut receiver: mpsc::Receiver<HubToHost>,
+    sender: mpsc::Sender<HostToHub>,
+) {
+    if sender
+        .send(HostToHub::Ready {
+            tools: registry.definitions(),
+            harnesses,
+        })
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let mut catalog = registry.subscribe();
+    let permission_waiters: crate::host::AcpPermissionWaiters =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let binding_waiters: crate::host::AcpBindingWaiters =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
+    loop {
+        tokio::select! {
+            message = receiver.recv() => {
+                let Some(message) = message else { return; };
+                if let HubToHost::ResolveAcpPermission { permission_id, option_id } = message {
+                    if let Some(waiter) = permission_waiters.lock().expect("ACP permission waiters poisoned").remove(&permission_id) {
+                        let _ = waiter.send(option_id);
+                    }
+                    continue;
+                }
+                if let HubToHost::AcknowledgeAcpSessionBinding { acknowledgement_id } = message {
+                    if let Some(waiter) = binding_waiters.lock().expect("ACP binding waiters poisoned").remove(&acknowledgement_id) {
+                        let _ = waiter.send(());
+                    }
+                    continue;
+                }
+                if matches!(message, HubToHost::RunAcp { .. }) {
+                    let registry = registry.clone();
+                    let sender = sender.clone();
+                    let waiters = Arc::clone(&permission_waiters);
+                    let binding_waiters = Arc::clone(&binding_waiters);
+                    tokio::spawn(async move {
+                        let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+                        let response = handle_host_request_streaming(
+                            &registry,
+                            None,
+                            message,
+                            Some(event_sender),
+                            Some(waiters),
+                            Some(binding_waiters),
+                        );
+                        tokio::pin!(response);
+                        let response = loop {
+                            tokio::select! {
+                                response = &mut response => break response,
+                                event = event_receiver.recv() => {
+                                    if let Some(event) = event
+                                        && sender.send(event).await.is_err()
+                                    { return; }
+                                }
+                            }
+                        };
+                        while let Ok(event) = event_receiver.try_recv() {
+                            if sender.send(event).await.is_err() { return; }
+                        }
+                        let _ = sender.send(response).await;
+                    });
+                    continue;
+                }
+                let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+                let response = handle_host_request_streaming(&registry, None, message, Some(event_sender), Some(Arc::clone(&permission_waiters)), Some(Arc::clone(&binding_waiters)));
+                tokio::pin!(response);
+                let response = loop {
+                    tokio::select! {
+                        response = &mut response => break response,
+                        event = event_receiver.recv() => {
+                            if let Some(event) = event
+                                && sender.send(event).await.is_err()
+                            { return; }
+                        }
+                    }
+                };
+                while let Ok(event) = event_receiver.try_recv() {
+                    if sender.send(event).await.is_err() { return; }
+                }
+                if sender.send(response).await.is_err() { return; }
+            }
+            changed = catalog.changed() => {
+                if changed.is_err() { return; }
+                let tools = catalog.borrow().clone();
+                if sender.send(HostToHub::ToolCatalogChanged {
+                    tools,
+                }).await.is_err() { return; }
+            }
+        }
+    }
+}

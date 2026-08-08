@@ -1,0 +1,55 @@
+[package]
+name = "mews"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+clap.workspace = true
+base64.workspace = true
+ed25519-dalek.workspace = true
+futures-util.workspace = true
+inquire.workspace = true
+mews-acp = { path = "../mews-acp" }
+mews-router = { path = "../mews-router" }
+mews-agent = { path = "../mews-agent" }
+mews-host = { path = "../mews-host" }
+mews-runtime = { path = "../mews-runtime" }
+mews-store = { path = "../mews-store" }
+mews-protocol = { path = "../mews-protocol" }
+mews-relay = { path = "../mews-relay" }
+mews-client = { path = "../mews-client" }
+mews-tui = { path = "../mews-tui" }
+reqwest.workspace = true
+regex.workspace = true
+rpassword.workspace = true
+rand_core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+snow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+toml.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lib]
+name = "mews"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mews"
+path = "src/main.rs"

@@ -1,0 +1,22 @@
+[package]
+name = "mews-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+chrono.workspace = true
+ed25519-dalek.workspace = true
+futures-util.workspace = true
+mews-protocol = { path = "../mews-protocol" }
+rand_core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+
