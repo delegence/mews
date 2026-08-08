@@ -3,6 +3,23 @@ use std::collections::BTreeMap;
 use super::*;
 
 impl Mews {
+    pub fn rename_agent(&mut self, slug: &str, new_slug: &str) -> Result<Agent> {
+        self.synchronize_agent(slug)?;
+        let source = self.root.join("agents").join(slug);
+        let destination = self.root.join("agents").join(new_slug);
+        if destination.exists() {
+            bail!("agent directory already exists: {}", destination.display());
+        }
+        let agent = self.store.rename_agent(slug, new_slug)?;
+        if let Err(error) = fs::rename(&source, &destination) {
+            let rollback = self.store.rename_agent(new_slug, slug);
+            rollback.context("agent directory rename failed and database rollback also failed")?;
+            return Err(error.into());
+        }
+        fs::File::open(self.root.join("agents"))?.sync_all()?;
+        Ok(agent)
+    }
+
     pub fn create_agent(&mut self, slug: &str) -> Result<Agent> {
         self.create_agent_with_harness(slug, mews_runtime::MEWS_HARNESS, BTreeMap::new())
     }
@@ -181,5 +198,19 @@ fn materialize(directory: &Path, revision: &crate::AgentRevision) -> Result<()> 
         return Err(error.into());
     }
     fs::File::open(parent)?.sync_all()?;
+    retain_previous_directories(parent, name)?;
+    Ok(())
+}
+
+fn retain_previous_directories(parent: &Path, name: &str) -> Result<()> {
+    let prefix = format!(".{name}.previous-");
+    let mut previous = fs::read_dir(parent)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+        .collect::<Vec<_>>();
+    previous.sort_by_key(|entry| entry.file_name());
+    for stale in previous.into_iter().rev().skip(1) {
+        fs::remove_dir_all(stale.path())?;
+    }
     Ok(())
 }

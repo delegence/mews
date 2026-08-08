@@ -36,19 +36,30 @@ pub(crate) struct HubControl {
     pub moving: Arc<AtomicBool>,
     pub handoff_gate: Arc<tokio::sync::RwLock<()>>,
     pub session_locks: Arc<Mutex<HashMap<crate::SessionId, Arc<Mutex<()>>>>>,
-    pub run_tasks: Arc<Mutex<HashMap<crate::RunId, tokio::task::AbortHandle>>>,
+    pub run_tasks: Arc<Mutex<HashMap<crate::RunId, RunTask>>>,
     pub event_notify: Arc<tokio::sync::Notify>,
-    pub permission_waiters:
-        Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<Option<String>>>>>,
+    pub permission_waiters: Arc<Mutex<HashMap<String, PermissionWaiter>>>,
 }
 
-pub(super) struct HubRuntime {
-    mews: Arc<Mutex<Mews>>,
-    remote_hosts: RemoteHosts,
-    control: HubControl,
+pub(crate) struct RunTask {
+    pub cancellation: mews_agent::CancellationToken,
+    pub abort: tokio::task::AbortHandle,
 }
 
-use dispatch::dispatch;
+pub(crate) struct PermissionWaiter {
+    pub request_id: String,
+    pub session_id: crate::SessionId,
+    pub run_id: crate::RunId,
+    pub sender: tokio::sync::oneshot::Sender<Option<String>>,
+}
+
+pub(crate) struct HubRuntime {
+    pub(crate) remote_hosts: RemoteHosts,
+    pub(crate) local_host: Arc<ConnectedHost>,
+    pub(crate) control: HubControl,
+}
+
+pub(crate) use dispatch::{RequestOrigin, dispatch};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct HubMoveRecovery {
@@ -128,6 +139,7 @@ async fn serve_local(root: PathBuf, recovering_handoff: bool) -> Result<bool> {
                 root.join(format!("host-state.previous-{}.json", uuid::Uuid::now_v7())),
             )?;
             fs::File::open(&root)?.sync_all()?;
+            retain_previous_host_states(&root)?;
         }
         fs::remove_file(root.join("hub-promote"))?;
         fs::File::open(&root)?.sync_all()?;
@@ -144,7 +156,17 @@ async fn serve_local(root: PathBuf, recovering_handoff: bool) -> Result<bool> {
     } else {
         initial.remote_host_acceptances()?
     };
-    let mews = Arc::new(Mutex::new(initial));
+    let local_host = Arc::new(
+        ConnectedHost::in_process(
+            initial.installation()?.hub_host_id,
+            mews_host::ToolRegistry::with_host_extensions(&root)?,
+        )
+        .await?,
+    );
+    // Keep the primary connection alive for the lifetime of the Hub lock. Each
+    // request opens its own SQLite connection so no async operation holds a
+    // coarse service mutex.
+    let mews = initial;
     let remote_hosts: RemoteHosts = Arc::new(Mutex::new(HashMap::new()));
     let control = HubControl {
         moving: Arc::new(AtomicBool::new(recovering_handoff)),
@@ -155,17 +177,25 @@ async fn serve_local(root: PathBuf, recovering_handoff: bool) -> Result<bool> {
         permission_waiters: Arc::new(Mutex::new(HashMap::new())),
     };
     let runtime = Arc::new(HubRuntime {
-        mews: Arc::clone(&mews),
         remote_hosts: Arc::clone(&remote_hosts),
+        local_host,
         control: control.clone(),
     });
     for (relay_urls, accepted) in reconnecting {
         let root = root.clone();
         let remote_hosts = Arc::clone(&remote_hosts);
         let control = control.clone();
+        let local_host = Arc::clone(&runtime.local_host);
         tokio::task::spawn_local(async move {
-            let _ = crate::host::serve_hub_host(root, relay_urls, accepted, remote_hosts, control)
-                .await;
+            let _ = crate::host::serve_hub_host(
+                root,
+                relay_urls,
+                accepted,
+                remote_hosts,
+                control,
+                local_host,
+            )
+            .await;
         });
     }
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -209,6 +239,19 @@ async fn serve_local(root: PathBuf, recovering_handoff: bool) -> Result<bool> {
         && fs::read_to_string(root.join("hub-move.phase"))?.trim() == "activating")
 }
 
+fn retain_previous_host_states(root: &Path) -> Result<()> {
+    let prefix = "host-state.previous-";
+    let mut previous = fs::read_dir(root)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+        .collect::<Vec<_>>();
+    previous.sort_by_key(|entry| entry.file_name());
+    for stale in previous.into_iter().rev().skip(1) {
+        fs::remove_file(stale.path())?;
+    }
+    Ok(())
+}
+
 async fn connection(
     stream: UnixStream,
     runtime: Arc<HubRuntime>,
@@ -235,7 +278,11 @@ async fn connection(
             HubResponse::Error(ProtocolError::unsupported_version(frame.protocol))
         } else {
             let request: HubRequest = serde_json::from_value(frame.body)?;
-            match dispatch(&runtime, &root, request).await {
+            let result = match resolve_request_location(RequestOrigin::Local, request) {
+                Ok(request) => dispatch(&runtime, &root, RequestOrigin::Local, request).await,
+                Err(error) => Err(error),
+            };
+            match result {
                 Ok((response, should_shutdown)) => {
                     if should_shutdown {
                         let _ = shutdown.send(true);
@@ -253,7 +300,7 @@ async fn connection(
     Ok(())
 }
 
-fn protocol_error(error: &anyhow::Error) -> ProtocolError {
+pub(crate) fn protocol_error(error: &anyhow::Error) -> ProtocolError {
     use mews_protocol::ProtocolErrorCode;
     use mews_store::StoreError;
 
@@ -296,6 +343,36 @@ fn hub_home() -> Result<PathBuf> {
         .context("HOME is unavailable for a locationless client")?
         .canonicalize()
         .context("resolve Hub user's home directory")
+}
+
+pub(crate) fn resolve_request_location(
+    origin: RequestOrigin<'_>,
+    request: HubRequest,
+) -> Result<HubRequest> {
+    Ok(match request {
+        HubRequest::StartSession {
+            slug,
+            working_directory: Some(working_directory),
+        } => match origin {
+            RequestOrigin::Host(host) => HubRequest::StartSessionOn {
+                slug,
+                host_id: host.host_id().clone(),
+                working_directory,
+            },
+            RequestOrigin::Local => HubRequest::StartSession {
+                slug,
+                working_directory: Some(working_directory),
+            },
+        },
+        HubRequest::StartSession {
+            slug,
+            working_directory: None,
+        } => HubRequest::StartSession {
+            slug,
+            working_directory: Some(hub_home()?),
+        },
+        request => request,
+    })
 }
 
 #[cfg(test)]

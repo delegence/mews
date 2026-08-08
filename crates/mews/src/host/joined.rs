@@ -46,10 +46,10 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
     let identity = Arc::new(HostIdentity::load(&root.join("secrets/host.key"))?);
     let noise = NoiseIdentity::load(&root.join("secrets/host-noise.key"))?;
     let relay_identity = RelayIdentity {
-        installation_id: state.offer.installation_id.clone(),
+        installation_id: state.installation_id.clone(),
         peer_id: state.accepted.relay_admission.peer_id.clone(),
         public_key: identity.public_key(),
-        authority_public_key: state.offer.installation_public_key.clone(),
+        authority_public_key: state.installation_public_key.clone(),
         admission: Some(state.accepted.relay_admission.clone()),
     };
     let stream = state.accepted.host.id.to_string();
@@ -68,13 +68,13 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
             connect_initiator(
                 relay,
                 PeerAuthentication {
-                    installation_id: state.offer.installation_id.clone(),
+                    installation_id: state.installation_id.clone(),
                     local_peer: relay_identity.peer_id.clone(),
                     remote_peer: state.accepted.hub_relay_admission.peer_id.clone(),
                     local_signer: &identity,
-                    trusted_remote_signing_key: &state.offer.installation_public_key,
+                    trusted_remote_signing_key: &state.installation_public_key,
                     local_noise: &noise,
-                    expected_remote_noise_key: Some(&state.offer.hub_noise_public_key),
+                    expected_remote_noise_key: Some(&state.hub_noise_public_key),
                     stream_id: &stream,
                 },
             ),
@@ -130,6 +130,10 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
         Arc::new(std::sync::Mutex::new(HashMap::new()));
     let binding_waiters: crate::host::AcpBindingWaiters =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let acp_cancellations = Arc::new(std::sync::Mutex::new(HashMap::<
+        RequestId,
+        mews_agent::CancellationToken,
+    >::new()));
     let (promotion_tx, mut promotion_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         while let Some(message) = peer_in.recv().await {
@@ -162,16 +166,39 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
                         }
                         continue;
                     }
+                    if let mews_protocol::HubToHost::CancelAcp { request_id } = &body {
+                        if let Some(cancellation) = acp_cancellations
+                            .lock()
+                            .expect("ACP cancellations poisoned")
+                            .remove(request_id)
+                        {
+                            cancellation.cancel();
+                        }
+                        continue;
+                    }
                     let promotes =
                         matches!(&body, mews_protocol::HubToHost::ActivateHubTransfer { .. });
                     if matches!(&body, mews_protocol::HubToHost::RunAcp { .. }) {
+                        let request_id = match &body {
+                            mews_protocol::HubToHost::RunAcp { request_id, .. } => {
+                                request_id.clone()
+                            }
+                            _ => unreachable!(),
+                        };
+                        let cancellation = mews_agent::CancellationToken::new();
+                        acp_cancellations
+                            .lock()
+                            .expect("ACP cancellations poisoned")
+                            .insert(request_id.clone(), cancellation.clone());
                         let registry = Arc::clone(&dispatch_registry);
                         let root = agent_root.clone();
                         let peer = dispatch_peer.clone();
                         let waiters = Arc::clone(&permission_waiters);
                         let binding_waiters = Arc::clone(&binding_waiters);
+                        let cancellations = Arc::clone(&acp_cancellations);
                         tokio::spawn(async move {
-                            let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+                            let (event_tx, mut event_rx) =
+                                tokio::sync::mpsc::channel(super::ACP_EVENT_CHANNEL_CAPACITY);
                             let response = crate::host::handle_host_request_streaming(
                                 &registry,
                                 Some(&root),
@@ -179,6 +206,7 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
                                 Some(event_tx),
                                 Some(waiters),
                                 Some(binding_waiters),
+                                Some(cancellation),
                             );
                             tokio::pin!(response);
                             let response = loop {
@@ -195,10 +223,15 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
                             let _ = peer
                                 .send(PeerEnvelope::ToolResponse { body: response })
                                 .await;
+                            cancellations
+                                .lock()
+                                .expect("ACP cancellations poisoned")
+                                .remove(&request_id);
                         });
                         continue;
                     }
-                    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let (event_tx, mut event_rx) =
+                        tokio::sync::mpsc::channel(super::ACP_EVENT_CHANNEL_CAPACITY);
                     let response = crate::host::handle_host_request_streaming(
                         &dispatch_registry,
                         Some(&agent_root),
@@ -206,6 +239,7 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
                         Some(event_tx),
                         Some(Arc::clone(&permission_waiters)),
                         Some(Arc::clone(&binding_waiters)),
+                        None,
                     );
                     tokio::pin!(response);
                     let response = loop {

@@ -108,11 +108,18 @@ impl<C: Channel> ChannelRuntime<C> {
                                     self.launch_next(&session).await?;
                                 }
                             }
+                            ClientEventKind::RunCancelled { run_id } => {
+                                self.mappings.record_delivery(event.id.as_str(), None)?;
+                                if let Some(session) = self.mappings.finish_run(&run_id.to_string())? {
+                                    self.launch_next(&session).await?;
+                                }
+                            }
                             ClientEventKind::RunStarted { .. }
                             | ClientEventKind::ReasoningDelta { .. }
                             | ClientEventKind::ToolActivity { .. }
                             | ClientEventKind::ToolStarted { .. }
-                            | ClientEventKind::ToolCompleted { .. } => {
+                            | ClientEventKind::ToolCompleted { .. }
+                            | ClientEventKind::PermissionResolved { .. } => {
                                 self.mappings.record_delivery(event.id.as_str(), None)?;
                             }
                             ClientEventKind::PermissionRequested { request, .. } => {

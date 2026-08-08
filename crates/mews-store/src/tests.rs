@@ -216,7 +216,9 @@ fn subscribed_consumers_replay_events_until_acknowledged() {
         .create_session(&agent.id, &installation.hub_host_id, directory.path())
         .unwrap();
     let consumer = ConsumerId::new();
-    store.subscribe_session(&consumer, &session.id).unwrap();
+    store
+        .subscribe_session(&consumer, &session.id, ConsumerKind::Durable)
+        .unwrap();
     let message = store
         .append_message(
             &session.id,
@@ -238,6 +240,11 @@ fn subscribed_consumers_replay_events_until_acknowledged() {
     store
         .acknowledge_events(&consumer, first.checkpoint)
         .unwrap();
+    let retained: u64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM client_events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(retained, 0);
     assert!(
         store
             .client_events(&consumer, 100)
@@ -245,6 +252,209 @@ fn subscribed_consumers_replay_events_until_acknowledged() {
             .events
             .is_empty()
     );
+}
+
+#[test]
+fn event_polling_reads_only_subscribed_sessions() {
+    let (mut store, installation) = initialized();
+    let (agent, _) = store
+        .create_agent("scoped-events", "Soul", CONFIG, &installation.hub_host_id)
+        .unwrap();
+    let first = store
+        .create_session(
+            &agent.id,
+            &installation.hub_host_id,
+            std::path::Path::new("/tmp/first"),
+        )
+        .unwrap();
+    let second = store
+        .create_session(
+            &agent.id,
+            &installation.hub_host_id,
+            std::path::Path::new("/tmp/second"),
+        )
+        .unwrap();
+    let consumer = ConsumerId::new();
+    store
+        .subscribe_session(&consumer, &first.id, ConsumerKind::Durable)
+        .unwrap();
+    let source = MessageSource {
+        kind: SourceKind::Harness,
+        id: "test".into(),
+    };
+    for index in 0..125 {
+        store
+            .append_client_event(
+                &second.id,
+                ClientEventKind::AssistantDelta {
+                    run_id: RunId::new(),
+                    delta: index.to_string(),
+                    message_id: None,
+                },
+            )
+            .unwrap();
+    }
+    let message = store
+        .append_message(
+            &first.id,
+            MessageRole::Assistant,
+            MessageContent::Text {
+                text: "subscribed".into(),
+            },
+            Value::Null,
+            source,
+        )
+        .unwrap();
+
+    let batch = store.client_events(&consumer, 100).unwrap();
+    assert_eq!(batch.events.len(), 1);
+    assert!(matches!(
+        &batch.events[0].kind,
+        ClientEventKind::AssistantMessage { message: event } if event.id == message.id
+    ));
+}
+
+#[test]
+fn deleting_ephemeral_consumer_removes_it_and_its_subscriptions() {
+    let (mut store, installation) = initialized();
+    let (agent, _) = store
+        .create_agent(
+            "ephemeral-events",
+            "Soul",
+            CONFIG,
+            &installation.hub_host_id,
+        )
+        .unwrap();
+    let session = store
+        .create_session(
+            &agent.id,
+            &installation.hub_host_id,
+            std::path::Path::new("/tmp"),
+        )
+        .unwrap();
+    let consumer = ConsumerId::new();
+    store
+        .subscribe_session(&consumer, &session.id, ConsumerKind::Ephemeral)
+        .unwrap();
+    assert!(
+        store
+            .subscribe_session(&consumer, &session.id, ConsumerKind::Durable)
+            .is_err()
+    );
+    store.delete_consumer(&consumer).unwrap();
+
+    assert!(matches!(
+        store.client_events(&consumer, 1),
+        Err(StoreError::NotFound { .. })
+    ));
+    let subscriptions: u64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM client_subscriptions WHERE consumer_id = ?1",
+            [consumer.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(subscriptions, 0);
+}
+
+#[test]
+fn ephemeral_consumers_do_not_hold_transient_events_past_durable_cursors() {
+    let (mut store, installation) = initialized();
+    let (agent, _) = store
+        .create_agent(
+            "transient-events",
+            "Soul",
+            CONFIG,
+            &installation.hub_host_id,
+        )
+        .unwrap();
+    let session = store
+        .create_session(
+            &agent.id,
+            &installation.hub_host_id,
+            std::path::Path::new("/tmp"),
+        )
+        .unwrap();
+    let durable = ConsumerId::new();
+    let ephemeral = ConsumerId::new();
+    store
+        .subscribe_session(&durable, &session.id, ConsumerKind::Durable)
+        .unwrap();
+    store
+        .subscribe_session(&ephemeral, &session.id, ConsumerKind::Ephemeral)
+        .unwrap();
+    store
+        .append_client_event(
+            &session.id,
+            ClientEventKind::AssistantDelta {
+                run_id: RunId::new(),
+                delta: "hello".into(),
+                message_id: None,
+            },
+        )
+        .unwrap();
+    let batch = store.client_events(&durable, 10).unwrap();
+    assert_eq!(batch.events.len(), 1);
+    store
+        .acknowledge_events(&durable, batch.checkpoint)
+        .unwrap();
+    // The checkpoint remains valid after another consumer compacts the row.
+    store
+        .acknowledge_events(&ephemeral, batch.checkpoint)
+        .unwrap();
+
+    assert!(
+        store
+            .client_events(&ephemeral, 10)
+            .unwrap()
+            .events
+            .is_empty()
+    );
+}
+
+#[test]
+fn cancelled_runs_emit_a_distinct_terminal_event() {
+    let (mut store, installation) = initialized();
+    let (agent, _) = store
+        .create_agent("cancel-event", "Soul", CONFIG, &installation.hub_host_id)
+        .unwrap();
+    let session = store
+        .create_session(
+            &agent.id,
+            &installation.hub_host_id,
+            std::path::Path::new("/tmp"),
+        )
+        .unwrap();
+    let consumer = ConsumerId::new();
+    store
+        .subscribe_session(&consumer, &session.id, ConsumerKind::Durable)
+        .unwrap();
+    let run = store.start_run(&session.id).unwrap();
+    store
+        .finish_run(&run.id, RunStatus::Cancelled, Some("user cancelled"))
+        .unwrap();
+
+    assert!(store
+        .client_events(&consumer, 10)
+        .unwrap()
+        .events
+        .iter()
+        .any(|event| matches!(&event.kind, ClientEventKind::RunCancelled { run_id } if run_id == &run.id)));
+}
+
+#[test]
+fn stale_development_schema_is_rejected_early() {
+    let state = tempfile::tempdir().unwrap();
+    let database = state.path().join("mews.db");
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute("CREATE TABLE hosts (id TEXT PRIMARY KEY)", [])
+        .unwrap();
+    drop(connection);
+
+    let error = Store::open(&database).err().unwrap();
+    assert!(error.to_string().contains("reset MEWS_HOME"));
 }
 
 #[test]
@@ -361,6 +571,15 @@ fn acp_session_binding_is_one_to_one_and_replacement_is_explicit() {
         .unwrap();
     assert_eq!(replaced.acp_session_id, "codex-session-2");
     assert!(replaced.replaced_at.is_some());
+    let has_unused_audit_table: bool = store
+        .connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'acp_session_replacements')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!has_unused_audit_table);
 }
 
 #[test]

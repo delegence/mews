@@ -569,15 +569,12 @@ fn normalize_probe(
                 .filter_map(|mode| mode.get("id").and_then(Value::as_str)),
         );
     } else {
-        descriptor.availability.authentication = if probe
-            .session_error
-            .as_deref()
-            .is_some_and(authentication_error)
-        {
-            HarnessReadiness::Required
-        } else {
-            HarnessReadiness::Failed
-        };
+        descriptor.availability.authentication =
+            if probe.session_error_kind == Some(mews_acp::AcpErrorKind::AuthenticationRequired) {
+                HarnessReadiness::Required
+            } else {
+                HarnessReadiness::Failed
+            };
         descriptor.availability.catalog = HarnessReadiness::Stale;
         descriptor.availability.detail = probe.session_error.map(bounded_detail);
     }
@@ -590,11 +587,6 @@ fn probe_failure(mut descriptor: HarnessDescriptor, error: String) -> HarnessDes
     descriptor.availability.detail = Some(bounded_detail(error));
     descriptor.probed_at = Some(now_unix());
     descriptor
-}
-
-fn authentication_error(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    error.contains("auth") || error.contains("login") || error.contains("credential")
 }
 
 fn now_unix() -> i64 {

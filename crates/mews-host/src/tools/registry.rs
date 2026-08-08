@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use mews_agent::CancellationToken;
 use serde_json::{Value, json};
 
 use super::builtins::{Bash, Edit, Read, Write};
@@ -20,7 +21,12 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn schema(&self) -> Value;
-    async fn execute(&self, arguments: Value, cwd: &Path) -> Result<Value>;
+    async fn execute(
+        &self,
+        arguments: Value,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Value>;
 }
 
 #[derive(Clone)]
@@ -90,10 +96,11 @@ impl ToolRegistry {
             if Arc::strong_count(&self.inner) == 1 {
                 return;
             }
-            if let Ok(next) = resource_fingerprint(&root) {
-                if next != fingerprint && self.reload_extensions(&root).is_ok() {
-                    fingerprint = next;
-                }
+            if let Ok(next) = resource_fingerprint(&root)
+                && next != fingerprint
+                && self.reload_extensions(&root).is_ok()
+            {
+                fingerprint = next;
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
@@ -138,9 +145,13 @@ impl ToolRegistry {
             .expect("extension hooks poisoned")
             .clone();
         for extension in hooks.into_iter().filter(|item| item.hook == hook) {
-            let output = super::process::execute(&extension.command, cwd, json!({
+            let input = json!({
                 "type": "hook", "extension": extension.extension, "hook": hook, "payload": payload,
-            })).await.with_context(|| format!("extension {:?} hook {hook}", extension.extension))?;
+            });
+            let output =
+                super::process::execute(&extension.command, cwd, input, &CancellationToken::new())
+                    .await
+                    .with_context(|| format!("extension {:?} hook {hook}", extension.extension))?;
             if !output.is_null() {
                 payload = output;
             }
@@ -213,20 +224,6 @@ impl ToolRegistry {
         Ok(())
     }
 
-    pub fn remove(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        let removed = {
-            let mut tools = self.inner.tools.write().expect("tool registry poisoned");
-            tools
-                .extensions
-                .remove(name)
-                .or_else(|| tools.native.remove(name))
-        };
-        if removed.is_some() {
-            self.publish_catalog();
-        }
-        removed
-    }
-
     pub fn names(&self) -> Vec<String> {
         let tools = self.inner.tools.read().expect("tool registry poisoned");
         tools
@@ -277,7 +274,13 @@ impl ToolRegistry {
         self.inner.catalog.send_replace(self.definitions());
     }
 
-    pub async fn execute(&self, name: &str, arguments: Value, cwd: &Path) -> Result<Value> {
+    pub async fn execute(
+        &self,
+        name: &str,
+        arguments: Value,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Value> {
         let tool = {
             let tools = self.inner.tools.read().expect("tool registry poisoned");
             tools
@@ -287,17 +290,18 @@ impl ToolRegistry {
                 .with_context(|| format!("Host does not provide tool {name:?}"))?
                 .clone()
         };
-        tool.execute(arguments, cwd).await
+        tool.execute(arguments, cwd, cancellation).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::process::MAX_OUTPUT;
     use tokio::fs;
 
     #[tokio::test]
-    async fn registry_is_dynamic_and_edit_refuses_ambiguous_changes() {
+    async fn edit_refuses_ambiguous_changes() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("a.txt"), "same same")
             .await
@@ -308,15 +312,9 @@ mod tests {
                 .execute(
                     "edit",
                     json!({"path":"a.txt","old_text":"same","new_text":"x"}),
-                    directory.path()
+                    directory.path(),
+                    &CancellationToken::new(),
                 )
-                .await
-                .is_err()
-        );
-        assert!(tools.remove("edit").is_some());
-        assert!(
-            tools
-                .execute("edit", json!({}), directory.path())
                 .await
                 .is_err()
         );
@@ -344,11 +342,170 @@ mod tests {
                 "bash",
                 json!({"command":"printf ok","timeout_seconds":null}),
                 Path::new("."),
+                &CancellationToken::new(),
             )
             .await
             .unwrap();
         assert_eq!(result["stdout"], "ok");
         assert_eq!(result["success"], true);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_drains_noisy_stdout_and_stderr_into_bounded_buffers() {
+        let tools = ToolRegistry::with_defaults();
+        let result = tools
+            .execute(
+                "bash",
+                json!({
+                    "command":"(yes o | head -c 70000) & (yes e | head -c 70000 >&2) & wait",
+                    "timeout_seconds":5
+                }),
+                Path::new("."),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["stdout"].as_str().unwrap().len(), MAX_OUTPUT);
+        assert_eq!(result["stderr"].as_str().unwrap().len(), MAX_OUTPUT);
+        assert_eq!(result["success"], true);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn extension_output_limit_terminates_the_process_group() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("tools");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(
+            directory.join("noisy.toml"),
+            r#"name = "noisy"
+description = "Exceed the output contract"
+command = ["sh", "-c", "yes x | head -c 70000; sleep 30"]
+schema = { type = "object" }
+"#,
+        )
+        .unwrap();
+        let tools = ToolRegistry::with_host_extensions(root.path()).unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            tools.execute("noisy", json!({}), root.path(), &CancellationToken::new()),
+        )
+        .await
+        .expect("the output limit should stop the sleeping process");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("extension tool output exceeds 64 KiB")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_stops_shell_descendants() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("descendant.pid");
+        let tools = ToolRegistry::with_defaults();
+        let cancellation = CancellationToken::new();
+        let command = format!(
+            "sleep 30 & child=$!; printf %s $child > {}; wait",
+            pid_path.display()
+        );
+        let execution = tools.execute(
+            "bash",
+            json!({"command":command,"timeout_seconds":30}),
+            directory.path(),
+            &cancellation,
+        );
+        tokio::pin!(execution);
+
+        let descendant = loop {
+            tokio::select! {
+                result = &mut execution => panic!("shell exited before cancellation: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                    if let Ok(pid) = std::fs::read_to_string(&pid_path) {
+                        break pid.parse::<i32>().unwrap();
+                    }
+                }
+            }
+        };
+        cancellation.cancel();
+        assert!(
+            execution
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+
+        for _ in 0..100 {
+            // SAFETY: signal 0 only queries whether the test child still exists.
+            if unsafe { libc::kill(descendant, 0) } == -1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("cancelled shell descendant {descendant} is still running");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_stops_shell_descendants() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("timed-out-descendant.pid");
+        let command = format!(
+            "sleep 30 & child=$!; printf %s $child > {}; wait",
+            pid_path.display()
+        );
+
+        let error = ToolRegistry::with_defaults()
+            .execute(
+                "bash",
+                json!({"command":command,"timeout_seconds":1}),
+                directory.path(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        let descendant = std::fs::read_to_string(pid_path)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+
+        for _ in 0..100 {
+            // SAFETY: signal 0 only queries whether the test child still exists.
+            if unsafe { libc::kill(descendant, 0) } == -1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed-out shell descendant {descendant} is still running");
+    }
+
+    #[tokio::test]
+    async fn read_rejects_files_over_the_streaming_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("large.txt"),
+            vec![b'x'; MAX_OUTPUT + 1],
+        )
+        .await
+        .unwrap();
+
+        let error = ToolRegistry::with_defaults()
+            .execute(
+                "read",
+                json!({"path":"large.txt"}),
+                directory.path(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("file exceeds 64 KiB"));
     }
 
     #[tokio::test]
@@ -369,7 +526,7 @@ schema = { type = "object" }
         assert!(tools.names().contains(&"hello".to_owned()));
         assert_eq!(
             tools
-                .execute("hello", json!({}), root.path())
+                .execute("hello", json!({}), root.path(), &CancellationToken::new(),)
                 .await
                 .unwrap(),
             json!({"hello": true})
@@ -406,7 +563,7 @@ schema = { type = "object" }
         );
         assert_eq!(
             registry
-                .execute("hello", json!({}), root.path())
+                .execute("hello", json!({}), root.path(), &CancellationToken::new(),)
                 .await
                 .unwrap(),
             json!({"hello": true})
@@ -468,7 +625,12 @@ schema = {{ type = "object" }}
         assert!(registry.names().contains(&"example_tool".to_owned()));
         assert_eq!(
             registry
-                .execute("example_tool", json!({}), root.path())
+                .execute(
+                    "example_tool",
+                    json!({}),
+                    root.path(),
+                    &CancellationToken::new(),
+                )
                 .await
                 .unwrap(),
             json!({"tool": true})

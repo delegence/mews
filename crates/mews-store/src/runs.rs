@@ -77,14 +77,17 @@ impl Store {
             RunStatus::Completed => ClientEventKind::RunCompleted {
                 run_id: run_id.clone(),
             },
-            RunStatus::Failed | RunStatus::Cancelled => ClientEventKind::RunFailed {
+            RunStatus::Failed => ClientEventKind::RunFailed {
                 run_id: run_id.clone(),
-                error: error.unwrap_or("Run cancelled").to_owned(),
+                error: error.unwrap_or("Run failed").to_owned(),
+            },
+            RunStatus::Cancelled => ClientEventKind::RunCancelled {
+                run_id: run_id.clone(),
             },
             RunStatus::Running => unreachable!(),
         };
         transaction.execute(
-            "INSERT INTO client_events (id, session_id, kind_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO client_events (id, session_id, kind_json, transient, created_at) VALUES (?1, ?2, ?3, 0, ?4)",
             params![EventId::new().as_str(), session_id, json(&kind)?, timestamp(Utc::now())],
         )?;
         transaction.commit()?;
@@ -177,8 +180,8 @@ fn insert_run(
         ],
     )?;
     connection.execute(
-        "INSERT INTO client_events (id, session_id, kind_json, created_at)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO client_events (id, session_id, kind_json, transient, created_at)
+         VALUES (?1, ?2, ?3, 0, ?4)",
         params![
             EventId::new().as_str(),
             session_id.as_str(),

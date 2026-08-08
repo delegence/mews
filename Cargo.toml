@@ -10,7 +10,6 @@ members = [
     "crates/mews-router",
     "crates/mews-runtime",
     "crates/mews-store",
-    "crates/mews-tui",
 ]
 resolver = "2"
 

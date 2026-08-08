@@ -6,14 +6,24 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-use crate::host::HostControl;
+use crate::{
+    host::{ConnectedHost, HostControl},
+    service::Mews,
+};
 use mews_protocol::{HubRequest, HubResponse, ProtocolError};
 
-use super::{HubRuntime, handoff::*, hub_home, runs};
+use super::{HubRuntime, handoff::*, runs};
 
-pub(super) async fn dispatch(
+#[derive(Clone, Copy)]
+pub(crate) enum RequestOrigin<'a> {
+    Local,
+    Host(&'a ConnectedHost),
+}
+
+pub(crate) async fn dispatch(
     runtime: &HubRuntime,
     root: &Path,
+    origin: RequestOrigin<'_>,
     request: HubRequest,
 ) -> Result<(HubResponse, bool)> {
     let is_move = matches!(&request, HubRequest::MoveHub { .. });
@@ -60,7 +70,7 @@ pub(super) async fn dispatch(
         }
         HubRequest::ResolvePermission {
             request_id,
-            option_id,
+            outcome,
         } => {
             let waiter = runtime
                 .control
@@ -71,13 +81,27 @@ pub(super) async fn dispatch(
                 .with_context(|| {
                     format!("permission request {request_id:?} is no longer pending")
                 })?;
-            let _ = waiter.send(option_id);
+            let selected = match &outcome {
+                mews_protocol::PermissionOutcome::Selected { option_id } => Some(option_id.clone()),
+                mews_protocol::PermissionOutcome::Cancelled => None,
+            };
+            Mews::open_connection(root)?.append_permission_resolution(
+                &waiter.session_id,
+                &waiter.run_id,
+                &request_id,
+                outcome,
+            )?;
+            let _ = waiter.sender.send(selected);
+            runtime.control.event_notify.notify_waiters();
             return Ok((HubResponse::Ack, false));
         }
         request => request,
     };
 
-    let mut mews = runtime.mews.lock().await;
+    let mut mews = Mews::open_connection(root)?;
+    if let RequestOrigin::Host(host) = origin {
+        mews.ensure_host(host.host_id())?;
+    }
     let response = match request {
         HubRequest::Status => HubResponse::Status(mews.installation()?),
         HubRequest::ListAgents => HubResponse::Agents(mews.agents()?),
@@ -91,14 +115,10 @@ pub(super) async fn dispatch(
             harness_options,
         )?),
         HubRequest::RenameAgent { slug, new_slug } => {
-            HubResponse::Agent(mews.rename_agent(&slug, &new_slug)?)
+            HubResponse::Agent(rename_agent(runtime, &mut mews, &slug, &new_slug).await?)
         }
         HubRequest::ArchiveAgent { slug } => {
             mews.archive_agent(&slug)?;
-            HubResponse::Ack
-        }
-        HubRequest::SetApiKey { provider, key } => {
-            mews.set_api_key(&provider, key).await?;
             HubResponse::Ack
         }
         HubRequest::SetAuth {
@@ -127,8 +147,9 @@ pub(super) async fn dispatch(
         HubRequest::SubscribeSession {
             consumer_id,
             session_id,
+            consumer_kind,
         } => {
-            mews.subscribe_session(&consumer_id, &session_id)?;
+            mews.subscribe_session(&consumer_id, &session_id, consumer_kind)?;
             HubResponse::Ack
         }
         HubRequest::UnsubscribeSession {
@@ -136,6 +157,10 @@ pub(super) async fn dispatch(
             session_id,
         } => {
             mews.unsubscribe_session(&consumer_id, &session_id)?;
+            HubResponse::Ack
+        }
+        HubRequest::DeleteConsumer { consumer_id } => {
+            mews.delete_consumer(&consumer_id)?;
             HubResponse::Ack
         }
         HubRequest::AcknowledgeEvents {
@@ -147,9 +172,7 @@ pub(super) async fn dispatch(
         }
         HubRequest::GetRun { id } => HubResponse::Run(mews.run(&id)?),
         HubRequest::CancelRun { id } => {
-            if let Some(task) = runtime.control.run_tasks.lock().await.remove(&id) {
-                task.abort();
-            }
+            runs::cancel_run(&runtime.control, root, &id).await;
             mews.cancel_run(&id)?;
             runtime.control.event_notify.notify_waiters();
             HubResponse::Ack
@@ -167,8 +190,11 @@ pub(super) async fn dispatch(
             slug,
             working_directory,
         } => {
-            let directory = working_directory.unwrap_or(hub_home()?);
-            HubResponse::Session(mews.start_session(&slug, &directory).await?)
+            let directory = working_directory.context("session location was not resolved")?;
+            HubResponse::Session(
+                mews.start_session_on(&slug, &directory, runtime.local_host.as_ref())
+                    .await?,
+            )
         }
         HubRequest::StartSessionOn {
             slug,
@@ -177,7 +203,10 @@ pub(super) async fn dispatch(
         } => {
             let installation = mews.installation()?;
             if host_id == installation.hub_host_id {
-                HubResponse::Session(mews.start_session(&slug, &working_directory).await?)
+                HubResponse::Session(
+                    mews.start_session_on(&slug, &working_directory, runtime.local_host.as_ref())
+                        .await?,
+                )
             } else {
                 let host = runtime
                     .remote_hosts
@@ -300,6 +329,7 @@ pub(super) async fn dispatch(
             let root = root.to_path_buf();
             let remote_hosts = Arc::clone(&runtime.remote_hosts);
             let control = runtime.control.clone();
+            let local_host = Arc::clone(&runtime.local_host);
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             tokio::task::spawn_local(async move {
                 if let Err(error) = crate::enrollment::relay::accept_join_ready(
@@ -308,6 +338,7 @@ pub(super) async fn dispatch(
                     ready_tx,
                     remote_hosts,
                     control,
+                    local_host,
                 )
                 .await
                 {
@@ -370,7 +401,9 @@ pub(super) async fn dispatch(
                     acknowledged += 1;
                 }
             }
-            if let Err(error) = transfer_hub_snapshot(&connected, &snapshot).await {
+            let transfer = transfer_hub_snapshot(&connected, &snapshot).await;
+            let _ = fs::remove_file(&snapshot.database_path);
+            if let Err(error) = transfer {
                 let rollback = mews.rollback_hub_move(&snapshot);
                 let _ = fs::remove_file(root.join("hub.json"));
                 let _ = fs::remove_file(root.join("hub-move.phase"));
@@ -435,4 +468,56 @@ pub(super) async fn dispatch(
         HubRequest::Shutdown => return Ok((HubResponse::Ack, true)),
     };
     Ok((response, false))
+}
+
+async fn rename_agent(
+    runtime: &HubRuntime,
+    mews: &mut Mews,
+    slug: &str,
+    new_slug: &str,
+) -> Result<crate::Agent> {
+    let installation = mews.installation()?;
+    let remote_ids = mews
+        .hosts()?
+        .into_iter()
+        .filter(|host| host.id != installation.hub_host_id)
+        .map(|host| host.id)
+        .collect::<Vec<_>>();
+    let connected = runtime.remote_hosts.lock().await;
+    let remote = remote_ids
+        .iter()
+        .map(|id| {
+            connected
+                .get(id)
+                .cloned()
+                .with_context(|| format!("Host {id} must be online before renaming an agent"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    drop(connected);
+
+    let current_agent = mews.synchronize_agent(slug)?;
+    let current = mews.agent_revision(&current_agent)?;
+    let mut replicas = Vec::with_capacity(remote.len());
+    for host in &remote {
+        let replica = host.agent_replica(slug).await?;
+        if let Some(replica) = &replica
+            && (replica.revision != current.revision
+                || replica.soul.trim_end() != current.soul.trim_end()
+                || replica.config_toml != current.config_toml)
+        {
+            bail!(
+                "Host {} has an unsynchronized agent replica; synchronize it before renaming",
+                host.host_id()
+            );
+        }
+        replicas.push(replica);
+    }
+
+    let renamed = mews.rename_agent(slug, new_slug)?;
+    let revision = mews.agent_revision(&renamed)?;
+    for (host, expected) in remote.iter().zip(&replicas) {
+        host.synchronize_agent(&renamed, &revision, expected.as_ref(), Some(slug))
+            .await?;
+    }
+    Ok(renamed)
 }

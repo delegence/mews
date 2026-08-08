@@ -275,7 +275,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
             root.path().join("models.json"),
-            r#"{"providers":{"openai":{"fetched_at":1,"models":[{"id":"openai/example","display_name":"Example"}]}}}"#,
+            r#"{"providers":{"openai":{"models":[{"id":"openai/example","display_name":"Example"}]}}}"#,
         )
         .unwrap();
         let models = crate::service::load_models(root.path()).unwrap();

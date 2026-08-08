@@ -12,10 +12,15 @@ use crate::{
 use mews_store::Store;
 
 pub(crate) fn canonical_acp_prompt(store: &Store, session: &Session, soul: &str) -> Result<String> {
-    Ok(mews_runtime::canonical_prompt(
-        provider_messages(model_messages(store.messages(&session.id)?)),
-        soul,
-    ))
+    let mut request = mews_agent::ModelRequest {
+        model: "acp/default".into(),
+        reasoning: None,
+        system: soul.to_owned(),
+        messages: provider_messages(model_messages(store.messages(&session.id)?)),
+        tools: Vec::new(),
+    };
+    mews_agent::apply_context_budget(&mut request)?;
+    Ok(mews_runtime::canonical_prompt(request.messages, soul))
 }
 
 pub async fn run(
@@ -41,6 +46,7 @@ pub struct StartedRun {
     pub id: crate::RunId,
     pub event_notify: Arc<tokio::sync::Notify>,
     pub harness: mews_protocol::HarnessDescriptor,
+    pub cancellation: CancellationToken,
 }
 
 pub async fn run_started(
@@ -87,26 +93,30 @@ async fn run_inner(
             .map(|started| Arc::clone(&started.event_notify)),
         harness: execution.harness,
     };
-    let mews_harness = mews_runtime::MewsHarness;
-    let mut dispatcher = mews_runtime::HarnessDispatcher::new();
-    dispatcher.register(mews_runtime::MEWS_HARNESS, &mews_harness)?;
-    dispatcher
-        .run(
-            &config.harness,
-            mews_runtime::HarnessRun {
-                provider,
-                environment,
-                store: &scoped,
-                agent: &config,
-                model_override: session.model_override.clone(),
-                default_model: defaults.model,
-                default_reasoning: defaults.reasoning,
-                cwd: session.working_directory.clone(),
-                soul,
-                cancellation: CancellationToken::new(),
-            },
-        )
-        .await
+    if config.harness != mews_runtime::MEWS_HARNESS {
+        anyhow::bail!("native runtime cannot execute Harness {}", config.harness);
+    }
+    mews_runtime::Harness::run(
+        &mews_runtime::MewsHarness,
+        mews_runtime::HarnessRun {
+            provider,
+            environment,
+            store: &scoped,
+            agent: &config,
+            model_override: session.model_override.clone(),
+            default_model: defaults.model,
+            default_reasoning: defaults.reasoning,
+            cwd: session.working_directory.clone(),
+            soul,
+            cancellation: execution
+                .started
+                .as_ref()
+                .map_or_else(CancellationToken::new, |started| {
+                    started.cancellation.clone()
+                }),
+        },
+    )
+    .await
 }
 
 struct RunExecution {
@@ -267,9 +277,17 @@ impl mews_runtime::ConversationStore for SessionStore<'_> {
     }
 
     fn assistant_delta(&self, delta: String) -> Result<()> {
+        let run_id = self
+            .run
+            .lock()
+            .expect("Run state poisoned")
+            .id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Run was not started"))?;
         self.store.append_client_event(
             &self.session.id,
             crate::ClientEventKind::AssistantDelta {
+                run_id,
                 delta,
                 message_id: None,
             },

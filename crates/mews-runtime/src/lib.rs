@@ -1,16 +1,16 @@
 //! Durable orchestration that connects the generic agent brain to MEWS state.
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use mews_agent::{
     AgentCapabilities, AgentEvent, AgentLoopConfig, AgentRuntime, CancellationToken,
-    ContextDocument, LifecycleHook, MessageContent, MessageRole, ModelMessage, ModelRequest,
-    NextTurnUpdate, ProgressReporter, Provider, ToolCall, ToolDecision, ToolDefinition,
-    ToolExecutionMode, ToolResult, TurnDecision,
+    ContextDocument, ContextSnapshot, LifecycleHook, MessageContent, MessageRole, ModelMessage,
+    ModelRequest, NextTurnUpdate, ProgressReporter, Provider, ToolCall, ToolDecision,
+    ToolDefinition, ToolResult, TurnDecision,
 };
-use mews_protocol::{AgentConfig, ReasoningEffort, ToolExecutionMode as ConfigToolExecution};
+use mews_protocol::{AgentConfig, ReasoningEffort, ToolExecutionMode};
 use serde_json::Value;
 
 mod prompt;
@@ -30,7 +30,7 @@ pub struct RuntimeConfig {
     pub model: String,
     pub reasoning: Option<ReasoningEffort>,
     pub allowed_tools: Vec<String>,
-    pub tool_execution: ConfigToolExecution,
+    pub tool_execution: ToolExecutionMode,
     pub cwd: PathBuf,
     pub soul: String,
     pub cancellation: CancellationToken,
@@ -53,54 +53,9 @@ pub struct HarnessRun<'a> {
 
 pub type HarnessOutcome = String;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct HarnessCapabilities {
-    pub mcp: bool,
-    pub continuation: bool,
-}
-
 #[async_trait(?Send)]
 pub trait Harness: Send + Sync {
     async fn run(&self, input: HarnessRun<'_>) -> Result<HarnessOutcome>;
-    fn capabilities(&self) -> HarnessCapabilities;
-}
-
-/// Logical Harness resolution stays independent from the implementation a
-/// Host registered for that name. Missing Harnesses fail; they never fall back.
-pub struct HarnessDispatcher<'a> {
-    harnesses: BTreeMap<&'a str, &'a dyn Harness>,
-}
-
-impl<'a> HarnessDispatcher<'a> {
-    pub fn new() -> Self {
-        Self {
-            harnesses: BTreeMap::new(),
-        }
-    }
-
-    pub fn register(&mut self, name: &'a str, harness: &'a dyn Harness) -> Result<()> {
-        if name.is_empty() {
-            bail!("Harness name must not be empty");
-        }
-        if self.harnesses.insert(name, harness).is_some() {
-            bail!("Harness {name:?} is registered more than once");
-        }
-        Ok(())
-    }
-
-    pub async fn run(&self, name: &str, input: HarnessRun<'_>) -> Result<HarnessOutcome> {
-        let harness = self
-            .harnesses
-            .get(name)
-            .with_context(|| format!("Harness {name:?} is not available on this Host"))?;
-        harness.run(input).await
-    }
-}
-
-impl Default for HarnessDispatcher<'_> {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 /// The native MEWS Harness is the existing in-process model/tool loop.
@@ -139,14 +94,9 @@ impl Harness for MewsHarness {
         )
         .await
     }
-
-    fn capabilities(&self) -> HarnessCapabilities {
-        HarnessCapabilities::default()
-    }
 }
 
-/// Convenience entry point retained for callers that intentionally run the
-/// native Harness directly. Hub execution uses `HarnessDispatcher` instead.
+/// Convenience entry point for callers running the native Harness directly.
 pub async fn run<E: AgentCapabilities>(
     provider: &dyn Provider,
     environment: &E,
@@ -176,25 +126,26 @@ async fn run_mews(
     store: &dyn ConversationStore,
     config: RuntimeConfig,
 ) -> Result<HarnessOutcome> {
-    let execution = match config.tool_execution {
-        ConfigToolExecution::Sequential => ToolExecutionMode::Sequential,
-        ConfigToolExecution::Parallel => ToolExecutionMode::Parallel,
-    };
-    let runtime = MewsRuntime {
-        environment,
-        store,
-        config: &config,
-    };
     store.begin_run()?;
-    let outcome = mews_agent::run_with_config(
-        provider,
-        &runtime,
-        AgentLoopConfig {
-            tool_execution: execution,
-            cancellation: config.cancellation.clone(),
-            ..AgentLoopConfig::default()
-        },
-    )
+    let outcome = async {
+        let context = environment.context(&config.cwd).await?;
+        let runtime = MewsRuntime {
+            environment,
+            store,
+            config: &config,
+            context: &context,
+        };
+        mews_agent::run_with_config(
+            provider,
+            &runtime,
+            AgentLoopConfig {
+                tool_execution: config.tool_execution,
+                cancellation: config.cancellation.clone(),
+                ..AgentLoopConfig::default()
+            },
+        )
+        .await
+    }
     .await;
     let persisted = store.finish_run(
         outcome
@@ -254,17 +205,17 @@ struct MewsRuntime<'a, E: AgentCapabilities + ?Sized> {
     environment: &'a E,
     store: &'a dyn ConversationStore,
     config: &'a RuntimeConfig,
+    context: &'a ContextSnapshot,
 }
 
 #[async_trait(?Send)]
 impl<E: AgentCapabilities + ?Sized> AgentRuntime for MewsRuntime<'_, E> {
     async fn request(&self, tools: Vec<ToolDefinition>) -> Result<ModelRequest> {
-        let snapshot = self.environment.context(&self.config.cwd).await?;
         let mut system = self.config.soul.clone();
-        append_project_context(&mut system, snapshot.documents);
-        if !snapshot.skills.is_empty() {
+        append_project_context(&mut system, &self.context.documents);
+        if !self.context.skills.is_empty() {
             system.push_str("\n\n<available_skills>\n");
-            for skill in snapshot.skills {
+            for skill in &self.context.skills {
                 system.push_str(&format!(
                     "<skill name={:?} description={:?} path={:?} />\n",
                     skill.name, skill.description, skill.path
@@ -272,9 +223,9 @@ impl<E: AgentCapabilities + ?Sized> AgentRuntime for MewsRuntime<'_, E> {
             }
             system.push_str("</available_skills>");
         }
-        if !snapshot.prompts.is_empty() {
+        if !self.context.prompts.is_empty() {
             system.push_str("\n\n<available_prompts>\n");
-            for prompt in snapshot.prompts {
+            for prompt in &self.context.prompts {
                 system.push_str(&format!(
                     "<prompt name={:?} description={:?} path={:?} />\n",
                     prompt.name, prompt.description, prompt.path
@@ -311,14 +262,6 @@ impl<E: AgentCapabilities + ?Sized> AgentRuntime for MewsRuntime<'_, E> {
         cancellation: &CancellationToken,
         progress: &dyn ProgressReporter,
     ) -> Result<ToolResult> {
-        if !self
-            .tools()
-            .await?
-            .iter()
-            .any(|tool| tool.name == call.name)
-        {
-            bail!("model requested unavailable tool {:?}", call.name);
-        }
         self.environment
             .execute(call, &self.config.cwd, cancellation, progress)
             .await
@@ -445,7 +388,7 @@ fn tool_allowed(pattern: &str, name: &str) -> bool {
             .is_some_and(|prefix| name.starts_with(prefix))
 }
 
-fn append_project_context(system: &mut String, documents: Vec<ContextDocument>) {
+fn append_project_context(system: &mut String, documents: &[ContextDocument]) {
     for document in documents {
         system.push_str(&format!(
             "\n\n<project_instruction path={:?}>\n{}\n</project_instruction>",
@@ -456,9 +399,21 @@ fn append_project_context(system: &mut String, documents: Vec<ContextDocument>) 
 
 #[cfg(test)]
 mod tests {
-    use super::{MewsHarnessOptions, append_project_context, tool_allowed};
-    use mews_agent::ContextDocument;
-    use mews_protocol::AgentConfig;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use mews_agent::{
+        ContextDocument, ContextSnapshot, ModelResponse, ModelStream, ModelStreamEvent,
+        ProviderError, ResourceDescriptor,
+    };
+    use mews_protocol::{AgentConfig, ToolExecutionMode};
+    use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn tool_allowlist_supports_exact_prefix_and_global_patterns() {
@@ -473,7 +428,7 @@ mod tests {
         let mut system = "soul".to_owned();
         append_project_context(
             &mut system,
-            vec![
+            &[
                 ContextDocument {
                     path: "/project/AGENTS.md".into(),
                     content: "broad".into(),
@@ -506,5 +461,139 @@ mod tests {
         let unknown =
             AgentConfig::parse("harness = \"mews\"\n[harness_options]\nmode = \"fast\"\n").unwrap();
         assert!(MewsHarnessOptions::from_agent(&unknown).is_err());
+    }
+
+    struct SnapshotEnvironment {
+        contexts: AtomicUsize,
+        catalogs: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AgentCapabilities for SnapshotEnvironment {
+        async fn context(&self, _: &std::path::Path) -> Result<ContextSnapshot> {
+            self.contexts.fetch_add(1, Ordering::SeqCst);
+            Ok(ContextSnapshot {
+                documents: vec![ContextDocument {
+                    path: "AGENTS.md".into(),
+                    content: "stable".into(),
+                }],
+                skills: Vec::<ResourceDescriptor>::new(),
+                prompts: Vec::<ResourceDescriptor>::new(),
+            })
+        }
+
+        fn tools(&self) -> Vec<ToolDefinition> {
+            self.catalogs.fetch_add(1, Ordering::SeqCst);
+            vec![ToolDefinition {
+                name: "work".into(),
+                description: "work".into(),
+                schema: json!({"type":"object"}),
+            }]
+        }
+
+        async fn execute(
+            &self,
+            _: &ToolCall,
+            _: &std::path::Path,
+            _: &CancellationToken,
+            _: &dyn ProgressReporter,
+        ) -> Result<ToolResult> {
+            Ok(ToolResult::success(json!({"ok": true})))
+        }
+
+        async fn hook(
+            &self,
+            _: LifecycleHook,
+            payload: Value,
+            _: &std::path::Path,
+        ) -> Result<Value> {
+            Ok(payload)
+        }
+    }
+
+    #[derive(Default)]
+    struct MemoryStore(Mutex<Vec<ModelMessage>>);
+
+    impl ConversationStore for MemoryStore {
+        fn begin_run(&self) -> Result<()> {
+            Ok(())
+        }
+        fn finish_run(&self, _: Option<&str>) -> Result<()> {
+            Ok(())
+        }
+        fn history(&self) -> Result<Vec<ModelMessage>> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        fn append(&self, message: ModelMessage) -> Result<()> {
+            self.0.lock().unwrap().push(message);
+            Ok(())
+        }
+        fn assistant_delta(&self, _: String) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct TwoTurnProvider(AtomicUsize);
+
+    #[async_trait]
+    impl Provider for TwoTurnProvider {
+        async fn generate(
+            &self,
+            _: ModelRequest,
+        ) -> std::result::Result<ModelResponse, ProviderError> {
+            unreachable!()
+        }
+
+        async fn stream(&self, _: ModelRequest) -> std::result::Result<ModelStream, ProviderError> {
+            let events = if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                vec![
+                    ModelStreamEvent::Start,
+                    ModelStreamEvent::ToolCall {
+                        id: "call-1".into(),
+                        name: "work".into(),
+                        arguments: json!({}),
+                        thought_signature: None,
+                    },
+                    ModelStreamEvent::Done,
+                ]
+            } else {
+                vec![
+                    ModelStreamEvent::Start,
+                    ModelStreamEvent::TextDelta("done".into()),
+                    ModelStreamEvent::Done,
+                ]
+            };
+            Ok(Box::pin(futures_util::stream::iter(
+                events.into_iter().map(Ok),
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshots_context_once_and_tools_once_per_turn() {
+        let environment = SnapshotEnvironment {
+            contexts: AtomicUsize::new(0),
+            catalogs: AtomicUsize::new(0),
+        };
+        let answer = run(
+            &TwoTurnProvider(AtomicUsize::new(0)),
+            &environment,
+            &MemoryStore::default(),
+            RuntimeConfig {
+                model: "test/model".into(),
+                reasoning: None,
+                allowed_tools: vec!["*".into()],
+                tool_execution: ToolExecutionMode::Parallel,
+                cwd: ".".into(),
+                soul: "soul".into(),
+                cancellation: CancellationToken::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(answer, "done");
+        assert_eq!(environment.contexts.load(Ordering::SeqCst), 1);
+        assert_eq!(environment.catalogs.load(Ordering::SeqCst), 2);
     }
 }

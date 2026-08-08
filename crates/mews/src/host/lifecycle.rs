@@ -22,7 +22,7 @@ pub(crate) type AcpBindingWaiters = Arc<Mutex<HashMap<String, std::sync::mpsc::S
 
 struct HostPermissionHandler {
     request_id: RequestId,
-    events: tokio::sync::mpsc::UnboundedSender<HostToHub>,
+    events: tokio::sync::mpsc::Sender<HostToHub>,
     waiters: AcpPermissionWaiters,
 }
 
@@ -63,6 +63,7 @@ impl mews_acp::AcpPermissionHandler for HostPermissionHandler {
                 request_id: self.request_id.clone(),
                 request,
             })
+            .await
             .map_err(|_| anyhow::anyhow!("Hub disconnected during ACP permission request"))?;
         let selected = tokio::select! {
             _ = cancellation.cancelled() => None,
@@ -85,16 +86,17 @@ pub(crate) async fn handle_host_request(
     agent_root: Option<&Path>,
     message: HubToHost,
 ) -> HostToHub {
-    handle_host_request_streaming(registry, agent_root, message, None, None, None).await
+    handle_host_request_streaming(registry, agent_root, message, None, None, None, None).await
 }
 
 pub(crate) async fn handle_host_request_streaming(
     registry: &ToolRegistry,
     agent_root: Option<&Path>,
     message: HubToHost,
-    events: Option<tokio::sync::mpsc::UnboundedSender<HostToHub>>,
+    events: Option<tokio::sync::mpsc::Sender<HostToHub>>,
     permission_waiters: Option<AcpPermissionWaiters>,
     binding_waiters: Option<AcpBindingWaiters>,
+    cancellation: Option<mews_agent::CancellationToken>,
 ) -> HostToHub {
     if let Some(response) = mews_host::handle_execution_request(registry, &message).await {
         return response;
@@ -225,7 +227,7 @@ pub(crate) async fn handle_host_request_streaming(
                 Err(error) => HostToHub::AgentReplica {
                     request_id,
                     replica: None,
-                    error: Some(error.to_string()),
+                    error: Some(format!("{error:#}")),
                 },
             }
         }
@@ -239,6 +241,7 @@ pub(crate) async fn handle_host_request_streaming(
             recovery_prompt,
             acp_session_id,
         } => {
+            let cancellation = cancellation.unwrap_or_default();
             let result = async {
                 let root = agent_root.context("external Harness execution requires a Host root")?;
                 let resolved = canonical_cwd
@@ -291,6 +294,26 @@ pub(crate) async fn handle_host_request_streaming(
                 std::thread::Builder::new()
                     .name("mews-acp-run".into())
                     .spawn(move || {
+                        // ACP's stream callback is synchronous. A bounded sync
+                        // handoff preserves backpressure without blocking the
+                        // current-thread ACP runtime on Tokio's async sender.
+                        let (callback_events, forwarder) = event_sender
+                            .map(|event_sender| {
+                                let (callback_events, events) = std::sync::mpsc::sync_channel(
+                                    super::ACP_EVENT_CHANNEL_CAPACITY,
+                                );
+                                let forwarder = std::thread::Builder::new()
+                                    .name("mews-acp-events".into())
+                                    .spawn(move || {
+                                        while let Ok(event) = events.recv() {
+                                            if event_sender.blocking_send(event).is_err() {
+                                                break;
+                                            }
+                                        }
+                                    });
+                                (callback_events, forwarder)
+                            })
+                            .unzip();
                         let result = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
                             .build()
@@ -312,6 +335,7 @@ pub(crate) async fn handle_host_request_streaming(
                                         },
                                         &environment,
                                         &tools,
+                                        cancellation,
                                         &mut |event| {
                                             if let mews_acp::AcpStreamEvent::SessionBound {
                                                 session_id,
@@ -323,7 +347,7 @@ pub(crate) async fn handle_host_request_streaming(
                                                 if let Some(waiters) = &binding_waiters {
                                                     waiters.lock().expect("ACP binding waiters poisoned").insert(acknowledgement_id.clone(), acknowledge);
                                                 }
-                                                if let Some(sender) = &event_sender {
+                                                if let Some(sender) = &callback_events {
                                                     sender.send(HostToHub::AcpEvent {
                                                         request_id: event_request_id.clone(),
                                                         event: mews_protocol::AcpEvent::SessionBound {
@@ -389,7 +413,7 @@ pub(crate) async fn handle_host_request_streaming(
                                                 mews_acp::AcpStreamEvent::SessionBound { .. } => unreachable!(),
                                             };
                                             for event in events {
-                                                if let Some(sender) = &event_sender {
+                                                if let Some(sender) = &callback_events {
                                                     sender
                                                         .send(HostToHub::AcpEvent {
                                                             request_id: event_request_id.clone(),
@@ -407,6 +431,18 @@ pub(crate) async fn handle_host_request_streaming(
                                     ),
                                 )
                             });
+                        drop(callback_events);
+                        if let Some(forwarder) = forwarder {
+                            match forwarder {
+                                Ok(forwarder) => {
+                                    let _ = forwarder.join();
+                                }
+                                Err(error) => {
+                                    let _ = sender.send(Err(error.into()));
+                                    return;
+                                }
+                            }
+                        }
                         let _ = sender.send(result);
                     })
                     .context("start ACP extension thread")?;
@@ -414,7 +450,8 @@ pub(crate) async fn handle_host_request_streaming(
                     .await
                     .context("ACP extension thread ended before replying")?;
                 if let Err(error) = &outcome
-                    && is_authentication_error(error)
+                    && mews_acp::classify_error(error)
+                        == Some(mews_acp::AcpErrorKind::AuthenticationRequired)
                 {
                     let _ =
                         mews_host::HarnessCatalog::invalidate_authentication(root, &failed_harness);
@@ -428,6 +465,25 @@ pub(crate) async fn handle_host_request_streaming(
                     answer: Some(outcome.answer),
                     acp_session_id: Some(outcome.session_id),
                     session_replaced: outcome.session_replaced,
+                    timings: Some(mews_protocol::AcpTimings {
+                        spawn_ms: outcome.timings.spawn.as_millis() as u64,
+                        initialize_ms: outcome.timings.initialize.as_millis() as u64,
+                        continuation_ms: outcome.timings.continuation.as_millis() as u64,
+                    }),
+                    stop_reason: Some(match outcome.stop_reason {
+                        mews_acp::AcpStopReason::EndTurn => mews_protocol::AcpStopReason::EndTurn,
+                        mews_acp::AcpStopReason::MaxTokens => {
+                            mews_protocol::AcpStopReason::MaxTokens
+                        }
+                        mews_acp::AcpStopReason::MaxTurnRequests => {
+                            mews_protocol::AcpStopReason::MaxTurnRequests
+                        }
+                        mews_acp::AcpStopReason::Refusal => mews_protocol::AcpStopReason::Refusal,
+                        mews_acp::AcpStopReason::Cancelled => {
+                            mews_protocol::AcpStopReason::Cancelled
+                        }
+                        mews_acp::AcpStopReason::Other => mews_protocol::AcpStopReason::Other,
+                    }),
                     error: None,
                 },
                 Err(error) => HostToHub::AcpResult {
@@ -435,13 +491,16 @@ pub(crate) async fn handle_host_request_streaming(
                     answer: None,
                     acp_session_id: None,
                     session_replaced: false,
+                    timings: None,
+                    stop_reason: None,
                     error: Some(error.to_string()),
                 },
             }
         }
         HubToHost::AttestDirectory { .. }
         | HubToHost::ExecuteTool { .. }
-        | HubToHost::ExecuteHook { .. } => {
+        | HubToHost::ExecuteHook { .. }
+        | HubToHost::CancelAcp { .. } => {
             unreachable!("execution requests are handled by mews-host")
         }
         HubToHost::SynchronizeAgent {
@@ -449,9 +508,16 @@ pub(crate) async fn handle_host_request_streaming(
             agent,
             revision,
             expected_replica,
+            previous_slug,
         } => {
             let result = agent_root.map_or(Ok(()), |root| {
-                materialize_agent(root, &agent, &revision, expected_replica.as_ref())
+                materialize_agent(
+                    root,
+                    &agent,
+                    &revision,
+                    expected_replica.as_ref(),
+                    previous_slug.as_deref(),
+                )
             });
             HostToHub::AgentSynchronized {
                 request_id,
@@ -460,20 +526,6 @@ pub(crate) async fn handle_host_request_streaming(
         }
         HubToHost::Ping { nonce } => HostToHub::Pong { nonce },
     }
-}
-
-fn is_authentication_error(error: &anyhow::Error) -> bool {
-    let text = format!("{error:#}").to_ascii_lowercase();
-    [
-        "auth",
-        "login",
-        "log in",
-        "credential",
-        "unauthorized",
-        "401",
-    ]
-    .iter()
-    .any(|needle| text.contains(needle))
 }
 
 fn split_stream_delta(text: &str) -> Vec<String> {
@@ -580,6 +632,7 @@ fn begin_hub_transfer(root: &Path, transfer: HubTransferStart) -> Result<()> {
         "auth.json.incoming",
         "auth.json.prepared",
         "hub-transfer.json",
+        "hub-transfer.activated.json",
         "hub-activation-token",
     ] {
         let path = root.join(name);
@@ -631,9 +684,20 @@ fn write_hub_transfer(root: &Path, offset: u64, data: &[u8]) -> Result<u64> {
 fn commit_hub_transfer(root: &Path) -> Result<()> {
     let manifest: HubTransferManifest =
         serde_json::from_slice(&std::fs::read(root.join("hub-transfer.json"))?)?;
-    let database = std::fs::read(root.join("mews.db.incoming"))?;
-    if database.len() as u64 != manifest.database_size
-        || format!("{:x}", Sha256::digest(&database)) != manifest.database_sha256
+    let mut database = std::fs::File::open(root.join("mews.db.incoming"))?;
+    let mut database_hash = Sha256::new();
+    let mut chunk = [0_u8; 96 * 1024];
+    let mut database_size = 0_u64;
+    loop {
+        let read = std::io::Read::read(&mut database, &mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        database_size += read as u64;
+        sha2::Digest::update(&mut database_hash, &chunk[..read]);
+    }
+    if database_size != manifest.database_size
+        || format!("{:x}", database_hash.finalize()) != manifest.database_sha256
     {
         bail!("Hub database transfer failed integrity verification");
     }
@@ -695,8 +759,29 @@ fn arm_hub_transfer(root: &Path, move_nonce: &str) -> Result<()> {
 
 #[doc(hidden)]
 pub fn activate_hub_transfer(root: &Path) -> Result<()> {
-    let manifest: HubTransferManifest =
-        serde_json::from_slice(&std::fs::read(root.join("hub-transfer.json"))?)?;
+    let manifest_path = root.join("hub-transfer.json");
+    let receipt_path = root.join("hub-transfer.activated.json");
+    if !manifest_path.exists() {
+        let receipt: HubTransferManifest = serde_json::from_slice(&std::fs::read(&receipt_path)?)?;
+        if database_matches_transfer(&root.join("mews.db"), &receipt)? {
+            return Ok(());
+        }
+        bail!("completed Hub activation receipt does not match the active database");
+    }
+    let manifest: HubTransferManifest = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+    if receipt_path.exists() {
+        let receipt: HubTransferManifest = serde_json::from_slice(&std::fs::read(&receipt_path)?)?;
+        if serde_json::to_vec(&receipt)? != serde_json::to_vec(&manifest)?
+            || !database_matches_transfer(&root.join("mews.db"), &manifest)?
+        {
+            bail!("completed Hub activation receipt does not match the prepared transfer");
+        }
+        let _ = std::fs::remove_file(root.join("hub-activate"));
+        let _ = std::fs::remove_file(root.join("hub-activation-token"));
+        let _ = std::fs::remove_file(manifest_path);
+        sync_directory(root)?;
+        return Ok(());
+    }
     let token = std::fs::read_to_string(root.join("hub-activation-token"))?;
     if token != manifest.move_nonce {
         bail!("prepared Hub has no valid source-issued activation token");
@@ -712,29 +797,91 @@ pub fn activate_hub_transfer(root: &Path) -> Result<()> {
         ("secrets/hub-noise.key.prepared", "secrets/hub-noise.key"),
         ("auth.json.prepared", "auth.json"),
     ] {
-        if !root.join(active).exists() {
+        if root.join(prepared).exists() && !root.join(active).exists() {
             std::fs::rename(root.join(prepared), root.join(active))?;
-        } else {
-            if std::fs::read(root.join(prepared))? != std::fs::read(root.join(active))? {
-                bail!("prepared Hub credential differs from the installation credential");
+        } else if root.join(prepared).exists() {
+            if std::fs::read(root.join(prepared))? == std::fs::read(root.join(active))? {
+                std::fs::remove_file(root.join(prepared))?;
+            } else {
+                let active_path = root.join(active);
+                retain_previous_file(
+                    active_path
+                        .parent()
+                        .context("Hub credential has no parent")?,
+                    active_path
+                        .file_name()
+                        .context("Hub credential has no file name")?
+                        .to_str()
+                        .context("Hub credential name is not UTF-8")?,
+                )?;
+                std::fs::rename(root.join(prepared), active_path)?;
             }
-            std::fs::remove_file(root.join(prepared))?;
+        } else if !root.join(active).exists() {
+            bail!("prepared Hub credential is missing: {prepared}");
         }
     }
-    if root.join("mews.db").exists() {
-        std::fs::rename(
-            root.join("mews.db"),
-            root.join(format!("mews.db.previous-{}", uuid::Uuid::now_v7())),
-        )?;
+
+    let active_database = root.join("mews.db");
+    let prepared_database = root.join("mews.db.prepared");
+    if database_matches_transfer(&active_database, &manifest)? {
+        if prepared_database.exists() {
+            if !database_matches_transfer(&prepared_database, &manifest)? {
+                bail!("prepared Hub database does not match the authorized handoff");
+            }
+            std::fs::remove_file(&prepared_database)?;
+        }
+    } else {
+        if !database_matches_transfer(&prepared_database, &manifest)? {
+            bail!("prepared Hub database is missing or does not match the authorized handoff");
+        }
+        if active_database.exists() {
+            retain_previous_file(root, "mews.db")?;
+        }
+        std::fs::rename(&prepared_database, &active_database)?;
     }
-    std::fs::rename(root.join("mews.db.prepared"), root.join("mews.db"))?;
     if !root.join("hub-promote").exists() {
         write_private(root.join("hub-promote"), b"ready")?;
     }
+    let receipt = serde_json::to_vec(&manifest)?;
+    if receipt_path.exists() {
+        if std::fs::read(&receipt_path)? != receipt {
+            bail!("existing Hub activation receipt belongs to another transfer");
+        }
+    } else {
+        write_private(receipt_path, &receipt)?;
+    }
     let _ = std::fs::remove_file(root.join("hub-activate"));
     let _ = std::fs::remove_file(root.join("hub-activation-token"));
-    let _ = std::fs::remove_file(root.join("hub-transfer.json"));
+    let _ = std::fs::remove_file(manifest_path);
     sync_directory(root)?;
+    Ok(())
+}
+
+fn database_matches_transfer(path: &Path, manifest: &HubTransferManifest) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let store = Store::open(path)?;
+    let Some(installation) = store.installation()? else {
+        return Ok(false);
+    };
+    Ok(installation.id == manifest.installation_id
+        && installation.generation == manifest.generation
+        && installation.hub_host_id == manifest.target_host_id)
+}
+
+fn retain_previous_file(root: &Path, name: &str) -> Result<()> {
+    let prefix = format!("{name}.previous-");
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    std::fs::rename(
+        root.join(name),
+        root.join(format!("{prefix}{}", uuid::Uuid::now_v7())),
+    )?;
     Ok(())
 }
 
@@ -784,19 +931,25 @@ fn materialize_agent(
     agent: &Agent,
     revision: &AgentRevision,
     expected: Option<&AgentReplica>,
+    previous_slug: Option<&str>,
 ) -> Result<()> {
     if revision.agent_id != agent.id || revision.revision != agent.current_revision {
         bail!("agent revision does not match agent");
     }
     let directory = root.join("agents").join(&agent.slug);
-    if read_agent(root, &agent.slug)?.as_ref() != expected {
+    let observed_slug = previous_slug.unwrap_or(&agent.slug);
+    if read_agent(root, observed_slug)?.as_ref() != expected {
         bail!("agent replica changed while synchronizing; local files were left untouched");
+    }
+    if previous_slug.is_some() && directory.exists() {
+        bail!("renamed agent destination already exists; local files were left untouched");
     }
     if expected.is_some_and(|replica| {
         replica.revision == revision.revision
             && replica.soul == revision.soul
             && replica.config_toml == revision.config_toml
-    }) {
+    }) && previous_slug.is_none()
+    {
         return Ok(());
     }
     let agents = root.join("agents");
@@ -807,21 +960,34 @@ fn materialize_agent(
     std::fs::write(staged.join("SOUL.md"), &revision.soul)?;
     std::fs::write(staged.join("agent.toml"), &revision.config_toml)?;
     std::fs::write(staged.join(".revision"), revision.revision.to_string())?;
-    let backup = if directory.exists() {
-        let backup = agents.join(format!(".{}.previous-{unique}", agent.slug));
-        std::fs::rename(&directory, &backup)?;
+    let previous_directory = root.join("agents").join(observed_slug);
+    let backup = if previous_directory.exists() {
+        let backup = agents.join(format!(".{observed_slug}.previous-{unique}"));
+        std::fs::rename(&previous_directory, &backup)?;
         Some(backup)
     } else {
         None
     };
     if let Err(error) = std::fs::rename(&staged, &directory) {
         if let Some(backup) = &backup {
-            let _ = std::fs::rename(backup, &directory);
+            let _ = std::fs::rename(backup, &previous_directory);
         }
         return Err(error.into());
     }
-    // Previous directories are intentionally retained: an editor with an open
-    // file can still finish writing there after the atomic directory swap.
+    retain_previous_agent_directories(&agents, observed_slug)?;
+    Ok(())
+}
+
+fn retain_previous_agent_directories(agents: &Path, slug: &str) -> Result<()> {
+    let prefix = format!(".{slug}.previous-");
+    let mut previous = std::fs::read_dir(agents)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+        .collect::<Vec<_>>();
+    previous.sort_by_key(|entry| entry.file_name());
+    for stale in previous.into_iter().rev().skip(1) {
+        std::fs::remove_dir_all(stale.path())?;
+    }
     Ok(())
 }
 

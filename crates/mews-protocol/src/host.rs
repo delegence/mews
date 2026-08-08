@@ -56,6 +56,7 @@ pub enum HubToHost {
     WriteHubTransfer {
         request_id: RequestId,
         offset: u64,
+        #[serde(with = "base64_bytes")]
         data: Vec<u8>,
     },
     CommitHubTransfer {
@@ -115,6 +116,9 @@ pub enum HubToHost {
         #[serde(default)]
         acp_session_id: Option<String>,
     },
+    CancelAcp {
+        request_id: RequestId,
+    },
     ResolveAcpPermission {
         permission_id: String,
         #[serde(default)]
@@ -132,6 +136,9 @@ pub enum HubToHost {
         agent: Agent,
         revision: AgentRevision,
         expected_replica: Option<AgentReplica>,
+        /// When renaming, the Host verifies and retires this old replica only
+        /// after the new canonical replica is durable.
+        previous_slug: Option<String>,
     },
     RefreshHarnessCatalog {
         request_id: RequestId,
@@ -139,6 +146,47 @@ pub enum HubToHost {
     Ping {
         nonce: u64,
     },
+}
+
+mod base64_bytes {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        STANDARD.decode(encoded).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worst_case_hub_transfer_chunk_fits_the_host_frame() {
+        let data = vec![u8::MAX; 128 * 1024];
+        let encoded = encode(HubToHost::WriteHubTransfer {
+            request_id: RequestId::new(),
+            offset: 0,
+            data: data.clone(),
+        })
+        .unwrap();
+        assert!(encoded.len() < MAX_HOST_FRAME_BYTES);
+        let decoded: HubToHost = decode(&encoded).unwrap();
+        assert!(
+            matches!(decoded, HubToHost::WriteHubTransfer { data: value, .. } if value == data)
+        );
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -175,9 +223,6 @@ pub enum HostToHub {
     ToolCatalogChanged {
         tools: Vec<ToolDefinition>,
     },
-    HarnessCatalogChanged {
-        harnesses: Vec<HarnessDescriptor>,
-    },
     HarnessCatalog {
         request_id: RequestId,
         harnesses: Vec<HarnessDescriptor>,
@@ -199,6 +244,8 @@ pub enum HostToHub {
         acp_session_id: Option<String>,
         #[serde(default)]
         session_replaced: bool,
+        stop_reason: Option<AcpStopReason>,
+        timings: Option<AcpTimings>,
         error: Option<String>,
     },
     /// A bounded, non-authoritative observation emitted while an ACP run is
@@ -238,6 +285,24 @@ pub enum HostToHub {
     Pong {
         nonce: u64,
     },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpStopReason {
+    EndTurn,
+    MaxTokens,
+    MaxTurnRequests,
+    Refusal,
+    Cancelled,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcpTimings {
+    pub spawn_ms: u64,
+    pub initialize_ms: u64,
+    pub continuation_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

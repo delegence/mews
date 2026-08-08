@@ -50,25 +50,32 @@ pub(super) async fn transfer_hub_snapshot(
     snapshot: &crate::service::HubSnapshot,
 ) -> Result<()> {
     use sha2::{Digest, Sha256};
-    let hash = format!("{:x}", Sha256::digest(&snapshot.database));
     host.begin_hub_transfer(mews_protocol::HubTransferStart {
         move_nonce: snapshot.move_nonce.clone(),
         installation_id: snapshot.installation_id.clone(),
         generation: snapshot.generation,
         target_host_id: snapshot.target_hub.clone(),
-        database_size: snapshot.database.len() as u64,
-        database_sha256: hash,
+        database_size: snapshot.database_size,
+        database_sha256: snapshot.database_sha256.clone(),
         installation_key: snapshot.installation_key.clone(),
         hub_noise_key: snapshot.hub_noise_key.clone(),
         credentials: snapshot.credentials.clone(),
         credentials_sha256: format!("{:x}", Sha256::digest(&snapshot.credentials)),
     })
     .await?;
+    let mut database = tokio::fs::File::open(&snapshot.database_path).await?;
+    let mut chunk = vec![0_u8; 96 * 1024];
     let mut offset = 0_u64;
-    for chunk in snapshot.database.chunks(96 * 1024) {
-        offset = host.write_hub_transfer(offset, chunk.to_vec()).await?;
+    loop {
+        let read = tokio::io::AsyncReadExt::read(&mut database, &mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        offset = host
+            .write_hub_transfer(offset, chunk[..read].to_vec())
+            .await?;
     }
-    if offset != snapshot.database.len() as u64 {
+    if offset != snapshot.database_size {
         bail!("target Host acknowledged the wrong snapshot length");
     }
     host.commit_hub_transfer().await

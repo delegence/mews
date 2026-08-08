@@ -20,7 +20,8 @@ use mews_store::Store;
 
 pub const DEFAULT_SOUL: &str =
     "You are a capable, practical agent. Be concise and use tools when they help.";
-pub const DEFAULT_CONFIG: &str = "tools = [\"*\"]\n";
+#[cfg(test)]
+pub const DEFAULT_CONFIG: &str = "harness = \"mews\"\ntools = [\"*\"]\n";
 const REVISION_FILE: &str = ".revision";
 const DATABASE_FILE: &str = "mews.db";
 
@@ -33,7 +34,9 @@ pub struct HubSnapshot {
     pub move_nonce: String,
     pub installation_id: crate::InstallationId,
     pub generation: u64,
-    pub database: Vec<u8>,
+    pub database_path: PathBuf,
+    pub database_size: u64,
+    pub database_sha256: String,
     pub installation_key: Vec<u8>,
     pub hub_noise_key: Vec<u8>,
     pub credentials: Vec<u8>,
@@ -41,12 +44,14 @@ pub struct HubSnapshot {
     pub target_hub: crate::HostId,
 }
 
+mod acp_execution;
 mod agents;
 mod core;
 mod handoff;
 mod providers;
+mod runs;
 mod sessions;
-pub(crate) use sessions::StartedRun;
+pub(crate) use runs::StartedRun;
 
 #[cfg(test)]
 use sessions::{parse_prompt_arguments, substitute_prompt_arguments};
@@ -131,6 +136,27 @@ mod tests {
     }
 
     #[test]
+    fn rename_agent_moves_the_editable_replica_after_synchronizing_it() {
+        let root = tempfile::tempdir().unwrap();
+        let mut mews = Mews::setup(root.path(), "laptop").unwrap();
+        mews.create_agent("coder").unwrap();
+        std::fs::write(root.path().join("agents/coder/SOUL.md"), "locally edited").unwrap();
+
+        let renamed = mews.rename_agent("coder", "builder").unwrap();
+
+        assert_eq!(renamed.slug, "builder");
+        assert!(!root.path().join("agents/coder").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("agents/builder/SOUL.md")).unwrap(),
+            "locally edited"
+        );
+        assert_eq!(
+            mews.agent_revision(&renamed).unwrap().soul,
+            "locally edited"
+        );
+    }
+
+    #[test]
     fn new_agents_preserve_the_requested_harness_and_its_options() {
         let root = tempfile::tempdir().unwrap();
         let mut mews = Mews::setup(root.path(), "laptop").unwrap();
@@ -176,6 +202,15 @@ mod tests {
                 model: Some("gpt-5.6-codex".into()),
                 reasoning: Some(crate::ReasoningEffort::Medium),
             }
+        );
+        let error = mews
+            .set_session_model(&session.id, Some("gpt-5.6-codex-mini"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("only supported by the native mews Harness"));
+        assert_eq!(
+            mews.store.session(&session.id).unwrap().model_override,
+            None
         );
     }
 
@@ -328,9 +363,7 @@ mod tests {
         let target = mews.enroll_host(&offer, &request).unwrap();
 
         let snapshot = mews.begin_hub_move(&target.id).unwrap();
-        let snapshot_path = root.path().join("inspect.db");
-        std::fs::write(&snapshot_path, &snapshot.database).unwrap();
-        let snapshot_store = Store::open(&snapshot_path).unwrap();
+        let snapshot_store = Store::open(&snapshot.database_path).unwrap();
         let promoted = snapshot_store.installation().unwrap().unwrap();
         assert_eq!(promoted.hub_host_id, target.id);
         assert_eq!(promoted.generation, 2);
@@ -339,6 +372,48 @@ mod tests {
         let rolled_back = mews.installation().unwrap();
         assert_eq!(rolled_back.hub_host_id, original);
         assert_eq!(rolled_back.generation, 3);
+    }
+
+    #[test]
+    fn demoted_host_state_contains_trust_material_but_no_join_offer() {
+        let root = tempfile::tempdir().unwrap();
+        let joining = tempfile::tempdir().unwrap();
+        let mut mews = Mews::setup(root.path(), "laptop").unwrap();
+        let offer = mews.create_invitation(Some("ws://127.0.0.1:9000")).unwrap();
+        let identity =
+            HostIdentity::load_or_create(&joining.path().join("secrets/host.key")).unwrap();
+        let noise =
+            NoiseIdentity::load_or_create(&joining.path().join("secrets/host-noise.key")).unwrap();
+        let request = crate::enrollment::JoinRequest::create(
+            &offer,
+            "mini-pc".into(),
+            &identity,
+            &noise,
+            "ws://mini-pc.local:8787".into(),
+        );
+        let target = mews.enroll_host(&offer, &request).unwrap();
+
+        let state = mews.demoted_host_state(&target.id).unwrap();
+        let mut persisted = serde_json::to_value(&state).unwrap();
+        assert_eq!(
+            persisted["installation_public_key"],
+            state.installation_public_key
+        );
+        assert_eq!(
+            persisted["hub_noise_public_key"],
+            state.hub_noise_public_key
+        );
+        assert!(persisted.get("invitation_id").is_none());
+        assert!(persisted.get("secret").is_none());
+        assert!(persisted.get("offer").is_none());
+
+        persisted
+            .as_object_mut()
+            .unwrap()
+            .insert("offer".into(), serde_json::to_value(offer).unwrap());
+        assert!(
+            serde_json::from_value::<crate::enrollment::relay::JoinedHostState>(persisted).is_err()
+        );
     }
 
     #[test]

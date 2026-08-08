@@ -25,12 +25,22 @@ pub struct EnrollmentAccepted {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JoinedHostState {
-    pub offer: JoinOffer,
+    pub installation_id: crate::InstallationId,
+    pub installation_public_key: String,
+    pub hub_noise_public_key: String,
     pub accepted: EnrollmentAccepted,
     pub relay_urls: Vec<String>,
 }
 
 pub async fn accept_join(root: &Path, offer: JoinOffer) -> Result<()> {
+    let mews = Mews::open_connection(root.to_path_buf())?;
+    let local_host = std::sync::Arc::new(
+        crate::host::ConnectedHost::in_process(
+            mews.installation()?.hub_host_id,
+            mews_host::ToolRegistry::with_host_extensions(root)?,
+        )
+        .await?,
+    );
     accept_join_inner(
         root,
         offer,
@@ -50,6 +60,7 @@ pub async fn accept_join(root: &Path, offer: JoinOffer) -> Result<()> {
                 std::collections::HashMap::new(),
             )),
         },
+        local_host,
     )
     .await
 }
@@ -60,8 +71,9 @@ pub(crate) async fn accept_join_ready(
     ready: tokio::sync::oneshot::Sender<Result<()>>,
     remote_hosts: crate::hub::RemoteHosts,
     control: crate::hub::HubControl,
+    local_host: std::sync::Arc<crate::host::ConnectedHost>,
 ) -> Result<()> {
-    accept_join_inner(root, offer, Some(ready), remote_hosts, control).await
+    accept_join_inner(root, offer, Some(ready), remote_hosts, control, local_host).await
 }
 
 async fn accept_join_inner(
@@ -70,6 +82,7 @@ async fn accept_join_inner(
     ready: Option<tokio::sync::oneshot::Sender<Result<()>>>,
     remote_hosts: crate::hub::RemoteHosts,
     control: crate::hub::HubControl,
+    local_host: std::sync::Arc<crate::host::ConnectedHost>,
 ) -> Result<()> {
     let authority = HostIdentity::load(&root.join("secrets/installation.key"))?;
     let hub_noise = NoiseIdentity::load(&root.join("secrets/hub-noise.key"))?;
@@ -147,6 +160,7 @@ async fn accept_join_inner(
         accepted,
         remote_hosts,
         control,
+        local_host,
     )
     .await
 }

@@ -456,6 +456,7 @@ pub enum ClientEventKind {
     /// Ephemeral-sized response fragment. The completed assistant message is
     /// still journaled separately as the durable conversation record.
     AssistantDelta {
+        run_id: RunId,
         delta: String,
         message_id: Option<String>,
     },
@@ -483,6 +484,11 @@ pub enum ClientEventKind {
         run_id: RunId,
         request: PermissionRequest,
     },
+    PermissionResolved {
+        run_id: RunId,
+        request_id: String,
+        outcome: PermissionOutcome,
+    },
     RunCompleted {
         run_id: RunId,
     },
@@ -490,6 +496,33 @@ pub enum ClientEventKind {
         run_id: RunId,
         error: String,
     },
+    RunCancelled {
+        run_id: RunId,
+    },
+}
+
+impl ClientEventKind {
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Self::AssistantDelta { .. } | Self::ReasoningDelta { .. } | Self::ToolActivity { .. }
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PermissionOutcome {
+    Selected { option_id: String },
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumerKind {
+    #[default]
+    Durable,
+    Ephemeral,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -518,8 +551,7 @@ pub struct PermissionOption {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EventBatch {
     pub events: Vec<ClientEvent>,
-    /// Acknowledging this advances past everything scanned, including events
-    /// for Sessions to which this consumer is not subscribed.
+    /// Acknowledging this advances past the subscribed events returned by the Hub.
     pub checkpoint: u64,
     pub advanced: bool,
 }

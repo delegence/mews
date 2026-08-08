@@ -48,6 +48,35 @@ pub(crate) struct AcpProcess {
     pub(crate) config: AcpHarnessConfig,
 }
 
+/// Keeps process-tree ownership even if the async Run task itself is aborted.
+pub(crate) struct ProcessTreeGuard {
+    process_id: Option<u32>,
+}
+
+impl ProcessTreeGuard {
+    pub(crate) fn new(child: &Child) -> Self {
+        Self {
+            process_id: child.id(),
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.process_id = None;
+    }
+}
+
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(process_id) = self.process_id {
+            // SAFETY: ACP children are spawned into a group whose id is their pid.
+            unsafe {
+                libc::kill(-(process_id as i32), libc::SIGKILL);
+            }
+        }
+    }
+}
+
 impl AcpProcess {
     pub(crate) fn new(config: AcpHarnessConfig) -> Self {
         Self { config }
@@ -72,6 +101,12 @@ impl AcpProcess {
             // The Host daemon owns stderr, so adapter startup failures remain
             // diagnosable without contaminating the ACP stdout transport.
             .stderr(std::process::Stdio::inherit());
+        command.kill_on_drop(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.as_std_mut().process_group(0);
+        }
         if let Some(path) = env::var_os("PATH") {
             command.env("PATH", path);
         }
@@ -79,4 +114,17 @@ impl AcpProcess {
             .spawn()
             .with_context(|| format!("start ACP Harness {:?}", program))
     }
+}
+
+pub(crate) async fn terminate_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    if let Some(process_id) = child.id() {
+        // The ACP child starts a fresh process group, so one signal covers any
+        // descendants it started for this Run.
+        unsafe {
+            libc::kill(-(process_id as i32), libc::SIGKILL);
+        }
+    }
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
 }

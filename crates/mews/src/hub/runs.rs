@@ -41,11 +41,15 @@ impl mews_acp::AcpPermissionHandler for HubPermissionHandler {
     ) -> Result<mews_acp::AcpPermissionDecision> {
         let request_id = uuid::Uuid::now_v7().to_string();
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        self.control
-            .permission_waiters
-            .lock()
-            .await
-            .insert(request_id.clone(), sender);
+        self.control.permission_waiters.lock().await.insert(
+            request_id.clone(),
+            super::PermissionWaiter {
+                request_id: request_id.clone(),
+                session_id: self.session_id.clone(),
+                run_id: self.run_id.clone(),
+                sender,
+            },
+        );
         let event = mews_protocol::PermissionRequest {
             id: request_id.clone(),
             tool_call: request.tool_call.clone(),
@@ -80,11 +84,24 @@ impl mews_acp::AcpPermissionHandler for HubPermissionHandler {
             _ = cancellation.cancelled() => None,
             response = receiver => response.ok().flatten(),
         };
-        self.control
+        let unresolved = self
+            .control
             .permission_waiters
             .lock()
             .await
-            .remove(&request_id);
+            .remove(&request_id)
+            .is_some();
+        // The resolver persists its outcome before waking this waiter. If the
+        // waiter still existed, cancellation won the race and owns persistence.
+        if selected.is_none() && unresolved {
+            Mews::open_connection(&self.root)?.append_permission_resolution(
+                &self.session_id,
+                &self.run_id,
+                &request_id,
+                mews_protocol::PermissionOutcome::Cancelled,
+            )?;
+            self.control.event_notify.notify_waiters();
+        }
         Ok(selected.map_or(
             mews_acp::AcpPermissionDecision::Cancelled,
             mews_acp::AcpPermissionDecision::Selected,
@@ -124,16 +141,10 @@ pub(super) async fn start_turn(
     metadata: Value,
     source: Option<MessageSource>,
 ) -> Result<mews_protocol::Run> {
-    let (session, installation, run, created) = {
-        let mews = runtime.mews.lock().await;
-        let (run, created) = mews.start_run_idempotent(&session_id, &idempotency_key)?;
-        (
-            mews.session(&session_id)?,
-            mews.installation()?,
-            run,
-            created,
-        )
-    };
+    let mews = Mews::open_connection(root)?;
+    let (run, created) = mews.start_run_idempotent(&session_id, &idempotency_key)?;
+    let session = mews.session(&session_id)?;
+    let installation = mews.installation()?;
     if !created {
         return Ok(run);
     }
@@ -145,6 +156,7 @@ pub(super) async fn start_turn(
     });
     let root = root.to_path_buf();
     let remote_hosts = Arc::clone(&runtime.remote_hosts);
+    let local_host = Arc::clone(&runtime.local_host);
     let locks = Arc::clone(&runtime.control.session_locks);
     let run_task = run.clone();
     let tasks = Arc::clone(&runtime.control.run_tasks);
@@ -155,6 +167,8 @@ pub(super) async fn start_turn(
         run.id.clone(),
         runtime.control.clone(),
     );
+    let cancellation = mews_agent::CancellationToken::new();
+    let run_cancellation = cancellation.clone();
     let task = tokio::task::spawn_local(async move {
         let lock = {
             let mut locks = locks.lock().await;
@@ -168,15 +182,17 @@ pub(super) async fn start_turn(
         let result = async {
             let mut turn = Mews::open_connection(&root)?;
             if session.host_id == installation.hub_host_id {
-                turn.send_from_started(
+                turn.send_on_from_started(
                     &session,
                     &prompt,
                     metadata,
+                    local_host.as_ref(),
                     source,
                     StartedRun {
                         id: run_task.id.clone(),
                         event_notify: Arc::clone(&notify),
                         permission_handler: Arc::clone(&permission_handler),
+                        cancellation: run_cancellation.clone(),
                     },
                 )
                 .await?;
@@ -197,6 +213,7 @@ pub(super) async fn start_turn(
                         id: run_task.id.clone(),
                         event_notify: Arc::clone(&notify),
                         permission_handler: Arc::clone(&permission_handler),
+                        cancellation: run_cancellation.clone(),
                     },
                 )
                 .await?;
@@ -204,19 +221,129 @@ pub(super) async fn start_turn(
             Ok::<_, anyhow::Error>(())
         }
         .await;
-        if let Err(error) = result {
-            if let Ok(mews) = Mews::open_connection(&root) {
-                let _ = mews.fail_run(&run_task.id, &format!("{error:#}"));
-            }
+        if let Err(error) = result
+            && !run_cancellation.is_cancelled()
+            && let Ok(mews) = Mews::open_connection(&root)
+        {
+            let _ = mews.fail_run(&run_task.id, &format!("{error:#}"));
         }
         tasks.lock().await.remove(&run_task.id);
         notify.notify_waiters();
     });
-    runtime
-        .control
-        .run_tasks
-        .lock()
-        .await
-        .insert(run.id.clone(), task.abort_handle());
+    runtime.control.run_tasks.lock().await.insert(
+        run.id.clone(),
+        super::RunTask {
+            cancellation,
+            abort: task.abort_handle(),
+        },
+    );
     Ok(run)
+}
+
+pub(crate) async fn cancel_run(control: &super::HubControl, root: &Path, run_id: &crate::RunId) {
+    let task = control.run_tasks.lock().await.remove(run_id);
+    if let Some(task) = task {
+        task.cancellation.cancel();
+        let waiters = {
+            let mut waiters = control.permission_waiters.lock().await;
+            let ids = waiters
+                .iter()
+                .filter(|(_, waiter)| waiter.run_id == *run_id)
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| waiters.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        for waiter in waiters {
+            if let Ok(mews) = Mews::open_connection(root) {
+                let _ = mews.append_permission_resolution(
+                    &waiter.session_id,
+                    &waiter.run_id,
+                    &waiter.request_id,
+                    mews_protocol::PermissionOutcome::Cancelled,
+                );
+            }
+            let _ = waiter.sender.send(None);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        task.abort.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn permission_token_cancellation_persists_its_resolution() {
+        let root = tempfile::tempdir().unwrap();
+        let mut mews = Mews::setup(root.path(), "laptop").unwrap();
+        mews.create_agent("coder").unwrap();
+        let session = mews.start_session("coder", root.path()).await.unwrap();
+        let run = mews.start_run(&session.id).unwrap();
+        let consumer = crate::ConsumerId::new();
+        mews.subscribe_session(&consumer, &session.id, mews_protocol::ConsumerKind::Durable)
+            .unwrap();
+        let control = super::super::HubControl {
+            moving: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            handoff_gate: Arc::new(tokio::sync::RwLock::new(())),
+            session_locks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            run_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            event_notify: Arc::new(tokio::sync::Notify::new()),
+            permission_waiters: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        };
+        let handler = permission_handler(
+            root.path(),
+            session.id.clone(),
+            run.id.clone(),
+            control.clone(),
+        );
+        let cancellation = mews_agent::CancellationToken::new();
+        let pending = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                handler
+                    .request_permission(
+                        &mews_acp::AcpPermissionRequest {
+                            session_id: "native-session".into(),
+                            tool_call: serde_json::json!({"toolCallId": "call-1"}),
+                            options: vec![],
+                            metadata: None,
+                        },
+                        &cancellation,
+                    )
+                    .await
+            }
+        });
+        while control.permission_waiters.lock().await.is_empty() {
+            tokio::task::yield_now().await;
+        }
+
+        cancellation.cancel();
+
+        assert_eq!(
+            pending.await.unwrap().unwrap(),
+            mews_acp::AcpPermissionDecision::Cancelled
+        );
+        assert!(control.permission_waiters.lock().await.is_empty());
+        let events = mews.client_events(&consumer, 100).unwrap().events;
+        let request_id = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                mews_protocol::ClientEventKind::PermissionRequested { request, .. } => {
+                    Some(request.id.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            mews_protocol::ClientEventKind::PermissionResolved {
+                request_id: resolved,
+                outcome: mews_protocol::PermissionOutcome::Cancelled,
+                ..
+            } if resolved == &request_id
+        )));
+    }
 }

@@ -1,6 +1,7 @@
 use crate::{CancellationToken, ProgressReporter, ToolCall, ToolProgress, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
+pub use mews_protocol::ToolExecutionMode;
 use mews_protocol::{ReasoningEffort, ToolDefinition};
 
 use crate::{ModelMessage, ModelRequest};
@@ -29,13 +30,6 @@ pub enum ToolDecision {
     #[default]
     Allow,
     Block(String),
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ToolExecutionMode {
-    Sequential,
-    #[default]
-    Parallel,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

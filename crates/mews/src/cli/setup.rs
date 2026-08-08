@@ -18,7 +18,6 @@ use mews::{
     service::Mews,
 };
 use mews_client::MewsClient;
-use mews_protocol::{HubRequest, HubResponse};
 
 use super::{
     defaults::{
@@ -278,7 +277,9 @@ async fn join_existing(
     std::fs::write(
         &state_path,
         serde_json::to_vec_pretty(&JoinedHostState {
-            offer,
+            installation_id: offer.installation_id,
+            installation_public_key: offer.installation_public_key,
+            hub_noise_public_key: offer.hub_noise_public_key,
             relay_urls: accepted.relay_urls.clone(),
             accepted: accepted.clone(),
         })?,
@@ -328,9 +329,8 @@ async fn spawn_and_wait(root: &Path, log_name: &str, args: &[&str], name: &str) 
         .with_context(|| format!("start {name}"))?;
     for _ in 0..200 {
         if let Ok(mut client) = MewsClient::connect(root).await
-            && let Ok(HubResponse::Status(installation)) = client.request(HubRequest::Status).await
+            && client.status().await.is_ok()
         {
-            let _ = installation;
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -350,7 +350,7 @@ pub(super) async fn wait_for_hub(root: &Path) -> Result<()> {
 async fn wait_for_hub_ready(root: &Path, announce: bool) -> Result<()> {
     for _ in 0..200 {
         if let Ok(mut client) = MewsClient::connect(root).await
-            && let Ok(HubResponse::Status(installation)) = client.request(HubRequest::Status).await
+            && let Ok(installation) = client.status().await
         {
             if announce {
                 print_hub_ready(&mut client, &installation).await;
@@ -366,12 +366,12 @@ async fn wait_for_hub_ready(root: &Path, announce: bool) -> Result<()> {
 }
 
 async fn print_hub_ready(client: &mut MewsClient, installation: &mews_protocol::Installation) {
-    let name = match client.request(HubRequest::ListHosts).await {
-        Ok(HubResponse::Hosts(hosts)) => hosts
+    let name = match client.hosts().await {
+        Ok(hosts) => hosts
             .into_iter()
             .find(|status| status.host.id == installation.hub_host_id)
             .map(|status| status.host.name),
-        _ => None,
+        Err(_) => None,
     };
     println!(
         "MEWS is ready. Hub Host: {}",

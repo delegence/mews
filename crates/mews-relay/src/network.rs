@@ -24,7 +24,6 @@ enum RegistrationMessage {
     Challenge { challenge: [u8; 32] },
     Proof { signature: String },
     Accepted,
-    Error { message: String },
 }
 
 pub async fn serve(address: SocketAddr) -> Result<()> {
@@ -132,7 +131,6 @@ impl NetworkRelay {
         .await?;
         let challenge = match receive_registration(&mut socket).await? {
             RegistrationMessage::Challenge { challenge } => challenge,
-            RegistrationMessage::Error { message } => bail!(message),
             _ => bail!("relay returned an invalid challenge"),
         };
         let signature = signer.sign(&registration_message(&identity, &challenge));

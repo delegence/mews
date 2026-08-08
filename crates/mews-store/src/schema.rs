@@ -1,5 +1,7 @@
 use super::*;
 
+const SCHEMA_VERSION: u32 = 1;
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let connection = Connection::open(path)?;
@@ -54,6 +56,19 @@ impl Store {
     }
 
     fn initialize_schema(&self) -> Result<(), StoreError> {
+        let version: u32 = self
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let has_schema: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hosts')",
+            [],
+            |row| row.get(0),
+        )?;
+        if version != SCHEMA_VERSION && (version != 0 || has_schema) {
+            return Err(StoreError::InvalidData(format!(
+                "development schema changed (found version {version}, expected {SCHEMA_VERSION}); reset MEWS_HOME"
+            )));
+        }
         self.connection.execute_batch(
             "BEGIN;
              CREATE TABLE IF NOT EXISTS hosts (
@@ -116,14 +131,6 @@ impl Store {
                  replaced_at TEXT,
                  UNIQUE (host_id, harness, acp_session_id)
              );
-             CREATE TABLE IF NOT EXISTS acp_session_replacements (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 session_id TEXT NOT NULL REFERENCES sessions(id),
-                 old_acp_session_id TEXT NOT NULL,
-                 new_acp_session_id TEXT NOT NULL,
-                 reason TEXT NOT NULL,
-                 created_at TEXT NOT NULL
-             );
              CREATE TABLE IF NOT EXISTS messages (
                  id TEXT PRIMARY KEY,
                  session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -165,11 +172,13 @@ impl Store {
                  id TEXT NOT NULL UNIQUE,
                  session_id TEXT NOT NULL REFERENCES sessions(id),
                  kind_json TEXT NOT NULL,
+                 transient INTEGER NOT NULL,
                  created_at TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS client_consumers (
                  id TEXT PRIMARY KEY,
                  cursor INTEGER NOT NULL,
+                 kind TEXT NOT NULL,
                  created_at TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS client_subscriptions (
@@ -177,15 +186,16 @@ impl Store {
                  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                  PRIMARY KEY (consumer_id, session_id)
              );
+             PRAGMA user_version = 1;
              COMMIT;",
         )?;
         Ok(())
     }
 
     fn recover_interrupted_work(&self) -> Result<(), StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
         let interrupted = {
-            let mut statement = self
-                .connection
+            let mut statement = transaction
                 .prepare("SELECT id, session_id FROM runs WHERE completed_at IS NULL")?;
             statement
                 .query_map([], |row| {
@@ -194,14 +204,11 @@ impl Store {
                 .collect::<Result<Vec<_>, _>>()?
         };
         let failed = json(&RunStatus::Failed)?;
-        self.connection.execute(
+        let recovered_at = timestamp(Utc::now());
+        transaction.execute(
             "UPDATE runs SET status_json = ?1, error = ?2, completed_at = ?3
              WHERE completed_at IS NULL",
-            params![
-                failed,
-                "Hub stopped before the Run completed",
-                timestamp(Utc::now())
-            ],
+            params![failed, "Hub stopped before the Run completed", recovered_at],
         )?;
         for (run_id, session_id) in interrupted {
             let run_id: RunId = parse_id(run_id)?;
@@ -209,11 +216,12 @@ impl Store {
                 run_id,
                 error: "Hub stopped before the Run completed".into(),
             };
-            self.connection.execute(
-                "INSERT INTO client_events (id, session_id, kind_json, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![EventId::new().as_str(), session_id, json(&kind)?, timestamp(Utc::now())],
+            transaction.execute(
+                "INSERT INTO client_events (id, session_id, kind_json, transient, created_at) VALUES (?1, ?2, ?3, 0, ?4)",
+                params![EventId::new().as_str(), session_id, json(&kind)?, recovered_at],
             )?;
         }
+        transaction.commit()?;
 
         let session_ids = {
             let mut statement = self

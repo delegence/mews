@@ -2,6 +2,7 @@
 
 pub mod channel;
 mod connection;
+pub mod response;
 
 pub use channel::*;
 pub use client::MewsClient;

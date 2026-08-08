@@ -6,11 +6,11 @@ use std::{
 use anyhow::{Context, Result, bail};
 use inquire::Select;
 use mews_client::MewsClient;
-use mews_protocol::{HubRequest, HubResponse, ModelInfo};
+use mews_protocol::ModelInfo;
 
 use super::{
     command::{ProviderCommand, ProviderModelsCommand},
-    prompt, response,
+    prompt,
 };
 
 pub async fn run(root: &Path, command: Option<ProviderCommand>) -> Result<()> {
@@ -36,37 +36,30 @@ pub async fn run(root: &Path, command: Option<ProviderCommand>) -> Result<()> {
         }
     };
     match command {
-        ProviderCommand::Status => match client.request(HubRequest::ListAuth).await? {
-            HubResponse::Auth(entries) if entries.is_empty() => {
+        ProviderCommand::Status => match client.auth_status().await? {
+            entries if entries.is_empty() => {
                 println!("No providers authenticated.")
             }
-            HubResponse::Auth(entries) => {
+            entries => {
                 for entry in entries {
                     println!("{}  {}", entry.provider, entry.kind);
                 }
             }
-            other => bail!("unexpected Hub response: {other:?}"),
         },
         ProviderCommand::Login { provider } => login(root, &mut client, provider).await?,
         ProviderCommand::SetKey { provider } => set_key(&mut client, provider).await?,
         ProviderCommand::Logout { provider } => {
-            response::ack(
-                client
-                    .request(HubRequest::RemoveAuth {
-                        provider: provider.clone(),
-                    })
-                    .await?,
-            )?;
+            client.remove_auth(provider.clone()).await?;
             println!("Removed {provider} credential.");
         }
         ProviderCommand::Models {
             command: Some(ProviderModelsCommand::Update),
         } => {
-            let models = response::models(client.request(HubRequest::RefreshModels).await?)?;
+            let models = client.refresh_models().await?;
             println!("Updated model catalog ({} models).", models.len());
         }
         ProviderCommand::Models { command: None } => {
-            let models = response::models(client.request(HubRequest::ListModels).await?)?;
+            let models = client.models().await?;
             if models.is_empty() {
                 bail!(
                     "no models are available; configure a provider with `mews providers login` or `mews providers set-key <provider>`"
@@ -86,20 +79,12 @@ pub async fn run(root: &Path, command: Option<ProviderCommand>) -> Result<()> {
                 .iter()
                 .find(|model| model_label(model) == choice)
                 .context("model choice disappeared")?;
-            response::ack(
-                client
-                    .request(HubRequest::SetDefaultModel {
-                        model: model.id.clone(),
-                    })
-                    .await?,
-            )?;
+            client.set_default_model(model.id.clone()).await?;
             println!("Default model: {}", model.id);
         }
         ProviderCommand::Reasoning => {
-            let defaults = response::provider_defaults(
-                client.request(HubRequest::GetProviderDefaults).await?,
-            )?;
-            let models = response::models(client.request(HubRequest::ListModels).await?)?;
+            let defaults = client.provider_defaults().await?;
+            let models = client.models().await?;
             let default_model = defaults
                 .model
                 .context("no default model is configured; run `mews providers models`")?;
@@ -135,11 +120,7 @@ pub async fn run(root: &Path, command: Option<ProviderCommand>) -> Result<()> {
                 .find(|(label, _)| label == &choice)
                 .map(|(_, value)| value)
                 .context("reasoning choice disappeared")?;
-            response::ack(
-                client
-                    .request(HubRequest::SetDefaultReasoning { reasoning })
-                    .await?,
-            )?;
+            client.set_default_reasoning(reasoning).await?;
             println!("Default reasoning: {choice}");
         }
     }
@@ -177,36 +158,28 @@ async fn login(root: &Path, client: &mut MewsClient, id: Option<String>) -> Resu
         }
     };
     let router = mews_router::RouterClient::new(root);
-    let request = match provider.auth.as_str() {
+    let credential = match provider.auth.as_str() {
         "oauth" if provider.id == "openai-codex" => {
-            let credential = router
+            router
                 .login_openai(|device| {
                     println!(
                         "Open {} and enter code {}",
                         device.verification_uri, device.user_code
                     )
                 })
-                .await?;
-            HubRequest::SetAuth {
-                provider: provider.id.clone(),
-                credential,
-            }
+                .await?
         }
         "oauth_or_api_key" if provider.id == "anthropic" => {
-            let credential = router
+            router
                 .login_anthropic(|authorization| {
                     println!("Open {}", authorization.authorization_uri);
                     open_browser(&authorization.authorization_uri);
                 })
-                .await?;
-            HubRequest::SetAuth {
-                provider: provider.id.clone(),
-                credential,
-            }
+                .await?
         }
         auth => bail!("{} does not support login ({auth})", provider.id),
     };
-    response::ack(client.request(request).await?)?;
+    client.set_auth(provider.id.clone(), credential).await?;
     println!("Authenticated {}.", provider.id);
     Ok(())
 }
@@ -242,14 +215,7 @@ async fn set_key(client: &mut MewsClient, id: Option<String>) -> Result<()> {
         }
     };
     let key = rpassword::prompt_password(format!("{} API key: ", provider.id))?;
-    response::ack(
-        client
-            .request(HubRequest::SetApiKey {
-                provider: provider.id.clone(),
-                key,
-            })
-            .await?,
-    )?;
+    client.set_api_key(provider.id.clone(), key).await?;
     println!("Saved {} credential in Hub auth.json.", provider.id);
     Ok(())
 }

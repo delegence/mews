@@ -1228,7 +1228,6 @@ dependencies = [
  "mews-router",
  "mews-runtime",
  "mews-store",
- "mews-tui",
  "rand_core 0.6.4",
  "regex",
  "reqwest",
@@ -1253,6 +1252,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "libc",
  "mews-agent",
  "serde",
  "serde_json",
@@ -1314,6 +1314,7 @@ name = "mews-protocol"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "serde",
  "serde_json",
@@ -1368,10 +1369,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "futures-util",
  "mews-agent",
  "mews-protocol",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -1389,16 +1392,6 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
-]
-
-[[package]]
-name = "mews-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "mews-client",
- "serde_json",
- "tokio",
 ]
 
 [[package]]

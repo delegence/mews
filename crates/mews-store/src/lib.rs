@@ -21,8 +21,8 @@ use thiserror::Error;
 
 use mews_protocol::{
     AcpSessionBinding, Agent, AgentConfig, AgentId, AgentRevision, ClientEvent, ClientEventKind,
-    ConsumerId, EventBatch, EventId, Host, HostId, Installation, InstallationId, InvitationId,
-    Message, MessageContent, MessageId, MessageRole, MessageSource, ProviderDefaults,
+    ConsumerId, ConsumerKind, EventBatch, EventId, Host, HostId, Installation, InstallationId,
+    InvitationId, Message, MessageContent, MessageId, MessageRole, MessageSource, ProviderDefaults,
     ReasoningEffort, Run, RunId, RunStatus, Session, SessionId, SourceKind,
 };
 

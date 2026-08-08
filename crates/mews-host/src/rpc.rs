@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use mews_agent::CancellationToken;
 use mews_protocol::{HostToHub, HubToHost};
 use serde_json::Value;
 
@@ -78,7 +79,14 @@ pub async fn handle_execution_request(
                 if resolved != *canonical_cwd || !resolved.is_dir() {
                     bail!("Session working directory no longer resolves to its attested path");
                 }
-                registry.execute(tool, arguments.clone(), &resolved).await
+                registry
+                    .execute(
+                        tool,
+                        arguments.clone(),
+                        &resolved,
+                        &CancellationToken::new(),
+                    )
+                    .await
             }
             .await;
             let (result, error) = match result {

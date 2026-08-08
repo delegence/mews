@@ -8,11 +8,14 @@ use serde_json::{Value, json};
 
 use crate::{
     AuthStore, MessageContent, MessageRole, ModelPart, ModelRequest, ModelResponse, ModelStream,
-    ModelStreamEvent, ProviderError, ProviderResult, ReasoningEffort, http::send_with_retry,
+    ModelStreamEvent, ProviderError, ProviderResult, ReasoningEffort,
+    http::{response_json, response_text_limited, send_with_retry},
 };
 
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const MAX_NONSTREAM_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 static CODEX_REFRESH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -92,17 +95,11 @@ pub(crate) async fn generate(
     }
     let response = send_with_retry(call).await?;
     if codex {
-        let body = response
-            .text()
-            .await
-            .map_err(|error| ProviderError::Http(error.to_string()))?;
+        let body = response_text_limited(response, MAX_NONSTREAM_BODY_BYTES).await?;
         parse_sse(&body, provider, &model)
             .map_err(|error| ProviderError::InvalidResponse(error.to_string()))
     } else {
-        let value = response
-            .json()
-            .await
-            .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+        let value = response_json(response).await?;
         parse(value, provider, &model)
             .map_err(|error| ProviderError::InvalidResponse(error.to_string()))
     }
@@ -177,15 +174,20 @@ pub(crate) async fn stream(
             .header("OpenAI-Beta", "responses=experimental");
     }
     let response = send_with_retry(call).await?;
-    let state_provider = provider.to_owned();
-    let state_model = model;
+    Ok(openai_response_stream(response, provider.to_owned(), model))
+}
+
+fn openai_response_stream(
+    response: reqwest::Response,
+    state_provider: String,
+    state_model: String,
+) -> ModelStream {
     let (sender, receiver) = tokio::sync::mpsc::channel(32);
     tokio::spawn(async move {
         use futures_util::StreamExt;
         let _ = sender.send(Ok(ModelStreamEvent::Start)).await;
         let mut bytes = response.bytes_stream();
         let mut buffer = Vec::new();
-        let mut completed = false;
         while let Some(chunk) = bytes.next().await {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
@@ -198,6 +200,10 @@ pub(crate) async fn stream(
             };
             buffer.extend_from_slice(&chunk);
             while let Some((end, delimiter_len)) = sse_frame_end(&buffer) {
+                if end > MAX_SSE_EVENT_BYTES {
+                    let _ = sender.send(Err(sse_event_too_large())).await;
+                    return;
+                }
                 let block = match String::from_utf8(buffer[..end].to_vec()) {
                     Ok(block) => block.replace('\r', ""),
                     Err(error) => {
@@ -227,7 +233,15 @@ pub(crate) async fn stream(
                         return;
                     }
                 };
-                let item = match event.get("type").and_then(Value::as_str) {
+                let event_type = event.get("type").and_then(Value::as_str);
+                if matches!(
+                    event_type,
+                    Some("response.failed" | "response.incomplete" | "error")
+                ) {
+                    let _ = sender.send(Err(openai_stream_error(&event))).await;
+                    return;
+                }
+                let item = match event_type {
                     Some("response.output_text.delta") => event
                         .get("delta")
                         .and_then(Value::as_str)
@@ -262,26 +276,52 @@ pub(crate) async fn stream(
                         })
                     }
                     Some("response.completed") => {
-                        completed = true;
-                        Some(ModelStreamEvent::Done)
+                        let _ = sender.send(Ok(ModelStreamEvent::Done)).await;
+                        return;
                     }
                     _ => None,
                 };
-                if let Some(item) = item {
-                    if sender.send(Ok(item)).await.is_err() {
-                        return;
-                    }
+                if let Some(item) = item
+                    && sender.send(Ok(item)).await.is_err()
+                {
+                    return;
                 }
             }
+            if buffer.len() > MAX_SSE_EVENT_BYTES {
+                let _ = sender.send(Err(sse_event_too_large())).await;
+                return;
+            }
         }
-        if !completed {
-            let _ = sender.send(Ok(ModelStreamEvent::Done)).await;
-        }
+        let _ = sender
+            .send(Err(ProviderError::InvalidResponse(
+                "OpenAI stream ended before response.completed".into(),
+            )))
+            .await;
     });
-    Ok(Box::pin(futures_util::stream::unfold(
+    Box::pin(futures_util::stream::unfold(
         receiver,
         |mut receiver| async { receiver.recv().await.map(|event| (event, receiver)) },
-    )))
+    ))
+}
+
+fn sse_event_too_large() -> ProviderError {
+    ProviderError::InvalidResponse(format!(
+        "OpenAI stream event exceeds {MAX_SSE_EVENT_BYTES} bytes"
+    ))
+}
+
+fn openai_stream_error(event: &Value) -> ProviderError {
+    let event_type = event.get("type").and_then(Value::as_str).unwrap_or("error");
+    let detail = [
+        "/response/error/message",
+        "/response/incomplete_details/reason",
+        "/error/message",
+        "/message",
+    ]
+    .into_iter()
+    .find_map(|pointer| event.pointer(pointer).and_then(Value::as_str))
+    .unwrap_or("provider reported a terminal error");
+    ProviderError::InvalidResponse(format!("OpenAI {event_type}: {detail}"))
 }
 
 fn sse_frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
@@ -333,10 +373,7 @@ pub(crate) async fn models(
             .header("originator", "mews");
     }
     let response = send_with_retry(request).await?;
-    let payload: Value = response
-        .json()
-        .await
-        .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+    let payload: Value = response_json(response).await?;
     let entries = payload
         .get(if codex { "models" } else { "data" })
         .and_then(Value::as_array)
@@ -482,18 +519,41 @@ fn parse(response: Value, provider: &str, model: &str) -> Result<ModelResponse> 
 }
 
 fn parse_sse(body: &str, provider: &str, model: &str) -> Result<ModelResponse> {
-    let response = body
-        .lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter(|data| *data != "[DONE]")
-        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
-        .find_map(|event| {
-            (event.get("type").and_then(Value::as_str) == Some("response.completed"))
-                .then(|| event.get("response").cloned())
-                .flatten()
-        })
-        .context("OpenAI Codex stream ended without a completed response")?;
-    parse(response, provider, model)
+    let body = body.replace("\r\n", "\n");
+    for block in body.split("\n\n") {
+        anyhow::ensure!(
+            block.len() <= MAX_SSE_EVENT_BYTES,
+            "OpenAI stream event exceeds {MAX_SSE_EVENT_BYTES} bytes"
+        );
+        let Some(data) = block.lines().find_map(|line| {
+            line.strip_suffix('\r')
+                .unwrap_or(line)
+                .strip_prefix("data: ")
+        }) else {
+            continue;
+        };
+        if data == "[DONE]" {
+            continue;
+        }
+        let event: Value = serde_json::from_str(data).context("invalid OpenAI stream event")?;
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.completed") => {
+                return parse(
+                    event
+                        .get("response")
+                        .cloned()
+                        .context("completed OpenAI response has no response body")?,
+                    provider,
+                    model,
+                );
+            }
+            Some("response.failed" | "response.incomplete" | "error") => {
+                anyhow::bail!(openai_stream_error(&event));
+            }
+            _ => {}
+        }
+    }
+    anyhow::bail!("OpenAI Codex stream ended without a completed response")
 }
 
 pub async fn login_openai<F>(mut notify: F) -> Result<AuthCredential>
@@ -520,15 +580,15 @@ async fn login_with_client<F>(
 where
     F: FnMut(DeviceAuthorization),
 {
-    let response: Value = send_with_retry(
-        client
-            .post(&endpoints.user_code)
-            .json(&json!({"client_id":CODEX_CLIENT_ID})),
+    let response: Value = response_json(
+        send_with_retry(
+            client
+                .post(&endpoints.user_code)
+                .json(&json!({"client_id":CODEX_CLIENT_ID})),
+        )
+        .await?,
     )
-    .await?
-    .json()
-    .await
-    .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+    .await?;
     let device_auth_id = response
         .get("device_auth_id")
         .and_then(Value::as_str)
@@ -575,7 +635,7 @@ where
             .await
             .map_err(|error| ProviderError::Http(error.to_string()))?;
         let status = response.status();
-        let value: Value = response.json().await.unwrap_or(Value::Null);
+        let value: Value = response_json(response).await.unwrap_or(Value::Null);
         let state = value.get("error").and_then(Value::as_str);
         if matches!(state, Some("authorization_pending")) || matches!(status.as_u16(), 403 | 404) {
             continue;
@@ -654,7 +714,7 @@ async fn exchange_code(
     verifier: &str,
     token_url: &str,
 ) -> Result<Value> {
-    Ok(client
+    let response = client
         .post(token_url)
         .form(&[
             ("grant_type", "authorization_code"),
@@ -668,13 +728,12 @@ async fn exchange_code(
         ])
         .send()
         .await?
-        .error_for_status()?
-        .json()
-        .await?)
+        .error_for_status()?;
+    Ok(response_json(response).await?)
 }
 
 async fn refresh(client: &Client, refresh: &str) -> Result<AuthCredential> {
-    let token = client
+    let response = client
         .post(CODEX_TOKEN_URL)
         .form(&[
             ("grant_type", "refresh_token"),
@@ -683,9 +742,8 @@ async fn refresh(client: &Client, refresh: &str) -> Result<AuthCredential> {
         ])
         .send()
         .await?
-        .error_for_status()?
-        .json()
-        .await?;
+        .error_for_status()?;
+    let token = response_json(response).await?;
     credential_from_token(token)
 }
 
@@ -769,6 +827,34 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
+    async fn collect_stream(body: String) -> Vec<ProviderResult<ModelStreamEvent>> {
+        use futures_util::StreamExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.unwrap();
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(headers.as_bytes()).await;
+            let _ = stream.write_all(body.as_bytes()).await;
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+        let events = openai_response_stream(response, "openai".into(), "gpt-test".into())
+            .collect()
+            .await;
+        server.await.unwrap();
+        events
+    }
+
     #[test]
     fn sse_framing_waits_for_complete_utf8_and_accepts_crlf() {
         let event = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Привет\"}\r\n\r\n";
@@ -777,6 +863,83 @@ mod tests {
         assert_eq!(sse_frame_end(&bytes[..split]), None);
         assert_eq!(sse_frame_end(bytes), Some((bytes.len() - 4, 4)));
         assert!(std::str::from_utf8(&bytes[..bytes.len() - 4]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn stream_requires_explicit_completion() {
+        let events = collect_stream(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n".into(),
+        )
+        .await;
+
+        assert!(matches!(events[0], Ok(ModelStreamEvent::Start)));
+        assert!(matches!(
+            &events[1],
+            Ok(ModelStreamEvent::TextDelta(text)) if text == "partial"
+        ));
+        assert!(matches!(
+            &events[2],
+            Err(ProviderError::InvalidResponse(message))
+                if message.contains("before response.completed")
+        ));
+        assert_eq!(events.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn stream_completion_is_terminal() {
+        let events = collect_stream(
+            concat!(
+                "data: {\"type\":\"response.completed\"}\n\n",
+                "data: {\"type\":\"error\",\"message\":\"late\"}\n\n"
+            )
+            .into(),
+        )
+        .await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(ModelStreamEvent::Start), Ok(ModelStreamEvent::Done)]
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_maps_openai_terminal_errors() {
+        let cases = [
+            (
+                r#"{"type":"response.failed","response":{"error":{"message":"failed"}}}"#,
+                "response.failed: failed",
+            ),
+            (
+                r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+                "response.incomplete: max_output_tokens",
+            ),
+            (
+                r#"{"type":"error","message":"overloaded"}"#,
+                "error: overloaded",
+            ),
+        ];
+
+        for (event, expected) in cases {
+            let events = collect_stream(format!("data: {event}\n\n")).await;
+            assert!(matches!(events[0], Ok(ModelStreamEvent::Start)));
+            assert!(matches!(
+                &events[1],
+                Err(ProviderError::InvalidResponse(message)) if message.contains(expected)
+            ));
+            assert_eq!(events.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_caps_a_single_sse_event() {
+        let events = collect_stream(format!("data: {}", "x".repeat(MAX_SSE_EVENT_BYTES))).await;
+
+        assert!(matches!(events[0], Ok(ModelStreamEvent::Start)));
+        assert!(matches!(
+            &events[1],
+            Err(ProviderError::InvalidResponse(message)) if message.contains("event exceeds")
+        ));
+        assert_eq!(events.len(), 2);
     }
     use crate::{ModelMessage, ToolDefinition};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

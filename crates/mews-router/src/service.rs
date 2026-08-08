@@ -41,10 +41,6 @@ enum RouterRequest {
     RefreshModels {
         provider: Option<String>,
     },
-    SetApiKey {
-        provider: String,
-        key: String,
-    },
     SetAuth {
         provider: String,
         credential: AuthCredential,
@@ -114,13 +110,14 @@ impl RouterClient {
     }
 
     pub async fn set_api_key(&self, provider: String, key: String) -> ProviderResult<()> {
-        match self
-            .call(RouterRequest::SetApiKey { provider, key })
-            .await?
-        {
-            RouterResponse::Ack(result) => result,
-            _ => Err(unexpected()),
-        }
+        self.set_auth(
+            provider,
+            AuthCredential::ApiKey {
+                key,
+                base_url: None,
+            },
+        )
+        .await
     }
 
     pub async fn set_auth(
@@ -306,14 +303,6 @@ async fn handle(
         RouterRequest::RefreshModels { provider } => {
             RouterResponse::Models(refresh_models(&registry, provider.as_deref()).await)
         }
-        RouterRequest::SetApiKey { provider, key } => {
-            let saved =
-                crate::AuthStore::set_api_key(&registry.root, &provider, key).map_err(auth_error);
-            if saved.is_ok() {
-                let _ = refresh_models(&registry, Some(&provider)).await;
-            }
-            RouterResponse::Ack(saved)
-        }
         RouterRequest::SetAuth {
             provider,
             credential,
@@ -430,7 +419,6 @@ struct ModelCatalog {
 
 #[derive(Serialize, Deserialize)]
 struct CachedModels {
-    fetched_at: u64,
     models: Vec<ModelInfo>,
 }
 
@@ -459,16 +447,7 @@ async fn refresh_models(
     for provider in providers {
         match registry.discover_models(&provider).await {
             Ok(models) => {
-                catalog.providers.insert(
-                    provider,
-                    CachedModels {
-                        fetched_at: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                        models,
-                    },
-                );
+                catalog.providers.insert(provider, CachedModels { models });
             }
             Err(error) => failures.push(error.to_string()),
         }
@@ -655,7 +634,6 @@ mod tests {
                 (
                     "openai".into(),
                     CachedModels {
-                        fetched_at: 1,
                         models: vec![ModelInfo {
                             id: "openai/test".into(),
                             display_name: None,
@@ -667,7 +645,6 @@ mod tests {
                 (
                     "anthropic".into(),
                     CachedModels {
-                        fetched_at: 1,
                         models: vec![ModelInfo {
                             id: "anthropic/test".into(),
                             display_name: None,
@@ -679,6 +656,8 @@ mod tests {
             ]),
         };
         save_catalog(root.path(), &catalog).unwrap();
+        let serialized = std::fs::read_to_string(root.path().join("models.json")).unwrap();
+        assert!(!serialized.contains("fetched_at"));
         remove_cached_models(root.path(), "openai").unwrap();
         let ids = load_models(root.path())
             .unwrap()

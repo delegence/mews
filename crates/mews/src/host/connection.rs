@@ -36,7 +36,7 @@ enum HostReply {
 }
 struct PendingRequest {
     reply: oneshot::Sender<Result<HostReply, String>>,
-    acp_events: Option<mpsc::UnboundedSender<AcpEvent>>,
+    acp_events: Option<mpsc::Sender<AcpEvent>>,
 }
 type PendingRequests = Arc<std::sync::Mutex<HashMap<RequestId, PendingRequest>>>;
 
@@ -60,6 +60,7 @@ pub trait HostControl: Send + Sync {
         agent: &Agent,
         revision: &AgentRevision,
         expected_replica: Option<&AgentReplica>,
+        previous_slug: Option<&str>,
     ) -> Result<()>;
     async fn agent_replica(&self, slug: &str) -> Result<Option<AgentReplica>>;
     async fn begin_hub_transfer(&self, transfer: HubTransferStart) -> Result<()>;
@@ -77,7 +78,8 @@ pub trait HostControl: Send + Sync {
     async fn run_acp(
         &self,
         run: RemoteAcpRun,
-        events: mpsc::UnboundedSender<AcpEvent>,
+        events: mpsc::Sender<AcpEvent>,
+        cancellation: &CancellationToken,
     ) -> Result<mews_acp::AcpSessionOutcome>;
     async fn resolve_acp_permission(
         &self,
@@ -191,7 +193,13 @@ impl ConnectedHost {
 
     pub async fn in_process(id: HostId, registry: ToolRegistry) -> Result<Self> {
         let tools = registry.definitions();
-        let harnesses = mews_host::HarnessCatalog::discover(None)?.descriptors();
+        let harnesses = mews_host::HarnessCatalog::discover(registry.root())?.descriptors();
+        if let Some(root) = registry.root().map(Path::to_path_buf) {
+            tokio::spawn({
+                let registry = registry.clone();
+                async move { registry.watch_host_extensions(root).await }
+            });
+        }
         let (hub_sender, host_receiver) = mpsc::channel(32);
         let (host_sender, hub_receiver) = mpsc::channel(32);
         tokio::spawn(serve_host(
@@ -256,11 +264,6 @@ impl ConnectedHost {
                     HostToHub::ToolCatalogChanged { tools } => {
                         *response_tools.write().expect("Host tool catalog poisoned") = tools;
                     }
-                    HostToHub::HarnessCatalogChanged { harnesses } => {
-                        *response_harnesses
-                            .write()
-                            .expect("Host Harness catalog poisoned") = harnesses;
-                    }
                     HostToHub::HarnessCatalog {
                         request_id,
                         harnesses,
@@ -319,6 +322,8 @@ impl ConnectedHost {
                         answer,
                         acp_session_id,
                         session_replaced,
+                        stop_reason,
+                        timings,
                         error,
                     } => {
                         if let Some(pending) = response_pending
@@ -326,41 +331,77 @@ impl ConnectedHost {
                             .expect("Host pending requests poisoned")
                             .remove(&request_id)
                         {
-                            let result = match (answer, acp_session_id, error) {
-                                (Some(answer), Some(session_id), None) => {
-                                    Ok(HostReply::Acp(mews_acp::AcpSessionOutcome {
-                                        answer,
-                                        session_id,
-                                        session_replaced,
-                                    }))
-                                }
-                                (_, _, Some(error)) => Err(error),
+                            let result = match (answer, acp_session_id, stop_reason, timings, error)
+                            {
+                                (
+                                    Some(answer),
+                                    Some(session_id),
+                                    Some(stop_reason),
+                                    Some(timings),
+                                    None,
+                                ) => Ok(HostReply::Acp(mews_acp::AcpSessionOutcome {
+                                    answer,
+                                    session_id,
+                                    session_replaced,
+                                    timings: mews_acp::AcpTimings {
+                                        spawn: std::time::Duration::from_millis(timings.spawn_ms),
+                                        initialize: std::time::Duration::from_millis(
+                                            timings.initialize_ms,
+                                        ),
+                                        continuation: std::time::Duration::from_millis(
+                                            timings.continuation_ms,
+                                        ),
+                                    },
+                                    stop_reason: match stop_reason {
+                                        mews_protocol::AcpStopReason::EndTurn => {
+                                            mews_acp::AcpStopReason::EndTurn
+                                        }
+                                        mews_protocol::AcpStopReason::MaxTokens => {
+                                            mews_acp::AcpStopReason::MaxTokens
+                                        }
+                                        mews_protocol::AcpStopReason::MaxTurnRequests => {
+                                            mews_acp::AcpStopReason::MaxTurnRequests
+                                        }
+                                        mews_protocol::AcpStopReason::Refusal => {
+                                            mews_acp::AcpStopReason::Refusal
+                                        }
+                                        mews_protocol::AcpStopReason::Cancelled => {
+                                            mews_acp::AcpStopReason::Cancelled
+                                        }
+                                        mews_protocol::AcpStopReason::Other => {
+                                            mews_acp::AcpStopReason::Other
+                                        }
+                                    },
+                                })),
+                                (_, _, _, _, Some(error)) => Err(error),
                                 _ => Err("Host returned an empty ACP result".into()),
                             };
                             let _ = pending.reply.send(result);
                         }
                     }
                     HostToHub::AcpEvent { request_id, event } => {
-                        if let Some(sender) = response_pending
+                        let sender = response_pending
                             .lock()
                             .expect("Host pending requests poisoned")
                             .get(&request_id)
                             .and_then(|pending| pending.acp_events.as_ref())
-                        {
-                            let _ = sender.send(event);
+                            .cloned();
+                        if let Some(sender) = sender {
+                            let _ = sender.send(event).await;
                         }
                     }
                     HostToHub::AcpPermissionRequested {
                         request_id,
                         request,
                     } => {
-                        if let Some(sender) = response_pending
+                        let sender = response_pending
                             .lock()
                             .expect("Host pending requests poisoned")
                             .get(&request_id)
                             .and_then(|pending| pending.acp_events.as_ref())
-                        {
-                            let _ = sender.send(AcpEvent::PermissionRequested { request });
+                            .cloned();
+                        if let Some(sender) = sender {
+                            let _ = sender.send(AcpEvent::PermissionRequested { request }).await;
                         }
                     }
                     HostToHub::DirectoryAttested {
@@ -516,6 +557,7 @@ impl HostControl for ConnectedHost {
         agent: &Agent,
         revision: &AgentRevision,
         expected_replica: Option<&AgentReplica>,
+        previous_slug: Option<&str>,
     ) -> Result<()> {
         match self
             .request(HubToHost::SynchronizeAgent {
@@ -523,6 +565,7 @@ impl HostControl for ConnectedHost {
                 agent: agent.clone(),
                 revision: revision.clone(),
                 expected_replica: expected_replica.cloned(),
+                previous_slug: previous_slug.map(str::to_owned),
             })
             .await?
         {
@@ -654,23 +697,34 @@ impl HostControl for ConnectedHost {
     async fn run_acp(
         &self,
         run: RemoteAcpRun,
-        events: mpsc::UnboundedSender<AcpEvent>,
+        events: mpsc::Sender<AcpEvent>,
+        cancellation: &CancellationToken,
     ) -> Result<mews_acp::AcpSessionOutcome> {
-        let reply = self
-            .request_with_events(
-                HubToHost::RunAcp {
-                    request_id: RequestId::new(),
-                    harness: run.harness,
-                    harness_options: run.harness_options,
-                    tools: run.tools,
-                    canonical_cwd: run.cwd,
-                    prompt: run.prompt,
-                    recovery_prompt: run.recovery_prompt,
-                    acp_session_id: run.session_id,
-                },
-                events,
-            )
-            .await?;
+        let request_id = RequestId::new();
+        let reply = self.request_with_events(
+            HubToHost::RunAcp {
+                request_id: request_id.clone(),
+                harness: run.harness,
+                harness_options: run.harness_options,
+                tools: run.tools,
+                canonical_cwd: run.cwd,
+                prompt: run.prompt,
+                recovery_prompt: run.recovery_prompt,
+                acp_session_id: run.session_id,
+            },
+            events,
+        );
+        tokio::pin!(reply);
+        let reply = tokio::select! {
+            reply = &mut reply => reply?,
+            _ = cancellation.cancelled() => {
+                self.sender.send(HubToHost::CancelAcp { request_id }).await
+                    .context("Host disconnected while cancelling ACP Run")?;
+                tokio::time::timeout(std::time::Duration::from_secs(5), reply)
+                    .await
+                    .context("Host did not stop the cancelled ACP Run")??
+            }
+        };
         match reply {
             HostReply::Acp(answer) => Ok(answer),
             _ => bail!("Host returned the wrong response type"),
@@ -699,7 +753,7 @@ impl HostControl for ConnectedHost {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl AgentCapabilities for ConnectedHost {
     async fn context(&self, cwd: &Path) -> Result<ContextSnapshot> {
         let content = self.fetch_project_context(cwd).await?;
@@ -765,7 +819,7 @@ impl ConnectedHost {
     async fn request_with_events(
         &self,
         request: HubToHost,
-        events: mpsc::UnboundedSender<AcpEvent>,
+        events: mpsc::Sender<AcpEvent>,
     ) -> Result<HostReply> {
         self.request_inner(request, Some(events)).await
     }
@@ -773,7 +827,7 @@ impl ConnectedHost {
     async fn request_inner(
         &self,
         request: HubToHost,
-        acp_events: Option<mpsc::UnboundedSender<AcpEvent>>,
+        acp_events: Option<mpsc::Sender<AcpEvent>>,
     ) -> Result<HostReply> {
         let request = mews_protocol::decode(&mews_protocol::encode(request)?)?;
         let request_id = match &request {
@@ -786,6 +840,9 @@ impl ConnectedHost {
             HubToHost::ReadPrompt { request_id, .. } => request_id.clone(),
             HubToHost::RefreshHarnessCatalog { request_id } => request_id.clone(),
             HubToHost::RunAcp { request_id, .. } => request_id.clone(),
+            HubToHost::CancelAcp { .. } => {
+                bail!("ACP cancellation is not a correlated Host request")
+            }
             HubToHost::BeginHubTransfer { request_id, .. }
             | HubToHost::WriteHubTransfer { request_id, .. }
             | HubToHost::CommitHubTransfer { request_id }
@@ -864,6 +921,9 @@ async fn serve_host(
         Arc::new(std::sync::Mutex::new(HashMap::new()));
     let binding_waiters: crate::host::AcpBindingWaiters =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let acp_cancellations = Arc::new(std::sync::Mutex::new(
+        HashMap::<RequestId, CancellationToken>::new(),
+    ));
     loop {
         tokio::select! {
             message = receiver.recv() => {
@@ -880,13 +940,34 @@ async fn serve_host(
                     }
                     continue;
                 }
+                if let HubToHost::CancelAcp { request_id } = message {
+                    if let Some(cancellation) = acp_cancellations
+                        .lock()
+                        .expect("ACP cancellations poisoned")
+                        .remove(&request_id)
+                    {
+                        cancellation.cancel();
+                    }
+                    continue;
+                }
                 if matches!(message, HubToHost::RunAcp { .. }) {
+                    let request_id = match &message {
+                        HubToHost::RunAcp { request_id, .. } => request_id.clone(),
+                        _ => unreachable!(),
+                    };
+                    let cancellation = CancellationToken::new();
+                    acp_cancellations
+                        .lock()
+                        .expect("ACP cancellations poisoned")
+                        .insert(request_id.clone(), cancellation.clone());
                     let registry = registry.clone();
                     let sender = sender.clone();
                     let waiters = Arc::clone(&permission_waiters);
                     let binding_waiters = Arc::clone(&binding_waiters);
+                    let cancellations = Arc::clone(&acp_cancellations);
                     tokio::spawn(async move {
-                        let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+                        let (event_sender, mut event_receiver) =
+                            mpsc::channel(super::ACP_EVENT_CHANNEL_CAPACITY);
                         let response = handle_host_request_streaming(
                             &registry,
                             None,
@@ -894,6 +975,7 @@ async fn serve_host(
                             Some(event_sender),
                             Some(waiters),
                             Some(binding_waiters),
+                            Some(cancellation),
                         );
                         tokio::pin!(response);
                         let response = loop {
@@ -910,11 +992,16 @@ async fn serve_host(
                             if sender.send(event).await.is_err() { return; }
                         }
                         let _ = sender.send(response).await;
+                        cancellations
+                            .lock()
+                            .expect("ACP cancellations poisoned")
+                            .remove(&request_id);
                     });
                     continue;
                 }
-                let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
-                let response = handle_host_request_streaming(&registry, None, message, Some(event_sender), Some(Arc::clone(&permission_waiters)), Some(Arc::clone(&binding_waiters)));
+                let (event_sender, mut event_receiver) =
+                    mpsc::channel(super::ACP_EVENT_CHANNEL_CAPACITY);
+                let response = handle_host_request_streaming(&registry, None, message, Some(event_sender), Some(Arc::clone(&permission_waiters)), Some(Arc::clone(&binding_waiters)), None);
                 tokio::pin!(response);
                 let response = loop {
                     tokio::select! {

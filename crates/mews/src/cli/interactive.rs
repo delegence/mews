@@ -1,4 +1,4 @@
-//! Interactive terminal client for MEWS sessions.
+//! Interactive terminal UI for MEWS sessions.
 
 use std::{
     collections::HashMap,
@@ -66,9 +66,28 @@ async fn send_interactive(
     prompt: String,
 ) -> Result<String> {
     let consumer = mews_client::ConsumerId::new();
-    client
-        .subscribe(consumer.clone(), session.id.clone())
-        .await?;
+    let subscribed = client
+        .subscribe_as(
+            consumer.clone(),
+            session.id.clone(),
+            mews_client::ConsumerKind::Ephemeral,
+        )
+        .await;
+    if let Err(error) = subscribed {
+        let _ = client.delete_consumer(consumer).await;
+        return Err(error);
+    }
+    let result = send_interactive_subscribed(client, session, prompt, consumer.clone()).await;
+    let _ = client.delete_consumer(consumer).await;
+    result
+}
+
+async fn send_interactive_subscribed(
+    client: &mut MewsClient,
+    session: &Session,
+    prompt: String,
+    consumer: mews_client::ConsumerId,
+) -> Result<String> {
     let run = client
         .start_turn(
             session.id.clone(),
@@ -197,6 +216,9 @@ async fn send_interactive(
                 mews_client::ClientEventKind::RunFailed { run_id, error } if *run_id == run.id => {
                     failure = Some(error.clone());
                 }
+                mews_client::ClientEventKind::RunCancelled { run_id } if *run_id == run.id => {
+                    failure = Some("Run cancelled".into());
+                }
                 _ => {}
             }
         }
@@ -258,13 +280,11 @@ async fn send_interactive(
         if let Some(error) = failure {
             thinking.stop().await?;
             commit_reasoning(&mut reasoning, &mut reasoning_visible, &colors)?;
-            client.unsubscribe(consumer, session.id.clone()).await?;
             anyhow::bail!("Run failed: {error}");
         }
         if finished {
             thinking.stop().await?;
             commit_reasoning(&mut reasoning, &mut reasoning_visible, &colors)?;
-            client.unsubscribe(consumer, session.id.clone()).await?;
             return Ok(answer);
         }
     }
@@ -476,7 +496,7 @@ fn format_tool_activity(tool: &str, arguments: &serde_json::Value) -> String {
         "fetch" => value("url")
             .map(|url| format!("fetching {url}"))
             .unwrap_or_else(|| "fetching resource".into()),
-        _ => format!("{}", compact_trace(tool)),
+        _ => compact_trace(tool),
     }
 }
 

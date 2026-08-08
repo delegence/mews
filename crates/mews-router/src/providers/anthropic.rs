@@ -14,7 +14,8 @@ use tokio::{
 
 use crate::{
     AuthStore, MessageContent, MessageRole, ModelPart, ModelRequest, ModelResponse, ProviderError,
-    ProviderResult, ReasoningEffort, http::send_with_retry,
+    ProviderResult, ReasoningEffort,
+    http::{response_json, send_with_retry},
 };
 
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -67,11 +68,7 @@ pub(crate) async fn generate(
     if oauth {
         request = request.header("anthropic-beta", oauth_betas(&body));
     }
-    let response = send_with_retry(request).await?;
-    let response: Value = response
-        .json()
-        .await
-        .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+    let response: Value = response_json(send_with_retry(request).await?).await?;
     parse(response, &model, &tools)
         .map_err(|error| ProviderError::InvalidResponse(error.to_string()))
 }
@@ -93,11 +90,7 @@ pub(crate) async fn models(client: &Client, root: &Path) -> ProviderResult<Vec<c
         if let Some(after_id) = &after_id {
             request = request.query(&[("after_id", after_id)]);
         }
-        let payload: Value = send_with_retry(request)
-            .await?
-            .json()
-            .await
-            .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+        let payload: Value = response_json(send_with_retry(request).await?).await?;
         let page = payload
             .get("data")
             .and_then(Value::as_array)
@@ -315,31 +308,31 @@ async fn exchange(
     state: &str,
     verifier: &str,
 ) -> Result<AuthCredential> {
-    let token: Value = send_with_retry(
-        client
-            .post(TOKEN_URL)
-            .header("accept", "application/json, text/plain, */*")
-            .header("user-agent", "axios/1.15.2")
-            .json(&json!({
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": REDIRECT_URI,
-                "client_id": CLIENT_ID,
-                "code_verifier": verifier,
-                "state": state,
-            })),
+    let token: Value = response_json(
+        send_with_retry(
+            client
+                .post(TOKEN_URL)
+                .header("accept", "application/json, text/plain, */*")
+                .header("user-agent", "axios/1.15.2")
+                .json(&json!({
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": REDIRECT_URI,
+                    "client_id": CLIENT_ID,
+                    "code_verifier": verifier,
+                    "state": state,
+                })),
+        )
+        .await?,
     )
-    .await?
-    .json()
     .await?;
     let mut credential = credential_from_token(token, None)?;
     if let AuthCredential::Oauth {
         access, account_id, ..
     } = &mut credential
+        && let Some(profile_account) = inspect_account(client, access).await
     {
-        if let Some(profile_account) = inspect_account(client, access).await {
-            *account_id = profile_account;
-        }
+        *account_id = profile_account;
     }
     Ok(credential)
 }
@@ -359,7 +352,7 @@ async fn inspect_account(client: &Client, access: &str) -> Option<String> {
         .ok()?
         .error_for_status()
         .ok()?;
-    let profile: Value = profile.json().await.ok()?;
+    let profile: Value = response_json(profile).await.ok()?;
     // The roles lookup is advisory, but replaying it keeps login behavior aligned
     // with Claude Code and catches an unusable claude_cli grant early upstream.
     let _ = request(ROLES_URL).send().await;
@@ -370,20 +363,21 @@ async fn inspect_account(client: &Client, access: &str) -> Option<String> {
 }
 
 async fn refresh(client: &Client, refresh_token: &str, account_id: &str) -> Result<AuthCredential> {
-    let token: Value = send_with_retry(
-        client
-            .post(TOKEN_URL)
-            .header("accept", "application/json, text/plain, */*")
-            .header("user-agent", "axios/1.15.2")
-            .json(&json!({
-                "client_id": CLIENT_ID,
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "scope": OAUTH_SCOPE,
-            })),
+    let token: Value = response_json(
+        send_with_retry(
+            client
+                .post(TOKEN_URL)
+                .header("accept", "application/json, text/plain, */*")
+                .header("user-agent", "axios/1.15.2")
+                .json(&json!({
+                    "client_id": CLIENT_ID,
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "scope": OAUTH_SCOPE,
+                })),
+        )
+        .await?,
     )
-    .await?
-    .json()
     .await?;
     credential_from_token(token, Some((refresh_token, account_id)))
 }

@@ -3,12 +3,8 @@ use std::{io::IsTerminal, path::Path};
 use anyhow::Result;
 use clap::CommandFactory;
 use mews_client::MewsClient;
-use mews_protocol::HubRequest;
 
-use super::{
-    command::{Cli, HarnessesCommand},
-    response,
-};
+use super::command::{Cli, HarnessesCommand};
 
 pub async fn run(root: &Path, command: Option<HarnessesCommand>) -> Result<()> {
     let Some(command) = command else {
@@ -41,7 +37,7 @@ pub async fn run(root: &Path, command: Option<HarnessesCommand>) -> Result<()> {
             );
         }
         if let Ok(mut client) = MewsClient::connect(root).await {
-            let _ = client.request(HubRequest::RefreshHarnesses).await;
+            let _ = client.refresh_harnesses().await;
         }
         if setup.descriptor.availability.authentication == mews_protocol::HarnessReadiness::Required
             && !std::io::stdin().is_terminal()
@@ -54,13 +50,18 @@ pub async fn run(root: &Path, command: Option<HarnessesCommand>) -> Result<()> {
         }
         return Ok(());
     }
-    let request = match command {
-        HarnessesCommand::List => HubRequest::ListHarnesses,
-        HarnessesCommand::Refresh => HubRequest::RefreshHarnesses,
+    let refresh = match command {
+        HarnessesCommand::List => false,
+        HarnessesCommand::Refresh => true,
         HarnessesCommand::Setup { .. } => unreachable!("handled before connecting to Hub"),
     };
     let mut client = MewsClient::connect(root).await?;
-    for entry in response::harnesses(client.request(request).await?)? {
+    let entries = if refresh {
+        client.refresh_harnesses().await?
+    } else {
+        client.harnesses().await?
+    };
+    for entry in entries {
         let availability = &entry.descriptor.availability;
         println!(
             "{}  {}  {}  runtime={:?} adapter={:?} auth={:?} catalog={:?}",

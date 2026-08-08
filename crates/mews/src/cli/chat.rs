@@ -4,9 +4,9 @@ use anyhow::{Context, Result, bail};
 use clap::CommandFactory;
 use inquire::{Confirm, Select, Text};
 use mews_client::MewsClient;
-use mews_protocol::{HubRequest, MessageSource, Session, SourceKind};
+use mews_protocol::{MessageSource, Session, SourceKind};
 
-use super::{command::Cli, prompt, response};
+use super::{command::Cli, prompt};
 
 pub async fn agents(root: &Path, args: Vec<String>) -> Result<()> {
     if args.is_empty() {
@@ -22,7 +22,7 @@ pub async fn agents(root: &Path, args: Vec<String>) -> Result<()> {
     let mut client = MewsClient::connect(root).await?;
     match args.as_slice() {
         [command] if command == "list" => {
-            for agent in response::agents(client.request(HubRequest::ListAgents).await?)? {
+            for agent in client.agents().await? {
                 println!("{}  {}  r{}", agent.id, agent.slug, agent.current_revision);
             }
         }
@@ -35,15 +35,9 @@ pub async fn agents(root: &Path, args: Vec<String>) -> Result<()> {
             let slug = creation.slug.context(
                 "agent name is required outside an interactive terminal; usage: mews agents new <name>",
             )?;
-            let agent = response::agent(
-                client
-                    .request(HubRequest::CreateAgent {
-                        slug,
-                        harness: creation.harness.clone(),
-                        harness_options: creation.harness_options,
-                    })
-                    .await?,
-            )?;
+            let agent = client
+                .create_agent(slug, creation.harness.clone(), creation.harness_options)
+                .await?;
             println!(
                 "Created {} ({}) with {} Harness.",
                 agent.slug,
@@ -55,22 +49,11 @@ pub async fn agents(root: &Path, args: Vec<String>) -> Result<()> {
             );
         }
         [command, slug, new_slug] if command == "rename" => {
-            let agent = response::agent(
-                client
-                    .request(HubRequest::RenameAgent {
-                        slug: slug.clone(),
-                        new_slug: new_slug.clone(),
-                    })
-                    .await?,
-            )?;
+            let agent = client.rename_agent(slug.clone(), new_slug.clone()).await?;
             println!("Renamed Agent to {}.", agent.slug);
         }
         [command, slug] if command == "delete" => {
-            response::ack(
-                client
-                    .request(HubRequest::ArchiveAgent { slug: slug.clone() })
-                    .await?,
-            )?;
+            client.archive_agent(slug.clone()).await?;
             println!("Deleted Agent {slug}.");
         }
         [slug, command, prompt @ ..] if command == "ask" && !prompt.is_empty() => {
@@ -80,7 +63,7 @@ pub async fn agents(root: &Path, args: Vec<String>) -> Result<()> {
         }
         [slug] => {
             let session = start_session(&mut client, slug).await?;
-            mews_tui::chat(&mut client, session).await?;
+            super::interactive::chat(&mut client, session).await?;
         }
         _ => bail!(
             "usage: mews agents list | mews agents new [name] [--harness <name>] [--option <key=value>]... | mews agents rename <slug> <new-slug> | mews agents delete <slug> | mews agents <slug> [ask <message>]"
@@ -103,7 +86,7 @@ async fn complete_creation_wizard(
         }
         creation.slug = Some(slug.to_owned());
     }
-    let mut harnesses = response::harnesses(client.request(HubRequest::ListHarnesses).await?)?;
+    let mut harnesses = client.harnesses().await?;
     if creation.harness.is_none() {
         let mut names = harnesses
             .iter()
@@ -169,7 +152,7 @@ async fn complete_creation_wizard(
         .unwrap_or(false)
     {
         mews_host::HarnessCatalog::setup(root, harness).await?;
-        harnesses = response::harnesses(client.request(HubRequest::RefreshHarnesses).await?)?;
+        harnesses = client.refresh_harnesses().await?;
         descriptors = ready_descriptors(&harnesses, harness);
     }
     if descriptors.is_empty() {
@@ -206,9 +189,8 @@ async fn select_mews_options(
     client: &mut MewsClient,
     creation: &mut CreateAgentArgs,
 ) -> Result<()> {
-    let defaults =
-        response::provider_defaults(client.request(HubRequest::GetProviderDefaults).await?)?;
-    let models = response::models(client.request(HubRequest::ListModels).await?)?;
+    let defaults = client.provider_defaults().await?;
+    let models = client.models().await?;
     if !creation.harness_options.contains_key("model") && !models.is_empty() {
         let mut choices = vec![("Provider default".to_owned(), None)];
         choices.extend(
@@ -432,7 +414,7 @@ pub async fn sessions(root: &Path, id: Option<String>, args: Vec<String>) -> Res
         if !args.is_empty() {
             bail!("usage: mews sessions list");
         }
-        for session in response::sessions(client.request(HubRequest::ListSessions).await?)? {
+        for session in client.sessions().await? {
             println!(
                 "{}  {}  {}",
                 session.id,
@@ -442,20 +424,16 @@ pub async fn sessions(root: &Path, id: Option<String>, args: Vec<String>) -> Res
         }
         return Ok(());
     }
-    let session = response::session(
-        client
-            .request(HubRequest::GetSession {
-                id: id.parse().map_err(anyhow::Error::msg)?,
-            })
-            .await?,
-    )?;
+    let session = client
+        .session(id.parse().map_err(anyhow::Error::msg)?)
+        .await?;
     if let [command, prompt @ ..] = args.as_slice()
         && command == "ask"
         && !prompt.is_empty()
     {
         println!("{}", send(&mut client, &session, prompt.join(" ")).await?);
     } else if args.is_empty() {
-        mews_tui::chat(&mut client, session).await?;
+        super::interactive::chat(&mut client, session).await?;
     } else {
         bail!("usage: mews sessions list | mews sessions <id> [ask <message>]");
     }
@@ -474,14 +452,9 @@ fn print_command_help(name: &str) -> Result<()> {
 }
 
 async fn start_session(client: &mut MewsClient, slug: &str) -> Result<Session> {
-    response::session(
-        client
-            .request(HubRequest::StartSession {
-                slug: slug.to_owned(),
-                working_directory: Some(env::current_dir()?.canonicalize()?),
-            })
-            .await?,
-    )
+    client
+        .start_session(slug, Some(env::current_dir()?.canonicalize()?))
+        .await
 }
 
 async fn send(client: &mut MewsClient, session: &Session, prompt: String) -> Result<String> {

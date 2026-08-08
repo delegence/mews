@@ -110,15 +110,17 @@ impl Mews {
     pub fn agents(&self) -> Result<Vec<Agent>> {
         Ok(self.store.agents()?)
     }
+
+    pub(crate) fn agent_revision(&self, agent: &Agent) -> Result<crate::AgentRevision> {
+        Ok(self
+            .store
+            .agent_revision(&agent.id, agent.current_revision)?)
+    }
     pub fn sessions(&self) -> Result<Vec<Session>> {
         Ok(self.store.sessions()?)
     }
     pub fn hosts(&self) -> Result<Vec<crate::Host>> {
         Ok(self.store.hosts()?)
-    }
-
-    pub fn rename_agent(&self, slug: &str, new_slug: &str) -> Result<Agent> {
-        Ok(self.store.rename_agent(slug, new_slug)?)
     }
 
     pub fn archive_agent(&self, slug: &str) -> Result<()> {

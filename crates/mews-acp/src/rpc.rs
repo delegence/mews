@@ -3,7 +3,7 @@ use std::{fmt, time::Duration};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     time,
 };
 
@@ -14,10 +14,20 @@ use crate::{
 
 pub(crate) struct RpcClient<'a, W> {
     writer: &'a mut W,
-    reader: &'a mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    reader: &'a mut BufReader<tokio::process::ChildStdout>,
     timeout: Duration,
     permission_handler: &'a dyn AcpPermissionHandler,
     next_id: u64,
+}
+
+const MAX_ACP_LINE_BYTES: usize = 1024 * 1024;
+const CANCELLATION_GRACE: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcpErrorKind {
+    AuthenticationRequired,
+    ResourceNotFound,
+    Other,
 }
 
 #[derive(Debug)]
@@ -45,15 +55,23 @@ impl fmt::Display for AcpRpcError {
 impl std::error::Error for AcpRpcError {}
 
 pub(crate) fn is_resource_not_found(error: &anyhow::Error) -> bool {
+    classify_error(error) == Some(AcpErrorKind::ResourceNotFound)
+}
+
+pub fn classify_error(error: &anyhow::Error) -> Option<AcpErrorKind> {
     error
         .downcast_ref::<AcpRpcError>()
-        .is_some_and(|error| error.code == -32002)
+        .map(|error| match error.code {
+            -32000 => AcpErrorKind::AuthenticationRequired,
+            -32002 => AcpErrorKind::ResourceNotFound,
+            _ => AcpErrorKind::Other,
+        })
 }
 
 impl<'a, W: AsyncWriteExt + Unpin> RpcClient<'a, W> {
     pub(crate) fn new(
         writer: &'a mut W,
-        reader: &'a mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+        reader: &'a mut BufReader<tokio::process::ChildStdout>,
         timeout: Duration,
         permission_handler: &'a dyn AcpPermissionHandler,
     ) -> Self {
@@ -91,87 +109,31 @@ impl<'a, W: AsyncWriteExt + Unpin> RpcClient<'a, W> {
         self.writer.write_all(b"\n").await?;
         self.writer.flush().await?;
 
+        let deadline = time::Instant::now() + self.timeout;
+
         loop {
             let line = if let Some(http) = mcp_http {
                 tokio::select! {
                     _ = cancellation.cancelled() => {
-                        self.cancel_session(session_id.as_deref()).await?;
+                        self.cancel_with_grace(session_id.as_deref()).await;
                         bail!("ACP Harness run cancelled");
                     }
-                    result = http.accept_and_handle(mcp.context("MCP endpoint requires a Run bridge")?) => {
+                    result = http.accept_and_handle(mcp.context("MCP endpoint requires a Run bridge")?, deadline) => {
                         result?;
                         continue;
                     }
-                    line = time::timeout(self.timeout, self.reader.next_line()) => line.context("ACP request timed out")??,
+                    _ = time::sleep_until(deadline) => bail!("ACP request timed out"),
+                    line = read_acp_line(self.reader, deadline) => line?,
                 }
             } else {
                 tokio::select! {
                     _ = cancellation.cancelled() => {
-                        self.cancel_session(session_id.as_deref()).await?;
+                        self.cancel_with_grace(session_id.as_deref()).await;
                         bail!("ACP Harness run cancelled");
                     }
-                    line = time::timeout(self.timeout, self.reader.next_line()) => line.context("ACP request timed out")??,
+                    _ = time::sleep_until(deadline) => bail!("ACP request timed out"),
+                    line = read_acp_line(self.reader, deadline) => line?,
                 }
-            };
-            let line = line.context("ACP Harness closed stdout before replying")?;
-            let message: Value = serde_json::from_str(&line)
-                .with_context(|| format!("invalid ACP JSON-RPC message: {line}"))?;
-            if message.get("method").and_then(Value::as_str) == Some("session/update") {
-                if let Some(update) = message
-                    .get("params")
-                    .and_then(|params| params.get("update"))
-                {
-                    on_update(update)?;
-                }
-                continue;
-            }
-            if message.get("method").is_some() && message.get("id").is_some() {
-                self.handle_client_request(&message, cancellation, &mut on_update)
-                    .await?;
-                continue;
-            }
-            if message.get("id") != Some(&json!(id)) {
-                continue;
-            }
-            if let Some(error) = message.get("error") {
-                return Err(acp_rpc_error(method, error));
-            }
-            return message
-                .get("result")
-                .cloned()
-                .context("ACP response did not include result");
-        }
-    }
-
-    pub(crate) async fn request_plain<F>(
-        &mut self,
-        method: &str,
-        params: Value,
-        cancellation: &mews_agent::CancellationToken,
-        mut on_update: F,
-    ) -> Result<Value>
-    where
-        F: FnMut(&Value) -> Result<()>,
-    {
-        let id = self.next_id;
-        self.next_id += 1;
-        let session_id = params
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let request = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        self.writer
-            .write_all(serde_json::to_string(&request)?.as_bytes())
-            .await?;
-        self.writer.write_all(b"\n").await?;
-        self.writer.flush().await?;
-        loop {
-            let line = tokio::select! {
-                _ = cancellation.cancelled() => {
-                    self.cancel_session(session_id.as_deref()).await?;
-                    bail!("ACP Harness run cancelled");
-                }
-                line = time::timeout(self.timeout, self.reader.next_line()) => line.context("ACP request timed out")??,
             };
             let line = line.context("ACP Harness closed stdout before replying")?;
             let message: Value = serde_json::from_str(&line)
@@ -276,6 +238,12 @@ impl<'a, W: AsyncWriteExt + Unpin> RpcClient<'a, W> {
         Ok(())
     }
 
+    async fn cancel_with_grace(&mut self, session_id: Option<&str>) {
+        let deadline = time::Instant::now() + CANCELLATION_GRACE;
+        let _ = time::timeout_at(deadline, self.cancel_session(session_id)).await;
+        time::sleep_until(deadline).await;
+    }
+
     async fn write_message(&mut self, message: &Value) -> Result<()> {
         self.writer
             .write_all(serde_json::to_string(message)?.as_bytes())
@@ -284,6 +252,34 @@ impl<'a, W: AsyncWriteExt + Unpin> RpcClient<'a, W> {
         self.writer.flush().await?;
         Ok(())
     }
+}
+
+async fn read_acp_line<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    deadline: time::Instant,
+) -> Result<Option<String>> {
+    let mut encoded = Vec::new();
+    let read = time::timeout_at(
+        deadline,
+        (&mut *reader)
+            .take((MAX_ACP_LINE_BYTES + 1) as u64)
+            .read_until(b'\n', &mut encoded),
+    )
+    .await
+    .context("ACP request timed out")??;
+    if read == 0 {
+        return Ok(None);
+    }
+    if encoded.len() > MAX_ACP_LINE_BYTES || !encoded.ends_with(b"\n") {
+        bail!("ACP JSON-RPC line exceeds 1 MiB");
+    }
+    encoded.pop();
+    if encoded.last() == Some(&b'\r') {
+        encoded.pop();
+    }
+    String::from_utf8(encoded)
+        .map(Some)
+        .context("ACP JSON-RPC line is not UTF-8")
 }
 
 pub(crate) fn acp_rpc_error(method: &str, error: &Value) -> anyhow::Error {
@@ -300,4 +296,19 @@ pub(crate) fn acp_rpc_error(method: &str, error: &Value) -> anyhow::Error {
             .to_owned(),
         data: error.get("data").cloned(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rejects_oversized_no_newline_output_at_the_ingress_bound() {
+        let bytes = vec![b'x'; MAX_ACP_LINE_BYTES + 1];
+        let mut reader = BufReader::new(bytes.as_slice());
+        let error = read_acp_line(&mut reader, time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds 1 MiB"));
+    }
 }

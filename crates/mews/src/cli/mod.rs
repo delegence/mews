@@ -3,8 +3,8 @@ mod command;
 mod defaults;
 mod harnesses;
 mod hosts;
+mod interactive;
 mod providers;
-mod response;
 mod runtime;
 mod setup;
 
@@ -12,7 +12,6 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser};
 use inquire::InquireError;
 use mews_client::MewsClient;
-use mews_protocol::HubRequest;
 
 use command::{Cli, Command, HubCommand, RelayCommand};
 
@@ -38,13 +37,13 @@ pub async fn run() -> Result<()> {
             command: HubCommand::Stop,
         } => {
             let mut client = MewsClient::connect(&cli.root).await?;
-            response::ack(client.request(HubRequest::Shutdown).await?)?;
+            client.shutdown_daemon().await?;
         }
         Command::Hub {
             command: HubCommand::Move { host },
         } => {
             let mut client = MewsClient::connect(&cli.root).await?;
-            response::ack(client.request(HubRequest::MoveHub { host }).await?)?;
+            client.move_hub(host).await?;
             println!("Hub moved successfully.");
         }
         Command::Hub {
@@ -69,7 +68,7 @@ pub async fn run() -> Result<()> {
         Command::Harnesses { command } => harnesses::run(&cli.root, command).await?,
         Command::Status => {
             let mut client = MewsClient::connect(&cli.root).await?;
-            let installation = response::status(client.request(HubRequest::Status).await?)?;
+            let installation = client.status().await?;
             println!(
                 "installation: {}\nhub host: {}\ngeneration: {}",
                 installation.id, installation.hub_host_id, installation.generation

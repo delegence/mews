@@ -1,8 +1,13 @@
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use reqwest::{RequestBuilder, Response, StatusCode};
+use serde::de::DeserializeOwned;
 
 use crate::{ProviderError, ProviderResult};
+
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 pub(crate) async fn send_with_retry(request: RequestBuilder) -> ProviderResult<Response> {
     const ATTEMPTS: usize = 3;
@@ -12,7 +17,7 @@ pub(crate) async fn send_with_retry(request: RequestBuilder) -> ProviderResult<R
         })?;
         let response = match call.send().await {
             Ok(response) => response,
-            Err(error) if attempt + 1 < ATTEMPTS && (error.is_connect() || error.is_timeout()) => {
+            Err(error) if attempt + 1 < ATTEMPTS && error.is_connect() => {
                 tokio::time::sleep(Duration::from_secs(1_u64 << attempt)).await;
                 continue;
             }
@@ -27,9 +32,13 @@ pub(crate) async fn send_with_retry(request: RequestBuilder) -> ProviderResult<R
         if status.is_success() {
             return Ok(response);
         }
-        let retryable = status == StatusCode::TOO_MANY_REQUESTS
-            || status == StatusCode::REQUEST_TIMEOUT
-            || status.is_server_error();
+        let retryable = matches!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS
+                | StatusCode::BAD_GATEWAY
+                | StatusCode::SERVICE_UNAVAILABLE
+                | StatusCode::GATEWAY_TIMEOUT
+        );
         if retryable && attempt + 1 < ATTEMPTS {
             let delay = retry_after.unwrap_or(1_u64 << attempt).min(30);
             tokio::time::sleep(Duration::from_secs(delay)).await;
@@ -50,10 +59,40 @@ pub(crate) async fn send_with_retry(request: RequestBuilder) -> ProviderResult<R
 }
 
 async fn response_text(response: Response) -> String {
-    response
-        .text()
+    response_text_limited(response, MAX_ERROR_BODY_BYTES)
         .await
-        .unwrap_or_else(|_| "response body unavailable".into())
+        .unwrap_or_else(|error| error.to_string())
+}
+
+pub(crate) async fn response_json<T: DeserializeOwned>(response: Response) -> ProviderResult<T> {
+    let bytes = response_bytes_limited(response, MAX_RESPONSE_BODY_BYTES).await?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ProviderError::InvalidResponse(error.to_string()))
+}
+
+pub(crate) async fn response_text_limited(
+    response: Response,
+    limit: usize,
+) -> ProviderResult<String> {
+    let bytes = response_bytes_limited(response, limit).await?;
+    String::from_utf8(bytes).map_err(|error| {
+        ProviderError::InvalidResponse(format!("provider response is not UTF-8: {error}"))
+    })
+}
+
+async fn response_bytes_limited(response: Response, limit: usize) -> ProviderResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| ProviderError::Http(error.to_string()))?;
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(ProviderError::InvalidResponse(format!(
+                "provider response exceeds {limit} bytes"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -92,5 +131,55 @@ mod tests {
         assert_eq!(response.text().await.unwrap(), "ok");
         server.await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_an_ambiguous_response_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = calls.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            server_calls.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(30))
+            .build()
+            .unwrap();
+
+        let result = send_with_retry(client.post(format!("http://{address}")).body("work")).await;
+
+        assert!(matches!(result, Err(ProviderError::Http(_))));
+        server.await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn caps_provider_error_bodies() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.unwrap();
+            let body = vec![b'x'; MAX_ERROR_BODY_BYTES + 1];
+            let headers = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+        });
+
+        let error = send_with_retry(reqwest::Client::new().get(format!("http://{address}")))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("exceeds 65536 bytes"));
+        server.await.unwrap();
     }
 }

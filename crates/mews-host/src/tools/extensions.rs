@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, path::Path};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use mews_agent::CancellationToken;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -78,9 +79,23 @@ fn runtime_extensions_in(directory: &Path) -> Result<Vec<RuntimeExtension>> {
                 bail!("unsupported extension hook {hook:?}");
             }
         }
-        extensions.push(extension);
+        extensions.push((path, extension));
     }
-    Ok(extensions)
+    extensions.sort_by(|(left_path, left), (right_path, right)| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left_path.cmp(right_path))
+    });
+    if extensions
+        .windows(2)
+        .any(|items| items[0].1.name == items[1].1.name)
+    {
+        bail!("duplicate runtime extension name");
+    }
+    Ok(extensions
+        .into_iter()
+        .map(|(_, extension)| extension)
+        .collect())
 }
 
 pub(super) fn resource_fingerprint(root: &Path) -> Result<String> {
@@ -163,12 +178,63 @@ impl Tool for ExternalTool {
     fn schema(&self) -> Value {
         self.0.schema.clone()
     }
-    async fn execute(&self, arguments: Value, cwd: &Path) -> Result<Value> {
+    async fn execute(
+        &self,
+        arguments: Value,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Value> {
         let input = if self.0.envelope {
             json!({"type":"tool", "name":self.0.name, "arguments":arguments})
         } else {
             arguments
         };
-        super::process::execute(&self.0.command, cwd, input).await
+        super::process::execute(&self.0.command, cwd, input, cancellation).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_extensions_are_sorted_by_name() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("first-on-disk.toml"),
+            "name = 'zebra'\ncommand = ['true']\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("second-on-disk.toml"),
+            "name = 'alpha'\ncommand = ['true']\n",
+        )
+        .unwrap();
+
+        let names: Vec<_> = runtime_extensions_in(directory.path())
+            .unwrap()
+            .into_iter()
+            .map(|extension| extension.name)
+            .collect();
+        assert_eq!(names, ["alpha", "zebra"]);
+    }
+
+    #[test]
+    fn duplicate_runtime_extension_names_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        for file in ["one.toml", "two.toml"] {
+            std::fs::write(
+                directory.path().join(file),
+                "name = 'duplicate'\ncommand = ['true']\n",
+            )
+            .unwrap();
+        }
+
+        let error = runtime_extensions_in(directory.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate runtime extension name")
+        );
     }
 }

@@ -2,17 +2,19 @@
 compile_error!("the MEWS Host daemon requires Unix sockets");
 
 use std::{
+    future::Future,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use mews_relay::{NetworkRelay, RelayIdentity};
 use tokio::sync::mpsc;
 
 use crate::{
     enrollment::relay::EnrollmentAccepted,
-    host::{ConnectedHost, HostControl},
+    host::ConnectedHost,
+    hub::{HubRuntime, RequestOrigin, dispatch, protocol_error, resolve_request_location},
     identity::{HostIdentity, NoiseIdentity},
     service::Mews,
     transport::{PeerAuthentication, connect_responder, run_peer_bridge},
@@ -25,10 +27,18 @@ pub(crate) async fn serve_hub_host(
     accepted: EnrollmentAccepted,
     remote_hosts: crate::hub::RemoteHosts,
     control: crate::hub::HubControl,
+    local_host: Arc<ConnectedHost>,
 ) -> Result<()> {
     loop {
-        if let Err(error) =
-            serve_hub_host_once(&root, &relay_urls, &accepted, &remote_hosts, &control).await
+        if let Err(error) = serve_hub_host_once(
+            &root,
+            &relay_urls,
+            &accepted,
+            &remote_hosts,
+            &control,
+            &local_host,
+        )
+        .await
         {
             eprintln!("remote Host {} disconnected: {error:#}", accepted.host.id);
         }
@@ -42,6 +52,7 @@ async fn serve_hub_host_once(
     accepted: &EnrollmentAccepted,
     remote_hosts: &crate::hub::RemoteHosts,
     control: &crate::hub::HubControl,
+    local_host: &Arc<ConnectedHost>,
 ) -> Result<()> {
     Mews::open_connection(root.to_path_buf())?.ensure_host(&accepted.host.id)?;
     let authority = HostIdentity::load(&root.join("secrets/installation.key"))?;
@@ -109,6 +120,11 @@ async fn serve_hub_host_once(
         .lock()
         .await
         .insert(accepted.host.id.clone(), Arc::clone(&connected));
+    let runtime = Arc::new(HubRuntime {
+        remote_hosts: Arc::clone(remote_hosts),
+        local_host: Arc::clone(local_host),
+        control: control.clone(),
+    });
     let tool_peer = peer_out.clone();
     tokio::task::spawn_local(async move {
         while let Some(body) = tool_rx.recv().await {
@@ -121,7 +137,7 @@ async fn serve_hub_host_once(
             }
         }
     });
-    let (client_tx, mut client_rx) = mpsc::channel(32);
+    let (client_tx, client_rx) = mpsc::channel(32);
     tokio::task::spawn_local(async move {
         while let Some(message) = peer_in.recv().await {
             match message {
@@ -135,409 +151,184 @@ async fn serve_hub_host_once(
             }
         }
     });
-    while let Some((request_id, request)) = client_rx.recv().await {
-        let response = match dispatch_remote(root, &connected, remote_hosts, control, request).await
-        {
-            Ok(response) => response,
-            Err(error) => HubResponse::Error(ProtocolError::internal(format!("{error:#}"))),
-        };
-        peer_out
-            .send(PeerEnvelope::ClientResponse {
-                request_id,
-                body: response,
-            })
-            .await
-            .context("remote Host disconnected")?;
+    let dispatch_root = root.to_path_buf();
+    let dispatch_host = Arc::clone(&connected);
+    let dispatch_runtime = Arc::clone(&runtime);
+    serve_client_requests(client_rx, peer_out, move |request| {
+        let root = dispatch_root.clone();
+        let host = Arc::clone(&dispatch_host);
+        let runtime = Arc::clone(&dispatch_runtime);
+        async move { dispatch_host_request(&runtime, &root, &host, request).await }
+    })
+    .await?;
+    let mut hosts = remote_hosts.lock().await;
+    if hosts
+        .get(&accepted.host.id)
+        .is_some_and(|current| Arc::ptr_eq(current, &connected))
+    {
+        hosts.remove(&accepted.host.id);
     }
     Ok(())
 }
 
-async fn dispatch_remote(
+async fn serve_client_requests<F, Fut>(
+    mut incoming: mpsc::Receiver<(mews_protocol::RequestId, HubRequest)>,
+    responses: mpsc::Sender<PeerEnvelope>,
+    dispatch: F,
+) -> Result<()>
+where
+    F: Fn(HubRequest) -> Fut + Clone + 'static,
+    Fut: Future<Output = HubResponse> + 'static,
+{
+    const MAX_CONCURRENT_REQUESTS: usize = 16;
+    let mut requests = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            biased;
+            result = requests.join_next(), if !requests.is_empty() => {
+                result.context("remote request task disappeared")?
+                    .context("remote request task panicked")??;
+            }
+            request = incoming.recv(), if requests.len() < MAX_CONCURRENT_REQUESTS => {
+                let Some((request_id, request)) = request else {
+                    break;
+                };
+                let responses = responses.clone();
+                let dispatch = dispatch.clone();
+                requests.spawn_local(async move {
+                    responses
+                        .send(PeerEnvelope::ClientResponse {
+                            request_id,
+                            body: dispatch(request).await,
+                        })
+                        .await
+                });
+            }
+        }
+    }
+    while let Some(result) = requests.join_next().await {
+        result.context("remote request task panicked")??;
+    }
+    Ok(())
+}
+
+async fn dispatch_host_request(
+    runtime: &HubRuntime,
     root: &Path,
     host: &ConnectedHost,
-    remote_hosts: &crate::hub::RemoteHosts,
-    control: &crate::hub::HubControl,
     request: HubRequest,
-) -> Result<HubResponse> {
-    let _operation = control.handoff_gate.read().await;
-    if control.moving.load(std::sync::atomic::Ordering::Acquire)
-        && !matches!(request, HubRequest::Status)
-    {
-        bail!("Hub is moving; try again after handoff");
+) -> HubResponse {
+    if let Some(error) = remote_origin_error(&request) {
+        return HubResponse::Error(error);
     }
-    if let HubRequest::ResolvePermission {
-        request_id,
-        option_id,
-    } = request
-    {
-        if let Some(waiter) = control.permission_waiters.lock().await.remove(&request_id) {
-            let _ = waiter.send(option_id);
-        }
-        return Ok(HubResponse::Ack);
+    let request = match resolve_request_location(RequestOrigin::Host(host), request) {
+        Ok(request) => request,
+        Err(error) => return HubResponse::Error(protocol_error(&error)),
+    };
+    match dispatch(runtime, root, RequestOrigin::Host(host), request).await {
+        Ok((response, false)) => response,
+        Ok((_, true)) => unreachable!("Host-origin requests cannot stop the Hub"),
+        Err(error) => HubResponse::Error(protocol_error(&error)),
     }
-    if let HubRequest::PollEvents {
-        consumer_id,
-        limit,
-        wait_ms,
-    } = request
-    {
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_millis(u64::from(wait_ms.min(30_000)));
-        loop {
-            let notified = control.event_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let events = Mews::open_connection(root.to_path_buf())?
-                .client_events(&consumer_id, limit.clamp(1, 500))?;
-            if events.advanced || tokio::time::Instant::now() >= deadline {
-                return Ok(HubResponse::Events(events));
-            }
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let _ = tokio::time::timeout(remaining, notified).await;
-        }
-    }
-    if let HubRequest::StartTurn {
-        idempotency_key,
-        session_id,
-        prompt,
-        metadata,
-        source,
-    } = request
-    {
-        let mews = Mews::open_connection(root.to_path_buf())?;
-        let (run, created) = mews.start_run_idempotent(&session_id, &idempotency_key)?;
-        if !created {
-            return Ok(HubResponse::Run(run));
-        }
-        control.event_notify.notify_waiters();
-        let session = mews.session(&session_id)?;
-        let installation = mews.installation()?;
-        let source = source.unwrap_or(crate::MessageSource {
-            kind: crate::SourceKind::Client,
-            id: "client".into(),
-        });
-        let root = root.to_path_buf();
-        let remote_hosts = Arc::clone(remote_hosts);
-        let locks = Arc::clone(&control.session_locks);
-        let run_task = run.clone();
-        let tasks = Arc::clone(&control.run_tasks);
-        let notify = Arc::clone(&control.event_notify);
-        let permission_handler = crate::hub::runs::permission_handler(
-            &root,
-            session.id.clone(),
-            run.id.clone(),
-            control.clone(),
-        );
-        let task = tokio::task::spawn_local(async move {
-            let lock = {
-                let mut locks = locks.lock().await;
-                Arc::clone(
-                    locks
-                        .entry(session.id.clone())
-                        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-                )
-            };
-            let _guard = lock.lock().await;
-            let result = async {
-                let mut turn = Mews::open_connection(&root)?;
-                if session.host_id == installation.hub_host_id {
-                    turn.send_from_started(
-                        &session,
-                        &prompt,
-                        metadata,
-                        source,
-                        crate::service::StartedRun {
-                            id: run_task.id.clone(),
-                            event_notify: Arc::clone(&notify),
-                            permission_handler: Arc::clone(&permission_handler),
-                        },
-                    )
-                    .await?;
-                } else {
-                    let target = remote_hosts
-                        .lock()
-                        .await
-                        .get(&session.host_id)
-                        .cloned()
-                        .with_context(|| format!("Session Host {} is offline", session.host_id))?;
-                    turn.send_on_from_started(
-                        &session,
-                        &prompt,
-                        metadata,
-                        target.as_ref(),
-                        source,
-                        crate::service::StartedRun {
-                            id: run_task.id.clone(),
-                            event_notify: Arc::clone(&notify),
-                            permission_handler: Arc::clone(&permission_handler),
-                        },
-                    )
-                    .await?;
-                }
-                Ok::<_, anyhow::Error>(())
-            }
-            .await;
-            if let Err(error) = result {
-                if let Ok(mews) = Mews::open_connection(&root) {
-                    let _ = mews.fail_run(&run_task.id, &format!("{error:#}"));
-                }
-            }
-            tasks.lock().await.remove(&run_task.id);
-            notify.notify_waiters();
-        });
-        control
-            .run_tasks
-            .lock()
-            .await
-            .insert(run.id.clone(), task.abort_handle());
-        return Ok(HubResponse::Run(run));
-    }
-    let mut mews = Mews::open_connection(root.to_path_buf())?;
-    mews.ensure_host(host.host_id())?;
-    Ok(match request {
-        HubRequest::Status => HubResponse::Status(mews.installation()?),
-        HubRequest::ResolvePermission { .. } => unreachable!("handled before opening the store"),
-        HubRequest::ListAgents => HubResponse::Agents(mews.agents()?),
-        HubRequest::CreateAgent {
-            slug,
-            harness,
-            harness_options,
-        } => HubResponse::Agent(mews.create_agent_with_harness(
-            &slug,
-            harness.as_deref().unwrap_or(mews_runtime::MEWS_HARNESS),
-            harness_options,
-        )?),
-        HubRequest::RenameAgent { slug, new_slug } => {
-            HubResponse::Agent(mews.rename_agent(&slug, &new_slug)?)
-        }
-        HubRequest::ArchiveAgent { slug } => {
-            mews.archive_agent(&slug)?;
-            HubResponse::Ack
-        }
-        HubRequest::SetApiKey { provider, key } => {
-            mews.set_api_key(&provider, key).await?;
-            HubResponse::Ack
-        }
-        HubRequest::SetAuth {
-            provider,
-            credential,
-        } => {
-            mews.set_auth(&provider, &credential).await?;
-            HubResponse::Ack
-        }
-        HubRequest::RemoveAuth { provider } => {
-            mews.remove_auth(&provider).await?;
-            HubResponse::Ack
-        }
-        HubRequest::ListAuth => HubResponse::Auth(mews.auth_statuses().await?),
-        HubRequest::ListModels => HubResponse::Models(mews.models().await?),
-        HubRequest::RefreshModels => HubResponse::Models(mews.refresh_models().await?),
-        HubRequest::GetProviderDefaults => HubResponse::ProviderDefaults(mews.provider_defaults()?),
-        HubRequest::SetDefaultModel { model } => {
-            mews.set_default_model(&model).await?;
-            HubResponse::Ack
-        }
-        HubRequest::SetDefaultReasoning { reasoning } => {
-            mews.set_default_reasoning(reasoning).await?;
-            HubResponse::Ack
-        }
-        HubRequest::SubscribeSession {
-            consumer_id,
-            session_id,
-        } => {
-            mews.subscribe_session(&consumer_id, &session_id)?;
-            HubResponse::Ack
-        }
-        HubRequest::UnsubscribeSession {
-            consumer_id,
-            session_id,
-        } => {
-            mews.unsubscribe_session(&consumer_id, &session_id)?;
-            HubResponse::Ack
-        }
-        HubRequest::AcknowledgeEvents {
-            consumer_id,
-            checkpoint,
-        } => {
-            mews.acknowledge_events(&consumer_id, checkpoint)?;
-            HubResponse::Ack
-        }
-        HubRequest::GetRun { id } => HubResponse::Run(mews.run(&id)?),
-        HubRequest::CancelRun { id } => {
-            if let Some(task) = control.run_tasks.lock().await.remove(&id) {
-                task.abort();
-            }
-            mews.cancel_run(&id)?;
-            control.event_notify.notify_waiters();
-            HubResponse::Ack
-        }
-        HubRequest::ListSessions => HubResponse::Sessions(mews.sessions()?),
-        HubRequest::GetSession { id } => HubResponse::Session(mews.session(&id)?),
-        HubRequest::GetSessionModelConfig { id } => {
-            let session = mews.session(&id)?;
-            HubResponse::SessionModelConfig(mews.session_model_config(&session)?)
-        }
-        HubRequest::SetSessionModel { id, model } => {
-            HubResponse::Session(mews.set_session_model(&id, model.as_deref())?)
-        }
-        HubRequest::StartSession {
-            slug,
-            working_directory,
-        } => HubResponse::Session(match working_directory {
-            Some(directory) => mews.start_session_on(&slug, &directory, host).await?,
-            None => {
-                let home = std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .context("HOME is unavailable for a locationless client")?
-                    .canonicalize()?;
-                mews.start_session(&slug, &home).await?
-            }
-        }),
-        HubRequest::StartSessionOn {
-            slug,
-            host_id,
-            working_directory,
-        } => {
-            let installation = mews.installation()?;
-            if host_id == installation.hub_host_id {
-                HubResponse::Session(mews.start_session(&slug, &working_directory).await?)
-            } else if host_id == *host.host_id() {
-                HubResponse::Session(
-                    mews.start_session_on(&slug, &working_directory, host)
-                        .await?,
-                )
-            } else {
-                let target = remote_hosts
-                    .lock()
-                    .await
-                    .get(&host_id)
-                    .cloned()
-                    .with_context(|| format!("target Host {host_id} is offline"))?;
-                HubResponse::Session(
-                    mews.start_session_on(&slug, &working_directory, target.as_ref())
-                        .await?,
-                )
-            }
-        }
-        HubRequest::StartTurn { .. } | HubRequest::PollEvents { .. } => {
-            unreachable!("handled above")
-        }
-        HubRequest::ListHosts => {
-            let installation = mews.installation()?;
-            let connected = remote_hosts.lock().await;
-            HubResponse::Hosts(
-                mews.hosts()?
-                    .into_iter()
-                    .map(|candidate| crate::HostStatus {
-                        connected: candidate.id == installation.hub_host_id
-                            || candidate.id == *host.host_id()
-                            || connected.contains_key(&candidate.id),
-                        host: candidate,
-                    })
-                    .collect(),
-            )
-        }
-        HubRequest::ListHarnesses => {
-            let installation = mews.installation()?;
-            let hosts = mews.hosts()?;
-            let hub_host = hosts
-                .iter()
-                .find(|candidate| candidate.id == installation.hub_host_id)
-                .context("Hub Host is missing from installation")?
-                .clone();
-            let mut catalog = mews_host::HarnessCatalog::discover(Some(root))?
-                .descriptors()
-                .into_iter()
-                .map(|descriptor| crate::HostHarnessStatus {
-                    host: hub_host.clone(),
-                    descriptor,
-                })
-                .collect::<Vec<_>>();
-            let connected = remote_hosts.lock().await;
-            for candidate in hosts
-                .into_iter()
-                .filter(|candidate| candidate.id != installation.hub_host_id)
-            {
-                let connection = if candidate.id == *host.host_id() {
-                    Some(host)
-                } else {
-                    connected.get(&candidate.id).map(AsRef::as_ref)
-                };
-                if let Some(connection) = connection {
-                    catalog.extend(connection.harness_catalog().into_iter().map(|descriptor| {
-                        crate::HostHarnessStatus {
-                            host: candidate.clone(),
-                            descriptor,
-                        }
-                    }));
-                }
-            }
-            catalog.sort_by(|left, right| {
-                left.descriptor
-                    .name
-                    .cmp(&right.descriptor.name)
-                    .then_with(|| left.host.name.cmp(&right.host.name))
-            });
-            HubResponse::Harnesses(catalog)
-        }
-        HubRequest::RefreshHarnesses => {
-            let installation = mews.installation()?;
-            let hosts = mews.hosts()?;
-            let hub_host = hosts
-                .iter()
-                .find(|candidate| candidate.id == installation.hub_host_id)
-                .context("Hub Host is missing from installation")?
-                .clone();
-            let mut catalog = mews_host::HarnessCatalog::discover(Some(root))?
-                .descriptors()
-                .into_iter()
-                .map(|descriptor| crate::HostHarnessStatus {
-                    host: hub_host.clone(),
-                    descriptor,
-                })
-                .collect::<Vec<_>>();
-            let connected = remote_hosts.lock().await;
-            for candidate in hosts
-                .into_iter()
-                .filter(|candidate| candidate.id != installation.hub_host_id)
-            {
-                let connection = if candidate.id == *host.host_id() {
-                    host
-                } else {
-                    connected
-                        .get(&candidate.id)
-                        .map(AsRef::as_ref)
-                        .with_context(|| format!("Host {} is offline", candidate.name))?
-                };
-                let descriptors = connection.refresh_harness_catalog().await?;
-                catalog.extend(descriptors.into_iter().map(|descriptor| {
-                    crate::HostHarnessStatus {
-                        host: candidate.clone(),
-                        descriptor,
-                    }
-                }));
-            }
-            catalog.sort_by(|left, right| {
-                left.descriptor
-                    .name
-                    .cmp(&right.descriptor.name)
-                    .then_with(|| left.host.name.cmp(&right.host.name))
-            });
-            HubResponse::Harnesses(catalog)
-        }
-        HubRequest::RemoveHost { id } => {
-            mews.remove_host(&id)?;
-            remote_hosts.lock().await.remove(&id);
-            HubResponse::Ack
-        }
-        HubRequest::CreateHostInvitation { .. } => HubResponse::Error(ProtocolError::internal(
-            "create invitations on the Hub machine",
-        )),
-        HubRequest::MoveHub { .. } => {
-            HubResponse::Error(ProtocolError::internal("move Hub from the Hub machine"))
-        }
-        HubRequest::Shutdown => HubResponse::Error(ProtocolError::internal(
-            "cannot stop Hub from a Host client",
-        )),
+}
+
+fn remote_origin_error(request: &HubRequest) -> Option<ProtocolError> {
+    use mews_protocol::ProtocolErrorCode;
+
+    let message = match request {
+        HubRequest::CreateHostInvitation { .. } => "create invitations on the Hub machine",
+        HubRequest::MoveHub { .. } => "move the Hub from the Hub machine",
+        HubRequest::Shutdown => "cannot stop the Hub from a Host client",
+        _ => return None,
+    };
+    Some(ProtocolError {
+        code: ProtocolErrorCode::InvalidRequest,
+        message: message.into(),
+        retryable: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use mews_protocol::ProtocolErrorCode;
+
+    use super::*;
+
+    #[test]
+    fn host_origin_restrictions_are_typed_invalid_requests() {
+        let error = remote_origin_error(&HubRequest::Shutdown).unwrap();
+        assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+        assert!(!error.retryable);
+        assert!(remote_origin_error(&HubRequest::Status).is_none());
+    }
+
+    #[tokio::test]
+    async fn remote_request_scheduler_is_concurrent_and_bounded() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (request_tx, request_rx) = mpsc::channel(64);
+                let (response_tx, mut response_rx) = mpsc::channel(64);
+                let slow = mews_protocol::RequestId::new();
+                request_tx
+                    .send((
+                        slow.clone(),
+                        HubRequest::PollEvents {
+                            consumer_id: crate::ConsumerId::new(),
+                            limit: 1,
+                            wait_ms: 1,
+                        },
+                    ))
+                    .await
+                    .unwrap();
+                for _ in 0..31 {
+                    request_tx
+                        .send((mews_protocol::RequestId::new(), HubRequest::Status))
+                        .await
+                        .unwrap();
+                }
+                drop(request_tx);
+                let active = Arc::new(AtomicUsize::new(0));
+                let peak = Arc::new(AtomicUsize::new(0));
+                let scheduler = serve_client_requests(request_rx, response_tx, {
+                    let active = Arc::clone(&active);
+                    let peak = Arc::clone(&peak);
+                    move |request| {
+                        let active = Arc::clone(&active);
+                        let peak = Arc::clone(&peak);
+                        async move {
+                            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(current, Ordering::SeqCst);
+                            let delay = if matches!(request, HubRequest::PollEvents { .. }) {
+                                75
+                            } else {
+                                5
+                            };
+                            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            HubResponse::Ack
+                        }
+                    }
+                });
+                let collect = async move {
+                    let mut ids = Vec::new();
+                    while let Some(PeerEnvelope::ClientResponse { request_id, .. }) =
+                        response_rx.recv().await
+                    {
+                        ids.push(request_id);
+                    }
+                    ids
+                };
+
+                let (result, responses) = tokio::join!(scheduler, collect);
+
+                result.unwrap();
+                assert_eq!(responses.len(), 32);
+                assert_ne!(responses.first(), Some(&slow));
+                assert!(peak.load(Ordering::SeqCst) > 1);
+                assert!(peak.load(Ordering::SeqCst) <= 16);
+            })
+            .await;
+    }
 }

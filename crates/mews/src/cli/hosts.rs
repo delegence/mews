@@ -1,14 +1,10 @@
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::CommandFactory;
 use mews_client::MewsClient;
-use mews_protocol::{HubRequest, HubResponse};
 
-use super::{
-    command::{Cli, HostsCommand},
-    response,
-};
+use super::command::{Cli, HostsCommand};
 
 pub async fn run(root: &Path, command: Option<HostsCommand>) -> Result<()> {
     let Some(command) = command else {
@@ -24,8 +20,8 @@ pub async fn run(root: &Path, command: Option<HostsCommand>) -> Result<()> {
     let mut client = MewsClient::connect(root).await?;
     match command {
         HostsCommand::List => {
-            let installation = response::status(client.request(HubRequest::Status).await?)?;
-            for status in response::hosts(client.request(HubRequest::ListHosts).await?)? {
+            let installation = client.status().await?;
+            for status in client.hosts().await? {
                 let role = if status.host.id == installation.hub_host_id {
                     "hub+host"
                 } else {
@@ -42,24 +38,18 @@ pub async fn run(root: &Path, command: Option<HostsCommand>) -> Result<()> {
                 );
             }
         }
-        HostsCommand::Invite { relay } => match client
-            .request(HubRequest::CreateHostInvitation { relay_url: relay })
-            .await?
-        {
-            HubResponse::HostInvitation(offer) => println!("{offer}"),
-            other => bail!("unexpected Hub response: {other:?}"),
-        },
+        HostsCommand::Invite { relay } => {
+            println!("{}", client.create_host_invitation(relay).await?)
+        }
         HostsCommand::Remove { host } => {
-            let target = response::hosts(client.request(HubRequest::ListHosts).await?)?
+            let target = client
+                .hosts()
+                .await?
                 .into_iter()
                 .map(|status| status.host)
                 .find(|candidate| candidate.name == host || candidate.id.to_string() == host)
                 .context("Host not found")?;
-            response::ack(
-                client
-                    .request(HubRequest::RemoveHost { id: target.id })
-                    .await?,
-            )?;
+            client.remove_host(target.id).await?;
             println!("Removed Host {host}.");
         }
     }

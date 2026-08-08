@@ -28,7 +28,7 @@ impl LocalEnvironment {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl AgentCapabilities for LocalEnvironment {
     async fn context(&self, cwd: &Path) -> Result<ContextSnapshot> {
         let documents = context::discover_agents_md(cwd)?
@@ -94,7 +94,7 @@ impl AgentCapabilities for LocalEnvironment {
         cancellation.check()?;
         let value = self
             .registry
-            .execute(&call.name, call.arguments.clone(), cwd)
+            .execute(&call.name, call.arguments.clone(), cwd, cancellation)
             .await?;
         Ok(ToolResult::success(value))
     }

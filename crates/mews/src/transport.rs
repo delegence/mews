@@ -8,7 +8,7 @@ use crate::{
     identity::{HostIdentity, NoiseIdentity},
 };
 use mews_host::ToolRegistry;
-use mews_protocol::{HostToHub, HubToHost, InstallationId, PeerEnvelope};
+use mews_protocol::{HostToHub, HubToHost, InstallationId, PeerEnvelope, RequestId};
 
 const CHUNK_HEADER: usize = 20;
 const MAX_MESSAGE_BYTES: usize = 256 * 1024;
@@ -260,7 +260,13 @@ pub async fn run_host_rpc(mut peer: EncryptedRelayPeer, registry: ToolRegistry) 
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let binding_waiters: crate::host::AcpBindingWaiters =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel();
+    let acp_cancellations =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            RequestId,
+            mews_agent::CancellationToken,
+        >::new()));
+    let (output_tx, mut output_rx) =
+        tokio::sync::mpsc::channel(crate::host::ACP_EVENT_CHANNEL_CAPACITY);
     loop {
         tokio::select! {
             bytes = peer.receive_bytes() => {
@@ -277,26 +283,48 @@ pub async fn run_host_rpc(mut peer: EncryptedRelayPeer, registry: ToolRegistry) 
                     }
                     continue;
                 }
+                if let HubToHost::CancelAcp { request_id } = request {
+                    if let Some(cancellation) = acp_cancellations.lock().expect("ACP cancellations poisoned").remove(&request_id) {
+                        cancellation.cancel();
+                    }
+                    continue;
+                }
+                let acp_request_id = match &request {
+                    HubToHost::RunAcp { request_id, .. } => Some(request_id.clone()),
+                    _ => None,
+                };
+                let cancellation = acp_request_id.as_ref().map(|request_id| {
+                    let cancellation = mews_agent::CancellationToken::new();
+                    acp_cancellations.lock().expect("ACP cancellations poisoned").insert(request_id.clone(), cancellation.clone());
+                    cancellation
+                });
                 let registry = registry.clone();
                 let output = output_tx.clone();
                 let waiters = std::sync::Arc::clone(&permission_waiters);
                 let binding_waiters = std::sync::Arc::clone(&binding_waiters);
+                let cancellations = std::sync::Arc::clone(&acp_cancellations);
                 tokio::spawn(async move {
-                    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let (event_tx, mut event_rx) =
+                        tokio::sync::mpsc::channel(crate::host::ACP_EVENT_CHANNEL_CAPACITY);
                     let response = crate::host::handle_host_request_streaming(
-                        &registry, None, request, Some(event_tx), Some(waiters), Some(binding_waiters),
+                        &registry, None, request, Some(event_tx), Some(waiters), Some(binding_waiters), cancellation,
                     );
                     tokio::pin!(response);
                     let response = loop {
                         tokio::select! {
                             response = &mut response => break response,
                             event = event_rx.recv() => if let Some(event) = event {
-                                let _ = output.send(event);
+                                let _ = output.send(event).await;
                             }
                         }
                     };
-                    while let Ok(event) = event_rx.try_recv() { let _ = output.send(event); }
-                    let _ = output.send(response);
+                    while let Ok(event) = event_rx.try_recv() {
+                        let _ = output.send(event).await;
+                    }
+                    let _ = output.send(response).await;
+                    if let Some(request_id) = acp_request_id {
+                        cancellations.lock().expect("ACP cancellations poisoned").remove(&request_id);
+                    }
                 });
             }
             Some(response) = output_rx.recv() => {

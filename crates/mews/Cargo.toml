@@ -23,7 +23,6 @@ mews-store = { path = "../mews-store" }
 mews-protocol = { path = "../mews-protocol" }
 mews-relay = { path = "../mews-relay" }
 mews-client = { path = "../mews-client" }
-mews-tui = { path = "../mews-tui" }
 reqwest.workspace = true
 regex.workspace = true
 rpassword.workspace = true

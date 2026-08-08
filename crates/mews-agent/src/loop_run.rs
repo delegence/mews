@@ -1,14 +1,17 @@
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use futures_util::{StreamExt, future::join_all};
-use mews_protocol::ToolDefinition;
+use futures_util::StreamExt;
 use serde_json::Value;
 
 use crate::{
     AgentEvent, AgentLoopConfig, AgentRuntime, CancellationToken, MessageContent, MessageRole,
     ModelMessage, ModelRequest, ModelStreamEvent, NextTurnUpdate, ProgressReporter, Provider,
-    ToolCall, ToolDecision, ToolExecutionMode, ToolProgress, ToolResult, TurnDecision,
+    ToolCall, ToolCatalog, ToolDecision, ToolExecutionMode, ToolProgress, ToolResult, TurnDecision,
+    apply_context_budget,
 };
+
+const MAX_TOOL_CALLS_PER_TURN: usize = 64;
+const MAX_CONCURRENT_TOOLS: usize = 8;
 
 pub async fn run(
     provider: &dyn Provider,
@@ -51,11 +54,15 @@ async fn run_inner(
 
     for turn in 0..config.max_steps {
         config.cancellation.check()?;
-        request.tools = runtime.tools().await?;
+        if turn > 0 {
+            request.tools = runtime.tools().await?;
+        }
         inject(runtime, &mut request, runtime.steering_messages().await?).await?;
         runtime.event(AgentEvent::TurnStart { index: turn }).await?;
         runtime.transform_context(&mut request).await?;
         runtime.before_model(&mut request).await?;
+        apply_context_budget(&mut request)?;
+        let tools = ToolCatalog::compile(request.tools.clone())?;
         runtime.event(AgentEvent::BeforeModel).await?;
 
         let (text, calls, provider_states) =
@@ -80,7 +87,7 @@ async fn run_inner(
             runtime.event(AgentEvent::AssistantText(text)).await?;
         }
 
-        let mut results = prepare_and_execute(runtime, calls, config).await?;
+        let mut results = prepare_and_execute(runtime, calls, &tools, config).await?;
         for (call, _) in &results {
             request.messages.push(ModelMessage {
                 role: MessageRole::Assistant,
@@ -211,9 +218,15 @@ enum Prepared {
 async fn prepare_and_execute(
     runtime: &dyn AgentRuntime,
     calls: Vec<ToolCall>,
+    tools: &ToolCatalog,
     config: &AgentLoopConfig,
 ) -> Result<Vec<(ToolCall, ToolResult)>> {
-    let tools = runtime.tools().await?;
+    if calls.len() > MAX_TOOL_CALLS_PER_TURN {
+        bail!(
+            "provider returned {} tool calls; the per-turn limit is {MAX_TOOL_CALLS_PER_TURN}",
+            calls.len()
+        );
+    }
     let mut prepared = Vec::new();
     for mut call in calls {
         config.cancellation.check()?;
@@ -221,7 +234,7 @@ async fn prepare_and_execute(
         runtime.event(AgentEvent::ToolCall(call.clone())).await?;
         let result = match decision {
             ToolDecision::Block(reason) => Some(ToolResult::error(reason)),
-            ToolDecision::Allow => validate_call(&call, &tools).err().map(ToolResult::error),
+            ToolDecision::Allow => tools.validate(&call).err().map(ToolResult::error),
         };
         prepared.push(match result {
             Some(result) => Prepared::Immediate(call, result),
@@ -237,28 +250,14 @@ async fn prepare_and_execute(
             }
             Ok(results)
         }
-        ToolExecutionMode::Parallel => Ok(join_all(
-            prepared
-                .into_iter()
-                .map(|item| execute_prepared(runtime, item, &config.cancellation)),
-        )
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?),
+        ToolExecutionMode::Parallel => futures_util::stream::iter(prepared)
+            .map(|item| execute_prepared(runtime, item, &config.cancellation))
+            .buffered(MAX_CONCURRENT_TOOLS)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect(),
     }
-}
-
-fn validate_call(call: &ToolCall, tools: &[ToolDefinition]) -> Result<()> {
-    let tool = tools
-        .iter()
-        .find(|tool| tool.name == call.name)
-        .with_context(|| format!("tool {:?} is unavailable", call.name))?;
-    let validator = jsonschema::validator_for(&tool.schema)
-        .with_context(|| format!("tool {:?} has an invalid schema", call.name))?;
-    if let Err(error) = validator.validate(&call.arguments) {
-        bail!("invalid arguments for tool {:?}: {error}", call.name);
-    }
-    Ok(())
 }
 
 async fn execute_prepared(
@@ -333,7 +332,7 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
-    use crate::{ModelPart, ModelResponse, ProviderError};
+    use crate::{ModelPart, ModelResponse, ProviderError, ToolDefinition};
     use serde_json::json;
 
     use super::*;
@@ -377,6 +376,7 @@ mod tests {
         executed: AtomicUsize,
         active: AtomicUsize,
         max_active: AtomicUsize,
+        tool_snapshots: AtomicUsize,
         follow_up: AtomicBool,
     }
 
@@ -387,6 +387,7 @@ mod tests {
                 executed: AtomicUsize::new(0),
                 active: AtomicUsize::new(0),
                 max_active: AtomicUsize::new(0),
+                tool_snapshots: AtomicUsize::new(0),
                 follow_up: AtomicBool::new(false),
             }
         }
@@ -404,6 +405,7 @@ mod tests {
             })
         }
         async fn tools(&self) -> Result<Vec<ToolDefinition>> {
+            self.tool_snapshots.fetch_add(1, Ordering::SeqCst);
             Ok(vec![ToolDefinition {
                 name: "work".into(),
                 description: "work".into(),
@@ -490,6 +492,7 @@ mod tests {
         assert_eq!(answer, "done");
         assert_eq!(runtime.executed.load(Ordering::SeqCst), 2);
         assert_eq!(runtime.max_active.load(Ordering::SeqCst), 2);
+        assert_eq!(runtime.tool_snapshots.load(Ordering::SeqCst), 2);
         assert!(runtime.events.lock().unwrap().iter().any(|event| {
             matches!(event, AgentEvent::ProviderState(ModelMessage { content: MessageContent::ProviderState { data, .. }, .. }) if data["opaque"] == "state")
         }));
@@ -529,6 +532,50 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(runtime.max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn parallel_mode_caps_concurrency_and_preserves_call_order() {
+        let runtime = Runtime::new();
+        let calls = (0..12)
+            .map(|index| ModelStreamEvent::ToolCall {
+                id: index.to_string(),
+                name: "work".into(),
+                arguments: json!({"value": index}),
+                thought_signature: None,
+            })
+            .collect::<Vec<_>>();
+        let provider = TestProvider {
+            turn: AtomicUsize::new(0),
+            first: std::iter::once(ModelStreamEvent::Start)
+                .chain(calls)
+                .chain(std::iter::once(ModelStreamEvent::Done))
+                .collect(),
+            later: text_events(),
+        };
+
+        run_with_config(&provider, &runtime, AgentLoopConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime.max_active.load(Ordering::SeqCst),
+            MAX_CONCURRENT_TOOLS
+        );
+        let result_ids = runtime
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolResult { call, .. } => Some(call.id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            result_ids,
+            (0..12).map(|index| index.to_string()).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

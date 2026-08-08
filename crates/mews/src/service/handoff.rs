@@ -1,4 +1,6 @@
 use super::*;
+use sha2::Digest;
+use std::io::Read;
 
 impl Mews {
     pub fn begin_hub_move(&mut self, target: &crate::HostId) -> Result<HubSnapshot> {
@@ -24,13 +26,24 @@ impl Mews {
                 fs::remove_file(&snapshot_path)?;
             }
             self.store.backup_to(&snapshot_path)?;
-            let database = fs::read(&snapshot_path)?;
-            fs::remove_file(&snapshot_path)?;
+            let database_size = fs::metadata(&snapshot_path)?.len();
+            let mut database = fs::File::open(&snapshot_path)?;
+            let mut hasher = sha2::Sha256::new();
+            let mut chunk = [0_u8; 96 * 1024];
+            loop {
+                let read = database.read(&mut chunk)?;
+                if read == 0 {
+                    break;
+                }
+                sha2::Digest::update(&mut hasher, &chunk[..read]);
+            }
             Ok(HubSnapshot {
                 move_nonce: uuid::Uuid::now_v7().to_string(),
                 installation_id: moved.id,
                 generation: moved.generation,
-                database,
+                database_path: snapshot_path,
+                database_size,
+                database_sha256: format!("{:x}", hasher.finalize()),
                 installation_key: fs::read(self.root.join("secrets/installation.key"))?,
                 hub_noise_key: fs::read(self.root.join("secrets/hub-noise.key"))?,
                 credentials: fs::read(self.root.join("auth.json")).unwrap_or_default(),
@@ -66,31 +79,20 @@ impl Mews {
         let relay_url = target.relay_url.context("target Host has no relay URL")?;
         let authority = HostIdentity::load(&self.root.join("secrets/installation.key"))?;
         let expires_at = chrono::Utc::now() + chrono::Duration::days(36_500);
-        let offer = crate::enrollment::JoinOffer::create(
-            installation.id.clone(),
-            crate::InvitationId::new(),
-            target_id.clone(),
-            &authority,
-            crate::enrollment::JoinOfferConnection {
-                relay_url: relay_url.clone(),
-                hub_noise_public_key: NoiseIdentity::load(
-                    &self.root.join("secrets/hub-noise.key"),
-                )?
-                .public_key(),
-                secret: uuid::Uuid::now_v7().to_string(),
-                expires_at,
-            },
-        )?;
+        let hub_noise_public_key =
+            NoiseIdentity::load(&self.root.join("secrets/hub-noise.key"))?.public_key();
         let relay_admission = self.relay_admission_for_host(&old_host)?;
         let hub_relay_admission = RelayAdmission::create(
             &authority,
-            installation.id,
+            installation.id.clone(),
             RelayPeerId::new(format!("hub-host:{}", old_host.id))?,
             authority.public_key(),
             expires_at,
         );
         Ok(crate::enrollment::relay::JoinedHostState {
-            offer,
+            installation_id: installation.id,
+            installation_public_key: authority.public_key(),
+            hub_noise_public_key,
             relay_urls: vec![relay_url.clone()],
             accepted: crate::enrollment::relay::EnrollmentAccepted {
                 host: old_host,

@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    Agent, AuthCredential, AuthStatus, ConsumerId, EventBatch, HostHarnessStatus, HostId,
-    HostStatus, Installation, MessageSource, ModelInfo, ProviderDefaults, ReasoningEffort, Run,
-    RunId, Session, SessionId, SessionModelConfig,
+    Agent, AuthCredential, AuthStatus, ConsumerId, ConsumerKind, EventBatch, HostHarnessStatus,
+    HostId, HostStatus, Installation, MessageSource, ModelInfo, PermissionOutcome,
+    ProviderDefaults, ReasoningEffort, Run, RunId, Session, SessionId, SessionModelConfig,
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -93,10 +93,6 @@ pub enum HubRequest {
     ArchiveAgent {
         slug: String,
     },
-    SetApiKey {
-        provider: String,
-        key: String,
-    },
     SetAuth {
         provider: String,
         credential: AuthCredential,
@@ -150,16 +146,20 @@ pub enum HubRequest {
     },
     ResolvePermission {
         request_id: String,
-        #[serde(default)]
-        option_id: Option<String>,
+        outcome: PermissionOutcome,
     },
     SubscribeSession {
         consumer_id: ConsumerId,
         session_id: SessionId,
+        #[serde(default)]
+        consumer_kind: ConsumerKind,
     },
     UnsubscribeSession {
         consumer_id: ConsumerId,
         session_id: SessionId,
+    },
+    DeleteConsumer {
+        consumer_id: ConsumerId,
     },
     PollEvents {
         consumer_id: ConsumerId,

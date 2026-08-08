@@ -13,16 +13,21 @@ use std::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use mews_agent::{
-    AgentCapabilities, CancellationToken, ProgressReporter, ToolCall, ToolDefinition, ToolResult,
+    AgentCapabilities, CancellationToken, ProgressReporter, ToolCall, ToolCatalog, ToolDefinition,
+    ToolResult,
 };
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
+    time::{Instant, timeout_at},
 };
 use uuid::Uuid;
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
+const MAX_HEADER_BYTES: usize = 32 * 1024;
+const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// A least-authority MCP capability valid only while its owning Run keeps it
 /// alive. Catalog changes cannot add authority to an existing Run.
@@ -31,6 +36,7 @@ pub struct RunMcpBridge<'a> {
     cwd: PathBuf,
     cancellation: CancellationToken,
     tools: BTreeMap<String, ToolDefinition>,
+    catalog: ToolCatalog,
     active: AtomicBool,
     next_call_id: AtomicU64,
 }
@@ -41,8 +47,8 @@ impl<'a> RunMcpBridge<'a> {
         cwd: PathBuf,
         cancellation: CancellationToken,
         allowed_tools: &[String],
-    ) -> Self {
-        let tools = environment
+    ) -> Result<Self> {
+        let definitions = environment
             .extension_tools()
             .into_iter()
             // Defense in depth: native MEWS tools cannot be exposed over MCP
@@ -53,16 +59,21 @@ impl<'a> RunMcpBridge<'a> {
                     .iter()
                     .any(|pattern| tool_allowed(pattern, &tool.name))
             })
+            .collect::<Vec<_>>();
+        let catalog = ToolCatalog::compile(definitions.clone())?;
+        let tools = definitions
+            .into_iter()
             .map(|tool| (tool.name.clone(), tool))
             .collect();
-        Self {
+        Ok(Self {
             environment,
             cwd,
             cancellation,
             tools,
+            catalog,
             active: AtomicBool::new(true),
             next_call_id: AtomicU64::new(1),
-        }
+        })
     }
 
     /// Invalidates the capability before the owning Run is dropped.
@@ -144,15 +155,19 @@ impl<'a> RunMcpBridge<'a> {
                 "MCP tool {name:?} is unavailable or not allowed for this Run"
             )));
         }
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Default::default()));
         let call = ToolCall {
             id: format!("mcp-{}", self.next_call_id.fetch_add(1, Ordering::Relaxed)),
             name: name.to_owned(),
-            arguments: params
-                .get("arguments")
-                .cloned()
-                .unwrap_or_else(|| Value::Object(Default::default())),
+            arguments,
             thought_signature: None,
         };
+        self.catalog
+            .validate(&call)
+            .map_err(|error| McpError::invalid(error.to_string()))?;
         let progress = NoProgress;
         let result = self
             .environment
@@ -195,14 +210,37 @@ impl RunMcpHttp {
         )
     }
 
-    pub async fn accept_and_handle(&self, bridge: &RunMcpBridge<'_>) -> Result<()> {
-        let (stream, _) = self
-            .listener
-            .accept()
+    pub async fn accept_and_handle(
+        &self,
+        bridge: &RunMcpBridge<'_>,
+        deadline: Instant,
+    ) -> Result<()> {
+        let (stream, _) = timeout_at(deadline, self.listener.accept())
             .await
+            .context("MCP request timed out")?
             .context("accept MCP connection")?;
-        handle_http_connection(stream, &self.path, bridge).await
+        timeout_at(deadline, handle_http_connection(stream, &self.path, bridge))
+            .await
+            .context("MCP request timed out")?
     }
+}
+
+async fn read_bounded_line<R: AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    limit: usize,
+) -> Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    let read = (&mut *reader)
+        .take((limit + 1) as u64)
+        .read_until(b'\n', &mut line)
+        .await?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if line.len() > limit || !line.ends_with(b"\n") {
+        anyhow::bail!("MCP HTTP line exceeds its byte limit");
+    }
+    Ok(Some(line))
 }
 
 async fn handle_http_connection(
@@ -212,32 +250,43 @@ async fn handle_http_connection(
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
-    let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
+    let request_line = read_bounded_line(&mut reader, MAX_REQUEST_LINE_BYTES)
         .await
-        .context("read MCP HTTP request line")?;
+        .context("read MCP HTTP request line")?
+        .context("MCP HTTP request is empty")?;
+    let request_line =
+        std::str::from_utf8(&request_line).context("MCP request line is not UTF-8")?;
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default();
     let path = parts.next().unwrap_or_default();
     let mut content_length = 0usize;
+    let mut header_bytes = 0usize;
+    let mut saw_content_length = false;
     loop {
-        let mut header = String::new();
-        reader.read_line(&mut header).await?;
-        if header == "\r\n" || header.is_empty() {
+        let remaining = MAX_HEADER_BYTES.saturating_sub(header_bytes);
+        let header = read_bounded_line(&mut reader, remaining)
+            .await?
+            .context("MCP HTTP headers ended before the blank line")?;
+        header_bytes += header.len();
+        if header == b"\r\n" || header == b"\n" {
             break;
         }
+        let header = std::str::from_utf8(&header).context("MCP header is not UTF-8")?;
         if let Some(value) = header
             .strip_prefix("Content-Length:")
             .or_else(|| header.strip_prefix("content-length:"))
         {
+            if saw_content_length {
+                anyhow::bail!("duplicate MCP Content-Length header");
+            }
+            saw_content_length = true;
             content_length = value.trim().parse().context("parse MCP content length")?;
         }
     }
     if method != "POST" || path != expected_path {
         return write_http_response(&mut writer, 404, Value::Null).await;
     }
-    if content_length > 1024 * 1024 {
+    if content_length > MAX_BODY_BYTES {
         return write_http_response(&mut writer, 413, Value::Null).await;
     }
     let mut body = vec![0; content_length];
@@ -335,9 +384,10 @@ mod tests {
 
     struct Capabilities {
         calls: Mutex<Vec<ToolCall>>,
+        delay: std::time::Duration,
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl AgentCapabilities for Capabilities {
         async fn context(&self, _: &Path) -> Result<ContextSnapshot> {
             Ok(ContextSnapshot::default())
@@ -365,6 +415,7 @@ mod tests {
             if call.name == "read" {
                 bail!("native tool must not be called")
             }
+            tokio::time::sleep(self.delay).await;
             self.calls.lock().unwrap().push(call.clone());
             Ok(ToolResult::success(json!({"called": call.name})))
         }
@@ -380,12 +431,14 @@ mod tests {
             CancellationToken::new(),
             &["issue_*".into()],
         )
+        .unwrap()
     }
 
     #[tokio::test]
     async fn exposes_only_allowed_extensions_and_routes_calls_through_capabilities() {
         let capabilities = Capabilities {
             calls: Mutex::new(Vec::new()),
+            delay: std::time::Duration::ZERO,
         };
         let bridge = bridge(&capabilities);
         let listed = bridge
@@ -402,6 +455,7 @@ mod tests {
     async fn http_transport_keeps_the_run_scoped_extension_boundary() {
         let capabilities = Capabilities {
             calls: Mutex::new(Vec::new()),
+            delay: std::time::Duration::ZERO,
         };
         let bridge = bridge(&capabilities);
         let endpoint = bridge.bind_http().await.unwrap();
@@ -429,7 +483,11 @@ mod tests {
             stream.read_to_end(&mut response).await.unwrap();
             response
         };
-        let (served, response) = tokio::join!(endpoint.accept_and_handle(&bridge), client);
+        let (served, response) = tokio::join!(
+            endpoint
+                .accept_and_handle(&bridge, Instant::now() + std::time::Duration::from_secs(2),),
+            client
+        );
         served.unwrap();
         let response = String::from_utf8(response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK"));
@@ -441,6 +499,7 @@ mod tests {
     async fn rejects_disallowed_unavailable_and_native_tools() {
         let capabilities = Capabilities {
             calls: Mutex::new(Vec::new()),
+            delay: std::time::Duration::ZERO,
         };
         let bridge = bridge(&capabilities);
         for name in ["deploy_preview", "missing", "read"] {
@@ -459,5 +518,112 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response["error"]["code"], -32000);
+    }
+
+    #[tokio::test]
+    async fn validates_extension_arguments_against_the_advertised_schema() {
+        struct StrictCapabilities;
+        #[async_trait]
+        impl AgentCapabilities for StrictCapabilities {
+            async fn context(&self, _: &Path) -> Result<ContextSnapshot> {
+                Ok(ContextSnapshot::default())
+            }
+            fn tools(&self) -> Vec<ToolDefinition> {
+                Vec::new()
+            }
+            fn extension_tools(&self) -> Vec<ToolDefinition> {
+                vec![ToolDefinition {
+                    name: "lookup".into(),
+                    description: "Lookup".into(),
+                    schema: json!({
+                        "type":"object",
+                        "properties":{"id":{"type":"string"}},
+                        "required":["id"],
+                        "additionalProperties":false
+                    }),
+                }]
+            }
+            async fn execute(
+                &self,
+                _: &ToolCall,
+                _: &Path,
+                _: &CancellationToken,
+                _: &dyn ProgressReporter,
+            ) -> Result<ToolResult> {
+                panic!("invalid arguments must not cross the capability boundary")
+            }
+            async fn hook(&self, _: LifecycleHook, _: Value, _: &Path) -> Result<Value> {
+                Ok(Value::Null)
+            }
+        }
+        let bridge = RunMcpBridge::for_extensions(
+            &StrictCapabilities,
+            PathBuf::from("/tmp"),
+            CancellationToken::new(),
+            &["lookup".into()],
+        )
+        .unwrap();
+
+        let response = bridge
+            .handle(json!({
+                "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                "params":{"name":"lookup", "arguments":{"id":7}}
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_http_lines_before_unbounded_allocation() {
+        for limit in [MAX_REQUEST_LINE_BYTES, MAX_HEADER_BYTES] {
+            let mut line = vec![b'x'; limit + 1];
+            line.push(b'\n');
+            let mut reader = BufReader::new(line.as_slice());
+            assert!(
+                read_bounded_line(&mut reader, limit)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("byte limit")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_deadline_covers_tool_execution() {
+        let capabilities = Capabilities {
+            calls: Mutex::new(Vec::new()),
+            delay: std::time::Duration::from_secs(30),
+        };
+        let bridge = bridge(&capabilities);
+        let endpoint = bridge.bind_http().await.unwrap();
+        let address = endpoint.listener.local_addr().unwrap();
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{"name":"issue_lookup", "arguments":{}}
+        }))
+        .unwrap();
+        let client = async {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            let request = format!(
+                "POST {} HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                endpoint.path,
+                body.len()
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+        };
+        let (served, ()) = tokio::join!(
+            endpoint.accept_and_handle(
+                &bridge,
+                Instant::now() + std::time::Duration::from_millis(50),
+            ),
+            client
+        );
+        assert!(served.unwrap_err().to_string().contains("timed out"));
+        assert!(capabilities.calls.lock().unwrap().is_empty());
     }
 }

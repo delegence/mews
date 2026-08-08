@@ -1,27 +1,25 @@
 //! Persistent ACP session execution and recovery.
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    path::PathBuf,
-};
+use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncWriteExt, BufReader},
     process::Child,
 };
 
 use crate::{
     mcp::{RunMcpBridge, RunMcpHttp},
-    process::{AcpHarnessConfig, AcpProcess},
-    rpc::{RpcClient, is_resource_not_found},
+    process::{AcpHarnessConfig, AcpProcess, ProcessTreeGuard, terminate_process_tree},
+    rpc::{AcpErrorKind, RpcClient, classify_error, is_resource_not_found},
+    updates::UpdateState,
 };
 
 // ACP v1 uses a negotiated integer protocol version. The date-shaped value
 // belongs to MCP, not ACP.
 const ACP_PROTOCOL_VERSION: u16 = 1;
-const MAX_METADATA_BYTES: usize = 16 * 1024;
 
 /// Bounded ACP discovery output. Hosts normalize this into their public
 /// catalog and persist it, so clients never start an adapter just to redraw a
@@ -31,6 +29,15 @@ pub struct AcpProbe {
     pub initialize: Value,
     pub session: Option<Value>,
     pub session_error: Option<String>,
+    pub session_error_kind: Option<AcpErrorKind>,
+    pub timings: AcpProbeTimings,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AcpProbeTimings {
+    pub spawn: Duration,
+    pub initialize: Duration,
+    pub session: Duration,
 }
 
 pub enum AcpStreamEvent {
@@ -56,14 +63,6 @@ pub enum AcpStreamEvent {
     },
 }
 
-#[derive(Clone, Debug, Default)]
-struct ToolActivityState {
-    title: String,
-    kind: Option<String>,
-    status: Option<String>,
-    input: Value,
-}
-
 #[derive(Clone, Debug)]
 pub struct AcpSessionRequest {
     pub prompt: String,
@@ -76,8 +75,50 @@ pub struct AcpSessionOutcome {
     pub answer: String,
     pub session_id: String,
     pub session_replaced: bool,
+    pub stop_reason: AcpStopReason,
+    pub timings: AcpTimings,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AcpTimings {
+    pub spawn: Duration,
+    pub initialize: Duration,
+    pub continuation: Duration,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InitializeResult {
+    protocol_version: u16,
+    #[serde(default)]
+    agent_capabilities: Value,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpStopReason {
+    EndTurn,
+    MaxTokens,
+    MaxTurnRequests,
+    Refusal,
+    Cancelled,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PromptResult {
+    stop_reason: AcpStopReason,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ContinuationMethod {
+    Resume,
+    Load,
+}
+
+#[allow(clippy::too_many_arguments)] // This is the public composition boundary for one Run.
 pub async fn run_acp_session_with_extensions_and_events(
     config: AcpHarnessConfig,
     cwd: PathBuf,
@@ -85,10 +126,14 @@ pub async fn run_acp_session_with_extensions_and_events(
     session: AcpSessionRequest,
     environment: &dyn mews_agent::AgentCapabilities,
     allowed_tools: &[String],
+    cancellation: mews_agent::CancellationToken,
     events: &mut dyn FnMut(AcpStreamEvent) -> Result<()>,
 ) -> Result<AcpSessionOutcome> {
     let harness = AcpProcess::new(config);
+    let spawn_started = tokio::time::Instant::now();
     let mut child = harness.spawn(&cwd)?;
+    let mut process_guard = ProcessTreeGuard::new(&child);
+    let spawn = spawn_started.elapsed();
     let result = harness
         .run_session_with_extensions(
             &mut child,
@@ -97,24 +142,30 @@ pub async fn run_acp_session_with_extensions_and_events(
             session,
             environment,
             allowed_tools,
+            cancellation,
             events,
         )
         .await;
-    if let Err(error) = &result {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-        return Err(anyhow!("ACP Harness failed: {error}"));
+    if result.is_err() {
+        terminate_process_tree(&mut child).await;
+        process_guard.disarm();
     }
+    let mut result = result.context("ACP Harness failed")?;
+    result.timings.spawn = spawn;
     let status = child.wait().await.context("wait for ACP Harness")?;
+    process_guard.disarm();
     if !status.success() {
         bail!("ACP Harness exited with {status}");
     }
-    result
+    Ok(result)
 }
 
 pub async fn probe_acp(config: AcpHarnessConfig, cwd: PathBuf) -> Result<AcpProbe> {
     let process = AcpProcess::new(config);
+    let spawn_started = tokio::time::Instant::now();
     let mut child = process.spawn(&cwd)?;
+    let mut process_guard = ProcessTreeGuard::new(&child);
+    let spawn = spawn_started.elapsed();
     let result = async {
         let stdin = child
             .stdin
@@ -125,7 +176,7 @@ pub async fn probe_acp(config: AcpHarnessConfig, cwd: PathBuf) -> Result<AcpProb
             .take()
             .context("ACP Harness did not open stdout")?;
         let mut writer = stdin;
-        let mut reader = BufReader::new(stdout).lines();
+        let mut reader = BufReader::new(stdout);
         let cancellation = mews_agent::CancellationToken::new();
         let mut rpc = RpcClient::new(
             &mut writer,
@@ -133,8 +184,9 @@ pub async fn probe_acp(config: AcpHarnessConfig, cwd: PathBuf) -> Result<AcpProb
             process.config.request_timeout,
             process.config.permission_handler.as_ref(),
         );
+        let initialize_started = tokio::time::Instant::now();
         let initialize = rpc
-            .request_plain(
+            .request(
                 "initialize",
                 json!({
                     "protocolVersion": ACP_PROTOCOL_VERSION,
@@ -142,26 +194,40 @@ pub async fn probe_acp(config: AcpHarnessConfig, cwd: PathBuf) -> Result<AcpProb
                     "clientCapabilities": { "auth": { "terminal": true } },
                 }),
                 &cancellation,
+                None,
+                None,
                 |_| Ok(()),
             )
             .await?;
+        let initialize_elapsed = initialize_started.elapsed();
+        let session_started = tokio::time::Instant::now();
         let session = rpc
-            .request_plain(
+            .request(
                 "session/new",
                 json!({ "cwd": cwd, "mcpServers": [] }),
                 &cancellation,
+                None,
+                None,
                 |_| Ok(()),
             )
             .await;
+        let session_elapsed = session_started.elapsed();
+        let session_error_kind = session.as_ref().err().and_then(classify_error);
         Ok(AcpProbe {
             initialize,
             session: session.as_ref().ok().cloned(),
             session_error: session.err().map(|error| error.to_string()),
+            session_error_kind,
+            timings: AcpProbeTimings {
+                spawn,
+                initialize: initialize_elapsed,
+                session: session_elapsed,
+            },
         })
     }
     .await;
-    let _ = child.kill().await;
-    let _ = child.wait().await;
+    terminate_process_tree(&mut child).await;
+    process_guard.disarm();
     result
 }
 
@@ -175,6 +241,7 @@ impl AcpProcess {
         session: AcpSessionRequest,
         environment: &dyn mews_agent::AgentCapabilities,
         allowed_tools: &[String],
+        cancellation: mews_agent::CancellationToken,
         events: &mut dyn FnMut(AcpStreamEvent) -> Result<()>,
     ) -> Result<AcpSessionOutcome> {
         let stdin = child
@@ -186,16 +253,16 @@ impl AcpProcess {
             .take()
             .context("ACP Harness did not open stdout")?;
         let mut writer = stdin;
-        let mut reader = BufReader::new(stdout).lines();
-        let cancellation = mews_agent::CancellationToken::new();
+        let mut reader = BufReader::new(stdout);
         let mut rpc = RpcClient::new(
             &mut writer,
             &mut reader,
             self.config.request_timeout,
             self.config.permission_handler.as_ref(),
         );
+        let initialize_started = tokio::time::Instant::now();
         let initialize = rpc
-            .request_plain(
+            .request(
                 "initialize",
                 json!({
                     "protocolVersion": ACP_PROTOCOL_VERSION,
@@ -203,19 +270,31 @@ impl AcpProcess {
                     "clientCapabilities": { "auth": { "terminal": true } },
                 }),
                 &cancellation,
+                None,
+                None,
                 |_| Ok(()),
             )
             .await?;
+        let initialize_elapsed = initialize_started.elapsed();
+        let initialize: InitializeResult =
+            serde_json::from_value(initialize).context("invalid ACP initialize result")?;
+        if initialize.protocol_version != ACP_PROTOCOL_VERSION {
+            bail!(
+                "ACP Harness negotiated unsupported protocol version {}",
+                initialize.protocol_version
+            );
+        }
         let mcp = RunMcpBridge::for_extensions(
             environment,
             cwd.clone(),
             cancellation.clone(),
             allowed_tools,
-        );
+        )?;
         let mcp_http = if mcp.tool_definitions().is_empty() {
             None
         } else if initialize
-            .pointer("/agentCapabilities/mcpCapabilities/http")
+            .agent_capabilities
+            .pointer("/mcpCapabilities/http")
             .and_then(Value::as_bool)
             == Some(true)
         {
@@ -227,24 +306,30 @@ impl AcpProcess {
             vec![json!({ "type": "http", "name": "mews_extensions", "url": http.url(), "headers": [] })]
         });
         let had_binding = session.session_id.is_some();
+        let continuation_started = tokio::time::Instant::now();
         let (session_id, session_replaced, prompt) = if let Some(session_id) = session.session_id {
             let method = if initialize
-                .pointer("/agentCapabilities/sessionCapabilities/resume")
+                .agent_capabilities
+                .pointer("/sessionCapabilities/resume")
                 .is_some()
             {
-                "session/resume"
+                ContinuationMethod::Resume
             } else if initialize
-                .pointer("/agentCapabilities/loadSession")
+                .agent_capabilities
+                .pointer("/loadSession")
                 .and_then(Value::as_bool)
                 == Some(true)
             {
-                "session/load"
+                ContinuationMethod::Load
             } else {
                 bail!("ACP Harness cannot resume persistent Sessions")
             };
             let resumed = rpc
                 .request(
-                    method,
+                    match method {
+                        ContinuationMethod::Resume => "session/resume",
+                        ContinuationMethod::Load => "session/load",
+                    },
                     json!({ "sessionId": session_id, "cwd": cwd.clone(), "mcpServers": mcp_servers.clone() }),
                     &cancellation,
                     Some(&mcp),
@@ -282,6 +367,7 @@ impl AcpProcess {
                 .await?;
             (acp_session_id(&created)?, false, session.prompt)
         };
+        let continuation_elapsed = continuation_started.elapsed();
         if !had_binding || session_replaced {
             events(AcpStreamEvent::SessionBound {
                 session_id: session_id.clone(),
@@ -297,96 +383,33 @@ impl AcpProcess {
             mcp_http.as_ref(),
         )
         .await?;
-        let mut assistant = String::new();
-        let mut assistant_boundary = false;
-        let mut assistant_message_id: Option<String> = None;
-        let mut tools = HashMap::<String, ToolActivityState>::new();
-        rpc.request(
-            "session/prompt",
-            json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": prompt }] }),
-            &cancellation,
-            Some(&mcp),
-            mcp_http.as_ref(),
-            |update| {
-                match update_kind(update) {
-                    Some("agent_message_chunk") => {
-                        if let Some(text) = update_text(update) {
-                            let message_id = update_message_id(update);
-                            let message_changed = assistant_message_id
-                                .as_ref()
-                                .zip(message_id.as_ref())
-                                .is_some_and(|(previous, next)| previous != next);
-                            if (assistant_boundary || message_changed) && !assistant.is_empty() {
-                                assistant.push_str("\n\n");
-                                events(AcpStreamEvent::AssistantDelta {
-                                    delta: "\n\n".into(),
-                                    message_id: message_id.clone(),
-                                })?;
-                            }
-                            assistant_boundary = false;
-                            if message_id.is_some() {
-                                assistant_message_id = message_id.clone();
-                            }
-                            assistant.push_str(text);
-                            events(AcpStreamEvent::AssistantDelta {
-                                delta: text.to_owned(),
-                                message_id,
-                            })?;
-                        }
-                    }
-                    Some("agent_thought_chunk") => {
-                        if let Some(text) = content_text(update) {
-                            events(AcpStreamEvent::ReasoningDelta {
-                                delta: text.to_owned(),
-                                message_id: update_message_id(update),
-                            })?;
-                        }
-                    }
-                    Some("tool_call" | "tool_call_update") => {
-                        assistant_boundary = true;
-                        let Some(call_id) = update
-                            .get("toolCallId")
-                            .and_then(Value::as_str)
-                            .filter(|call_id| !call_id.trim().is_empty())
-                            .map(str::to_owned)
-                        else {
-                            events(AcpStreamEvent::ProviderState(bounded_json(update)))?;
-                            return Ok(());
-                        };
-                        let state = tools.entry(call_id.clone()).or_default();
-                        if let Some(title) = non_empty_string(update, "title") {
-                            state.title = title.to_owned();
-                        }
-                        if let Some(kind) = non_empty_string(update, "kind") {
-                            state.kind = Some(kind.to_owned());
-                        }
-                        if let Some(status) = non_empty_string(update, "status") {
-                            state.status = Some(status.to_owned());
-                        }
-                        if let Some(input) = update.get("rawInput") {
-                            merge_json(&mut state.input, input);
-                        }
-                        events(AcpStreamEvent::ToolActivity {
-                            call_id,
-                            title: (!state.title.is_empty())
-                                .then(|| state.title.clone())
-                                .unwrap_or_else(|| "Tool call".into()),
-                            kind: state.kind.clone(),
-                            status: state.status.clone(),
-                            input: state.input.clone(),
-                        })?;
-                    }
-                    _ => events(AcpStreamEvent::ProviderState(bounded_json(update)))?,
-                }
-                Ok(())
-            },
-        )
-        .await?;
+        let mut updates = UpdateState::default();
+        let prompt_result = rpc
+            .request(
+                "session/prompt",
+                json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": prompt }] }),
+                &cancellation,
+                Some(&mcp),
+                mcp_http.as_ref(),
+                |update| updates.apply(update, events),
+            )
+            .await?;
+        let prompt_result: PromptResult =
+            serde_json::from_value(prompt_result).context("invalid ACP session/prompt result")?;
         mcp.revoke();
+        if prompt_result.stop_reason == AcpStopReason::Cancelled {
+            bail!("ACP Harness reported that the prompt was cancelled");
+        }
         Ok(AcpSessionOutcome {
-            answer: assistant,
+            answer: updates.answer(),
             session_id,
             session_replaced,
+            stop_reason: prompt_result.stop_reason,
+            timings: AcpTimings {
+                spawn: Duration::ZERO,
+                initialize: initialize_elapsed,
+                continuation: continuation_elapsed,
+            },
         })
     }
 }
@@ -394,7 +417,6 @@ impl AcpProcess {
 fn acp_session_id(response: &Value) -> Result<String> {
     response
         .get("sessionId")
-        .or_else(|| response.get("session_id"))
         .and_then(Value::as_str)
         .map(str::to_owned)
         .context("ACP session/new response did not include sessionId")
@@ -425,80 +447,14 @@ where
     Ok(())
 }
 
-fn update_text(update: &Value) -> Option<&str> {
-    if update_kind(update) != Some("agent_message_chunk") {
-        return None;
-    }
-    content_text(update)
-}
-
-fn update_kind(update: &Value) -> Option<&str> {
-    update.get("sessionUpdate").and_then(Value::as_str)
-}
-
-fn update_message_id(update: &Value) -> Option<String> {
-    update
-        .get("messageId")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-        .map(str::to_owned)
-}
-
-fn non_empty_string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-}
-
-fn merge_json(current: &mut Value, update: &Value) {
-    match (current, update) {
-        (Value::Object(current), Value::Object(update)) => {
-            for (key, value) in update {
-                if value.is_null() || value.as_str().is_some_and(str::is_empty) {
-                    continue;
-                }
-                match current.get_mut(key) {
-                    Some(current) => merge_json(current, value),
-                    None => {
-                        current.insert(key.clone(), value.clone());
-                    }
-                }
-            }
-        }
-        (current, update) if !update.is_null() => *current = update.clone(),
-        _ => {}
-    }
-}
-
-fn content_text(update: &Value) -> Option<&str> {
-    update
-        .get("content")
-        .and_then(|content| {
-            content
-                .get("text")
-                .and_then(Value::as_str)
-                .or_else(|| content.as_str())
-        })
-        .or_else(|| update.get("text").and_then(Value::as_str))
-}
-
-fn bounded_json(value: &Value) -> Value {
-    let encoded = value.to_string();
-    if encoded.len() <= MAX_METADATA_BYTES {
-        value.clone()
-    } else {
-        json!({ "truncated": true, "preview": &encoded[..MAX_METADATA_BYTES] })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        AcpHarnessConfig, AcpSessionRequest, AcpStreamEvent, bounded_json,
-        run_acp_session_with_extensions_and_events, update_text,
+        AcpHarnessConfig, AcpSessionRequest, AcpStopReason, AcpStreamEvent, probe_acp,
+        run_acp_session_with_extensions_and_events,
     };
-    use crate::rpc::{acp_rpc_error, is_resource_not_found};
+    use crate::rpc::{AcpErrorKind, acp_rpc_error, classify_error, is_resource_not_found};
+    use crate::updates::update_text;
     use anyhow::{Result, bail};
     use async_trait::async_trait;
     use mews_agent::{
@@ -506,13 +462,7 @@ mod tests {
         ToolCall, ToolDefinition, ToolResult,
     };
     use serde_json::json;
-    use std::{collections::BTreeMap, path::Path};
-
-    #[test]
-    fn provider_metadata_is_size_bounded() {
-        let value = json!({"body": "x".repeat(20_000)});
-        assert_eq!(bounded_json(&value)["truncated"], true);
-    }
+    use std::{collections::BTreeMap, path::Path, time::Duration};
 
     #[test]
     fn only_agent_messages_are_answer_text() {
@@ -542,6 +492,195 @@ mod tests {
         assert!(!is_resource_not_found(&anyhow::anyhow!(
             "ACP request timed out"
         )));
+        let authentication = acp_rpc_error(
+            "session/new",
+            &json!({"code":-32000,"message":"any diagnostic prose"}),
+        )
+        .context("wrapped run failure");
+        assert_eq!(
+            classify_error(&authentication),
+            Some(AcpErrorKind::AuthenticationRequired)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_classifies_authentication_by_acp_error_code_and_reports_timings() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = directory.path().join("auth-acp");
+        fs::write(
+            &fixture,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"id":1'*) sleep 0.02; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{}}}' ;;
+    *'"id":2'*) sleep 0.02; printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"Provider sign-in required"}}'; sleep 30 ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let probe = probe_acp(
+            AcpHarnessConfig::new([fixture.into_os_string()]).unwrap(),
+            directory.path().to_owned(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            probe.session_error_kind,
+            Some(AcpErrorKind::AuthenticationRequired)
+        );
+        assert!(probe.timings.initialize >= Duration::from_millis(10));
+        assert!(probe.timings.session >= Duration::from_millis(10));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_an_unsupported_negotiated_protocol_version() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = directory.path().join("wrong-version-acp");
+        fs::write(
+            &fixture,
+            r#"#!/bin/sh
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":2,"agentCapabilities":{}}}'
+sleep 30
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = run_acp_session_with_extensions_and_events(
+            AcpHarnessConfig::new([fixture.into_os_string()]).unwrap(),
+            directory.path().to_owned(),
+            BTreeMap::new(),
+            AcpSessionRequest {
+                prompt: "hello".into(),
+                recovery_prompt: "hello".into(),
+                session_id: None,
+            },
+            &NoCapabilities,
+            &[],
+            CancellationToken::new(),
+            &mut |_| Ok(()),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("unsupported protocol version 2"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn continuous_updates_do_not_extend_the_absolute_request_deadline() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = directory.path().join("updates-forever-acp");
+        fs::write(
+            &fixture,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"id":1'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{}}}' ;;
+    *'"id":2'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"fixture"}}' ;;
+    *'"id":3'*) while true; do printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk","text":"busy"}}}'; sleep 0.01; done ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut config = AcpHarnessConfig::new([fixture.into_os_string()]).unwrap();
+        config.request_timeout = Duration::from_millis(100);
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_acp_session_with_extensions_and_events(
+                config,
+                directory.path().to_owned(),
+                BTreeMap::new(),
+                AcpSessionRequest {
+                    prompt: "never finishes".into(),
+                    recovery_prompt: "never finishes".into(),
+                    session_id: None,
+                },
+                &NoCapabilities,
+                &[],
+                CancellationToken::new(),
+                &mut |_| Ok(()),
+            ),
+        )
+        .await
+        .expect("absolute deadline must not be reset by updates")
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("timed out"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_terminates_adapter_descendants() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = directory.path().join("cancel-acp");
+        let descendant_path = directory.path().join("descendant.pid");
+        fs::write(
+            &fixture,
+            format!(
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"id":1'*) printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}' ;;
+    *'"id":2'*) printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"fixture"}}}}' ;;
+    *'"id":3'*) sleep 30 & child=$!; printf %s "$child" > {}; wait ;;
+  esac
+done
+"#,
+                descendant_path.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
+        let cancellation = CancellationToken::new();
+        let mut events = |_| Ok(());
+        let execution = run_acp_session_with_extensions_and_events(
+            AcpHarnessConfig::new([fixture.into_os_string()]).unwrap(),
+            directory.path().to_owned(),
+            BTreeMap::new(),
+            AcpSessionRequest {
+                prompt: "start child".into(),
+                recovery_prompt: "start child".into(),
+                session_id: None,
+            },
+            &NoCapabilities,
+            &[],
+            cancellation.clone(),
+            &mut events,
+        );
+        tokio::pin!(execution);
+        let descendant = loop {
+            tokio::select! {
+                result = &mut execution => panic!("adapter exited before cancellation: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                    if let Ok(pid) = fs::read_to_string(&descendant_path) {
+                        break pid.parse::<i32>().unwrap();
+                    }
+                }
+            }
+        };
+        cancellation.cancel();
+        let error = execution.await.unwrap_err();
+        assert!(format!("{error:#}").contains("cancelled"));
+        for _ in 0..100 {
+            // SAFETY: signal 0 only checks whether this test descendant exists.
+            if unsafe { libc::kill(descendant, 0) } == -1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("cancelled ACP descendant {descendant} is still running");
     }
 
     #[cfg(unix)]
@@ -555,9 +694,9 @@ mod tests {
             r#"#!/bin/sh
 while IFS= read -r line; do
   case "$line" in
-    *'"id":1'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"resume":{}}}}}' ;;
-    *'"id":2'*'session/resume'*'native-1'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}' ;;
-    *'"id":3'*'second turn'*) printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"resumed"}}}}'; printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'; exit 0 ;;
+    *'"id":1'*) sleep 0.02; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"resume":{}}}}}' ;;
+    *'"id":2'*'session/resume'*'native-1'*) sleep 0.02; printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}' ;;
+    *'"id":3'*'second turn'*) printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"resumed"}}}}'; printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'; exit 0 ;;
     *) exit 9 ;;
   esac
 done
@@ -576,6 +715,7 @@ done
             },
             &NoCapabilities,
             &[],
+            CancellationToken::new(),
             &mut |_| Ok(()),
         )
         .await
@@ -583,6 +723,8 @@ done
         assert_eq!(outcome.answer, "resumed");
         assert_eq!(outcome.session_id, "native-1");
         assert!(!outcome.session_replaced);
+        assert!(outcome.timings.initialize >= Duration::from_millis(10));
+        assert!(outcome.timings.continuation >= Duration::from_millis(10));
     }
 
     #[cfg(unix)]
@@ -599,7 +741,7 @@ while IFS= read -r line; do
     *'"id":1'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"resume":{}}}}}' ;;
     *'"id":2'*'session/resume'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32002,"message":"Resource not found"}}' ;;
     *'"id":3'*'session/new'*) printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"native-2"}}' ;;
-    *'"id":4'*'recovery history'*) printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{}}'; exit 0 ;;
+    *'"id":4'*'recovery history'*) printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'; exit 0 ;;
     *) exit 9 ;;
   esac
 done
@@ -619,6 +761,7 @@ done
             },
             &NoCapabilities,
             &[],
+            CancellationToken::new(),
             &mut |event| {
                 if let super::AcpStreamEvent::SessionBound {
                     session_id,
@@ -638,7 +781,7 @@ done
     }
 
     struct NoCapabilities;
-    #[async_trait(?Send)]
+    #[async_trait]
     impl AgentCapabilities for NoCapabilities {
         async fn context(&self, _: &Path) -> Result<ContextSnapshot> {
             Ok(ContextSnapshot::default())
@@ -677,7 +820,7 @@ done
             r#"#!/bin/sh
 while IFS= read -r line; do
   case "$line" in
-    *'"id":1'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}' ;;
+    *'"id":1'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{}}}' ;;
     *'"id":2'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"fixture"}}' ;;
     *'"id":3'*)
       printf '%s\n' '{"jsonrpc":"2.0","id":90,"method":"session/request_permission","params":{"sessionId":"fixture","toolCall":{"sessionUpdate":"tool_call","toolCallId":"native-1","title":"Run command"},"options":[{"optionId":"allow","name":"Allow Once","kind":"allow_once"},{"optionId":"decline","name":"Decline","kind":"reject_once"}],"_meta":{"provider":"fixture"}}}'
@@ -688,7 +831,7 @@ while IFS= read -r line; do
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture","update":{"sessionUpdate":"tool_call","toolCallId":"web-1","title":"Web search","kind":"search","status":"in_progress","rawInput":{"query":""}}}}'
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture","update":{"sessionUpdate":"tool_call_update","toolCallId":"web-1","status":"completed","rawInput":{"query":"weather in Tashkent"}}}}'
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture","update":{"sessionUpdate":"agent_message_chunk","messageId":"message-2","content":{"type":"text","text":"fixture reply"}}}}'
-      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
       exit 0
       ;;
   esac
@@ -710,6 +853,7 @@ done
             },
             &NoCapabilities,
             &[],
+            CancellationToken::new(),
             &mut |event| {
                 events.push(event);
                 Ok(())
@@ -718,6 +862,7 @@ done
         .await
         .unwrap();
         assert_eq!(outcome.answer, "intro\n\nfixture reply");
+        assert_eq!(outcome.stop_reason, AcpStopReason::EndTurn);
         assert!(events.iter().any(|event| {
             matches!(
                 event,

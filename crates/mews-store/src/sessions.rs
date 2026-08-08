@@ -63,24 +63,11 @@ impl Store {
                     params![session_id.as_str(), host_id.as_str(), harness, definition_hash, acp_session_id, timestamp(now)],
                 )?;
             }
-            Some((bound_host, bound_harness, _bound_hash, old_id))
+            Some((bound_host, bound_harness, _bound_hash, _old_id))
                 if replacement_reason.is_some()
                     && bound_host == host_id.as_str()
                     && bound_harness == harness =>
             {
-                let reason = replacement_reason.expect("checked above");
-                transaction.execute(
-                    "INSERT INTO acp_session_replacements
-                     (session_id, old_acp_session_id, new_acp_session_id, reason, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        session_id.as_str(),
-                        old_id,
-                        acp_session_id,
-                        reason,
-                        timestamp(now)
-                    ],
-                )?;
                 transaction.execute(
                     "UPDATE acp_session_bindings
                      SET acp_session_id = ?2, harness_definition_hash = ?3, replaced_at = ?4
@@ -295,8 +282,8 @@ impl Store {
             && matches!(message.content, MessageContent::Text { .. })
         {
             transaction.execute(
-                "INSERT INTO client_events (id, session_id, kind_json, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO client_events (id, session_id, kind_json, transient, created_at)
+                 VALUES (?1, ?2, ?3, 0, ?4)",
                 params![
                     EventId::new().as_str(),
                     session_id.as_str(),
@@ -332,7 +319,7 @@ impl Store {
                     }
                 };
                 transaction.execute(
-                    "INSERT INTO client_events (id, session_id, kind_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT INTO client_events (id, session_id, kind_json, transient, created_at) VALUES (?1, ?2, ?3, 0, ?4)",
                     params![EventId::new().as_str(), session_id.as_str(), json(&kind)?, timestamp(Utc::now())],
                 )?;
             }

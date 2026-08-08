@@ -7,7 +7,8 @@ use serde_json::{Value, json};
 
 use crate::{
     AuthStore, MessageContent, MessageRole, ModelPart, ModelRequest, ModelResponse, ProviderError,
-    ProviderResult, ReasoningEffort, http::send_with_retry,
+    ProviderResult, ReasoningEffort,
+    http::{response_json, send_with_retry},
 };
 
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
@@ -44,19 +45,19 @@ pub(crate) async fn generate(
     }
     apply_reasoning(&mut body, model, request.reasoning);
 
-    let response: Value = send_with_retry(
-        client
-            .post(format!(
-                "{}/v1beta/models/{model}:generateContent",
-                base.trim_end_matches('/')
-            ))
-            .header("x-goog-api-key", key)
-            .json(&body),
+    let response: Value = response_json(
+        send_with_retry(
+            client
+                .post(format!(
+                    "{}/v1beta/models/{model}:generateContent",
+                    base.trim_end_matches('/')
+                ))
+                .header("x-goog-api-key", key)
+                .json(&body),
+        )
+        .await?,
     )
-    .await?
-    .json()
-    .await
-    .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+    .await?;
     parse(response).map_err(|error| ProviderError::InvalidResponse(error.to_string()))
 }
 
@@ -72,11 +73,7 @@ pub(crate) async fn models(client: &Client, root: &Path) -> ProviderResult<Vec<c
         if let Some(token) = &page_token {
             request = request.query(&[("pageToken", token)]);
         }
-        let payload: Value = send_with_retry(request)
-            .await?
-            .json()
-            .await
-            .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+        let payload: Value = response_json(send_with_retry(request).await?).await?;
         let entries = payload
             .get("models")
             .and_then(Value::as_array)

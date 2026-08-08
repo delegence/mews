@@ -13,4 +13,6 @@ mews-protocol = { path = "../mews-protocol" }
 serde_json.workspace = true
 
 [dev-dependencies]
+futures-util.workspace = true
 tempfile.workspace = true
+tokio.workspace = true
