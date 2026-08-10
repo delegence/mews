@@ -1,6 +1,37 @@
 use super::*;
 
 impl Mews {
+    pub fn session_history(&self, session_id: &crate::SessionId) -> Result<Vec<crate::Message>> {
+        self.store.active_messages(session_id).map_err(Into::into)
+    }
+
+    pub fn session_history_page(
+        &self,
+        session_id: &crate::SessionId,
+        after: Option<u64>,
+        limit: u16,
+    ) -> Result<crate::SessionHistoryPage> {
+        let (messages, next) = self.store.active_messages_page(session_id, after, limit)?;
+        Ok(crate::SessionHistoryPage { messages, next })
+    }
+
+    pub fn session_entries(
+        &self,
+        session_id: &crate::SessionId,
+    ) -> Result<Vec<crate::SessionEntry>> {
+        self.store.session_entries(session_id).map_err(Into::into)
+    }
+
+    pub fn session_entries_page(
+        &self,
+        session_id: &crate::SessionId,
+        after: Option<u64>,
+        limit: u16,
+    ) -> Result<crate::SessionEntriesPage> {
+        let (entries, next) = self.store.session_entries_page(session_id, after, limit)?;
+        Ok(crate::SessionEntriesPage { entries, next })
+    }
+
     pub fn session_model_config(
         &self,
         session: &crate::Session,
@@ -11,6 +42,7 @@ impl Mews {
         let config = crate::AgentConfig::parse(&revision.config_toml)?;
         if config.harness != mews_runtime::MEWS_HARNESS {
             return Ok(crate::SessionModelConfig {
+                harness: config.harness,
                 model: config.harness_options.get("model").cloned(),
                 reasoning: config
                     .harness_options
@@ -37,6 +69,7 @@ impl Mews {
             None
         });
         Ok(crate::SessionModelConfig {
+            harness: config.harness,
             model: session
                 .model_override
                 .clone()

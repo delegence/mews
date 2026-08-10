@@ -47,7 +47,12 @@ pub struct RemoteAcpRun {
     pub cwd: std::path::PathBuf,
     pub prompt: String,
     pub recovery_prompt: String,
-    pub session_id: Option<String>,
+    pub agent_slug: String,
+    pub soul: String,
+    pub mews_session_id: String,
+    pub run_id: String,
+    pub transition: mews_protocol::AcpBindingTransition,
+    pub context: Option<mews_protocol::AcpBindingContext>,
 }
 
 #[async_trait]
@@ -129,19 +134,33 @@ impl ConnectedHost {
             .clone()
     }
 
+    /// Refreshing the Hub's own Host must update the same live catalog used
+    /// for dispatch, not only the catalog returned to a client.
+    pub(crate) fn replace_harness_catalog(&self, harnesses: Vec<HarnessDescriptor>) {
+        *self
+            .harnesses
+            .write()
+            .expect("Host Harness catalog poisoned") = harnesses;
+    }
+
     pub(crate) async fn execute_tool(
         &self,
         tool: &str,
         arguments: Value,
         cwd: &Path,
     ) -> Result<Value> {
+        let request_id = RequestId::new();
         match self
-            .request(HubToHost::ExecuteTool {
-                request_id: RequestId::new(),
-                tool: tool.to_owned(),
-                arguments,
-                canonical_cwd: cwd.to_path_buf(),
-            })
+            .request_inner(
+                HubToHost::ExecuteTool {
+                    request_id: request_id.clone(),
+                    tool: tool.to_owned(),
+                    arguments,
+                    canonical_cwd: cwd.to_path_buf(),
+                },
+                None,
+                Some(request_id),
+            )
             .await?
         {
             HostReply::Tool(value) => Ok(value),
@@ -149,25 +168,44 @@ impl ConnectedHost {
         }
     }
 
-    async fn execute_hook(&self, hook: &str, payload: Value, cwd: &Path) -> Result<Value> {
-        match self
-            .request(HubToHost::ExecuteHook {
-                request_id: RequestId::new(),
+    async fn execute_hook(
+        &self,
+        hook: &str,
+        payload: Value,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Value> {
+        cancellation.check()?;
+        let request_id = RequestId::new();
+        let request = self.request_inner(
+            HubToHost::ExecuteHook {
+                request_id: request_id.clone(),
                 hook: hook.to_owned(),
                 payload,
                 canonical_cwd: cwd.to_path_buf(),
-            })
-            .await?
-        {
+            },
+            None,
+            Some(request_id),
+        );
+        tokio::pin!(request);
+        let reply = tokio::select! {
+            result = &mut request => result?,
+            _ = cancellation.cancelled() => {
+                cancellation.check()?;
+                unreachable!()
+            }
+        };
+        match reply {
             HostReply::Hook(payload) => Ok(payload),
             _ => bail!("Host returned the wrong response type"),
         }
     }
 
-    async fn fetch_project_context(&self, cwd: &Path) -> Result<String> {
+    async fn fetch_project_context(&self, agent_slug: &str, cwd: &Path) -> Result<String> {
         match self
             .request(HubToHost::ReadProjectContext {
                 request_id: RequestId::new(),
+                agent_slug: agent_slug.to_owned(),
                 canonical_cwd: cwd.to_path_buf(),
             })
             .await?
@@ -401,7 +439,12 @@ impl ConnectedHost {
                             .and_then(|pending| pending.acp_events.as_ref())
                             .cloned();
                         if let Some(sender) = sender {
-                            let _ = sender.send(AcpEvent::PermissionRequested { request }).await;
+                            let _ = sender
+                                .send(AcpEvent::PermissionRequested {
+                                    event_key: format!("permission:{}", request.id),
+                                    request,
+                                })
+                                .await;
                         }
                     }
                     HostToHub::DirectoryAttested {
@@ -710,7 +753,12 @@ impl HostControl for ConnectedHost {
                 canonical_cwd: run.cwd,
                 prompt: run.prompt,
                 recovery_prompt: run.recovery_prompt,
-                acp_session_id: run.session_id,
+                agent_slug: run.agent_slug,
+                soul: run.soul,
+                mews_session_id: run.mews_session_id,
+                run_id: run.run_id,
+                transition: run.transition,
+                context: run.context,
             },
             events,
         );
@@ -755,8 +803,8 @@ impl HostControl for ConnectedHost {
 
 #[async_trait]
 impl AgentCapabilities for ConnectedHost {
-    async fn context(&self, cwd: &Path) -> Result<ContextSnapshot> {
-        let content = self.fetch_project_context(cwd).await?;
+    async fn context(&self, agent_slug: &str, cwd: &Path) -> Result<ContextSnapshot> {
+        let content = self.fetch_project_context(agent_slug, cwd).await?;
         Ok(ContextSnapshot {
             documents: vec![ContextDocument {
                 path: cwd.join("<host-context>"),
@@ -792,13 +840,25 @@ impl AgentCapabilities for ConnectedHost {
         _progress: &dyn ProgressReporter,
     ) -> Result<ToolResult> {
         cancellation.check()?;
-        Ok(ToolResult::success(
-            self.execute_tool(&call.name, call.arguments.clone(), cwd)
-                .await?,
-        ))
+        let execution = self.execute_tool(&call.name, call.arguments.clone(), cwd);
+        tokio::pin!(execution);
+        let result = tokio::select! {
+            result = &mut execution => result?,
+            _ = cancellation.cancelled() => {
+                cancellation.check()?;
+                unreachable!()
+            }
+        };
+        Ok(ToolResult::success(result))
     }
 
-    async fn hook(&self, hook: LifecycleHook, payload: Value, cwd: &Path) -> Result<Value> {
+    async fn hook(
+        &self,
+        hook: LifecycleHook,
+        payload: Value,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Value> {
         let name = match hook {
             LifecycleHook::RunStart => "run_start",
             LifecycleHook::BeforeModel => "before_model",
@@ -807,13 +867,13 @@ impl AgentCapabilities for ConnectedHost {
             LifecycleHook::AfterTurn => "after_turn",
             LifecycleHook::RunEnd => "run_end",
         };
-        self.execute_hook(name, payload, cwd).await
+        self.execute_hook(name, payload, cwd, cancellation).await
     }
 }
 
 impl ConnectedHost {
     async fn request(&self, request: HubToHost) -> Result<HostReply> {
-        self.request_inner(request, None).await
+        self.request_inner(request, None, None).await
     }
 
     async fn request_with_events(
@@ -821,13 +881,14 @@ impl ConnectedHost {
         request: HubToHost,
         events: mpsc::Sender<AcpEvent>,
     ) -> Result<HostReply> {
-        self.request_inner(request, Some(events)).await
+        self.request_inner(request, Some(events), None).await
     }
 
     async fn request_inner(
         &self,
         request: HubToHost,
         acp_events: Option<mpsc::Sender<AcpEvent>>,
+        cancel_tool: Option<RequestId>,
     ) -> Result<HostReply> {
         let request = mews_protocol::decode(&mews_protocol::encode(request)?)?;
         let request_id = match &request {
@@ -842,6 +903,9 @@ impl ConnectedHost {
             HubToHost::RunAcp { request_id, .. } => request_id.clone(),
             HubToHost::CancelAcp { .. } => {
                 bail!("ACP cancellation is not a correlated Host request")
+            }
+            HubToHost::CancelTool { .. } => {
+                bail!("tool cancellation is not a correlated Host request")
             }
             HubToHost::BeginHubTransfer { request_id, .. }
             | HubToHost::WriteHubTransfer { request_id, .. }
@@ -878,11 +942,63 @@ impl ConnectedHost {
             .send(request)
             .await
             .context("Host disconnected")?;
-        tokio::time::timeout(std::time::Duration::from_secs(3605), receiver)
+        let mut cancellation = cancel_tool.map(|request_id| ToolCancellationGuard {
+            sender: self.sender.clone(),
+            request_id,
+            armed: true,
+        });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3605), receiver)
             .await
             .context("Host request timed out")?
             .context("Host disconnected before replying")?
-            .map_err(anyhow::Error::msg)
+            .map_err(anyhow::Error::msg);
+        if let Some(cancellation) = &mut cancellation {
+            cancellation.armed = false;
+        }
+        result
+    }
+}
+
+struct ToolCancellationGuard {
+    sender: mpsc::Sender<HubToHost>,
+    request_id: RequestId,
+    armed: bool,
+}
+
+pub(crate) struct CancellationRegistryOwner {
+    cancellations: Arc<std::sync::Mutex<HashMap<RequestId, CancellationToken>>>,
+}
+
+impl CancellationRegistryOwner {
+    pub(crate) fn new(
+        cancellations: Arc<std::sync::Mutex<HashMap<RequestId, CancellationToken>>>,
+    ) -> Self {
+        Self { cancellations }
+    }
+}
+
+impl Drop for CancellationRegistryOwner {
+    fn drop(&mut self) {
+        for (_, cancellation) in self
+            .cancellations
+            .lock()
+            .expect("Host cancellations poisoned")
+            .drain()
+        {
+            cancellation.cancel();
+        }
+    }
+}
+
+impl Drop for ToolCancellationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let sender = self.sender.clone();
+            let request_id = self.request_id.clone();
+            tokio::spawn(async move {
+                let _ = sender.send(HubToHost::CancelTool { request_id }).await;
+            });
+        }
     }
 }
 
@@ -924,6 +1040,11 @@ async fn serve_host(
     let acp_cancellations = Arc::new(std::sync::Mutex::new(
         HashMap::<RequestId, CancellationToken>::new(),
     ));
+    let tool_cancellations = Arc::new(std::sync::Mutex::new(
+        HashMap::<RequestId, CancellationToken>::new(),
+    ));
+    let _acp_cancellation_owner = CancellationRegistryOwner::new(Arc::clone(&acp_cancellations));
+    let _tool_cancellation_owner = CancellationRegistryOwner::new(Arc::clone(&tool_cancellations));
     loop {
         tokio::select! {
             message = receiver.recv() => {
@@ -950,6 +1071,39 @@ async fn serve_host(
                     }
                     continue;
                 }
+                if let HubToHost::CancelTool { request_id } = message {
+                    if let Some(cancellation) = tool_cancellations
+                        .lock()
+                        .expect("tool cancellations poisoned")
+                        .remove(&request_id)
+                    {
+                        cancellation.cancel();
+                    }
+                    continue;
+                }
+                if matches!(message, HubToHost::ExecuteTool { .. } | HubToHost::ExecuteHook { .. }) {
+                    let request_id = match &message {
+                        HubToHost::ExecuteTool { request_id, .. }
+                        | HubToHost::ExecuteHook { request_id, .. } => request_id.clone(),
+                        _ => unreachable!(),
+                    };
+                    let cancellation = CancellationToken::new();
+                    tool_cancellations.lock().expect("tool cancellations poisoned")
+                        .insert(request_id.clone(), cancellation.clone());
+                    let registry = registry.clone();
+                    let sender = sender.clone();
+                    let cancellations = Arc::clone(&tool_cancellations);
+                    tokio::spawn(async move {
+                        let response = handle_host_request_streaming(
+                            &registry, registry.root(), message, None, None, None,
+                            Some(cancellation),
+                        ).await;
+                        cancellations.lock().expect("tool cancellations poisoned")
+                            .remove(&request_id);
+                        let _ = sender.send(response).await;
+                    });
+                    continue;
+                }
                 if matches!(message, HubToHost::RunAcp { .. }) {
                     let request_id = match &message {
                         HubToHost::RunAcp { request_id, .. } => request_id.clone(),
@@ -970,7 +1124,7 @@ async fn serve_host(
                             mpsc::channel(super::ACP_EVENT_CHANNEL_CAPACITY);
                         let response = handle_host_request_streaming(
                             &registry,
-                            None,
+                            registry.root(),
                             message,
                             Some(event_sender),
                             Some(waiters),
@@ -1001,7 +1155,7 @@ async fn serve_host(
                 }
                 let (event_sender, mut event_receiver) =
                     mpsc::channel(super::ACP_EVENT_CHANNEL_CAPACITY);
-                let response = handle_host_request_streaming(&registry, None, message, Some(event_sender), Some(Arc::clone(&permission_waiters)), Some(Arc::clone(&binding_waiters)), None);
+                let response = handle_host_request_streaming(&registry, registry.root(), message, Some(event_sender), Some(Arc::clone(&permission_waiters)), Some(Arc::clone(&binding_waiters)), None);
                 tokio::pin!(response);
                 let response = loop {
                     tokio::select! {

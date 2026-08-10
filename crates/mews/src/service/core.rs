@@ -39,10 +39,11 @@ impl Mews {
     /// primary `Mews` value retains the exclusive process lock.
     pub(crate) fn open_connection(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
-        let store = Store::open(root.join(DATABASE_FILE))?;
-        NoiseIdentity::load(&root.join("secrets/hub-noise.key"))?;
-        validate_installation_authority(&root, &store)?;
-        validate_hub_assignment(&root, &store)?;
+        // The primary Hub connection validates schema, identities, and Hub
+        // assignment before serving requests. Request connections only need the
+        // already-initialized database; handoff fences requests before identity
+        // or assignment files can change.
+        let store = Store::open_existing(root.join(DATABASE_FILE))?;
         Ok(Self { root, store })
     }
 

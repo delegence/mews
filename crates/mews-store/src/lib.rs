@@ -20,10 +20,13 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use mews_protocol::{
-    AcpSessionBinding, Agent, AgentConfig, AgentId, AgentRevision, ClientEvent, ClientEventKind,
-    ConsumerId, ConsumerKind, EventBatch, EventId, Host, HostId, Installation, InstallationId,
-    InvitationId, Message, MessageContent, MessageId, MessageRole, MessageSource, ProviderDefaults,
-    ReasoningEffort, Run, RunId, RunStatus, Session, SessionId, SourceKind,
+    AcpBindingTransition, AcpContextSnapshot, AcpInstructionChannel, AcpObservation,
+    AcpSessionBinding, Agent, AgentConfig, AgentId, AgentRevision, AssistantResponse, ClientEvent,
+    ClientEventKind, ConsumerId, ConsumerKind, EventBatch, EventId, HarnessProvenance, Host,
+    HostId, Installation, InstallationId, InvitationId, Message, MessageContent, MessageId,
+    MessageRole, MessageSource, ProviderDefaults, ReasoningEffort, ReasoningProvenance,
+    ReasoningVisibility, Run, RunId, RunStatus, Session, SessionEntry, SessionEntryPayload,
+    SessionId, SourceKind, ToolCall, ToolResult,
 };
 
 #[derive(Debug, Error)]
@@ -38,6 +41,11 @@ pub enum StoreError {
     DuplicateAgent(String),
     #[error("agent revision conflict: expected {expected}, current {current}")]
     RevisionConflict { expected: u64, current: u64 },
+    #[error("session leaf conflict: expected {expected:?}, current {current:?}")]
+    LeafConflict {
+        expected: Option<MessageId>,
+        current: Option<MessageId>,
+    },
     #[error("invalid agent definition: {0}")]
     InvalidAgent(String),
 }

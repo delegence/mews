@@ -37,6 +37,11 @@ impl Mews {
                 harness_options.entry("model".into()).or_insert(model);
             }
             if let Some(reasoning) = defaults.reasoning {
+                if reasoning == crate::ReasoningEffort::Auto {
+                    bail!(
+                        "reasoning auto is not supported by the native mews Harness; use Provider default instead"
+                    );
+                }
                 harness_options
                     .entry("reasoning".into())
                     .or_insert_with(|| reasoning_name(reasoning).into());
@@ -190,9 +195,18 @@ fn materialize(directory: &Path, revision: &crate::AgentRevision) -> Result<()> 
     fs::File::open(&staged)?.sync_all()?;
     if directory.exists() {
         fs::rename(directory, &previous)?;
+        if previous.join("skills").exists()
+            && let Err(error) = fs::rename(previous.join("skills"), staged.join("skills"))
+        {
+            let _ = fs::rename(&previous, directory);
+            return Err(error.into());
+        }
     }
     if let Err(error) = fs::rename(&staged, directory) {
         if previous.exists() {
+            if staged.join("skills").exists() {
+                let _ = fs::rename(staged.join("skills"), previous.join("skills"));
+            }
             let _ = fs::rename(&previous, directory);
         }
         return Err(error.into());

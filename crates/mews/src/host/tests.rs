@@ -4,6 +4,19 @@ use crate::host::lifecycle::handle_host_request;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
+#[test]
+fn cancellation_registry_owner_cancels_all_work_on_drop() {
+    let first = mews_agent::CancellationToken::new();
+    let second = mews_agent::CancellationToken::new();
+    let registry = Arc::new(std::sync::Mutex::new(HashMap::from([
+        (RequestId::new(), first.clone()),
+        (RequestId::new(), second.clone()),
+    ])));
+    drop(CancellationRegistryOwner::new(registry));
+    assert!(first.is_cancelled());
+    assert!(second.is_cancelled());
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn remote_acp_runs_on_the_bound_host_working_directory() {
@@ -45,62 +58,85 @@ done
         .unwrap();
     let cwd = project.path().canonicalize().unwrap();
 
-    let (requests, mut host_requests) = tokio::sync::mpsc::channel(1);
-    let (responses, response_stream) = tokio::sync::mpsc::channel(1);
-    let connected =
-        ConnectedHost::from_channels(HostId::new(), Vec::new(), requests, response_stream)
-            .await
-            .unwrap();
-    let registry = ToolRegistry::with_defaults();
-    let host_root = host_root.path().to_owned();
-    tokio::spawn(async move {
-        let request = host_requests.recv().await.unwrap();
-        let (events, mut event_stream) =
-            tokio::sync::mpsc::channel(crate::host::ACP_EVENT_CHANNEL_CAPACITY);
-        let response = crate::host::handle_host_request_streaming(
-            &registry,
-            Some(&host_root),
-            request,
-            Some(events),
-            None,
-            None,
-            None,
-        )
-        .await;
-        while let Ok(event) = event_stream.try_recv() {
-            responses.send(event).await.unwrap();
-        }
-        responses.send(response).await.unwrap();
-    });
+    let connected = ConnectedHost::in_process(
+        HostId::new(),
+        ToolRegistry::with_host_extensions(host_root.path()).unwrap(),
+    )
+    .await
+    .unwrap();
 
     let (event_tx, mut event_rx) =
         tokio::sync::mpsc::channel(crate::host::ACP_EVENT_CHANNEL_CAPACITY);
-    let answer = connected
-        .run_acp(
-            RemoteAcpRun {
-                harness: "fixture".into(),
-                harness_options: Default::default(),
-                tools: vec!["*".into()],
-                cwd: cwd.clone(),
-                prompt: "canonical remote prompt".into(),
-                recovery_prompt: "recovery prompt".into(),
-                session_id: None,
-            },
-            event_tx,
-            &mews_agent::CancellationToken::new(),
-        )
-        .await
-        .unwrap();
+    let cancellation = mews_agent::CancellationToken::new();
+    let run = connected.run_acp(
+        RemoteAcpRun {
+            harness: "fixture".into(),
+            harness_options: Default::default(),
+            tools: vec!["*".into()],
+            cwd: cwd.clone(),
+            prompt: "canonical remote prompt".into(),
+            recovery_prompt: "recovery prompt".into(),
+            agent_slug: "fixture-agent".into(),
+            soul: "fixture soul".into(),
+            mews_session_id: "session-fixture".into(),
+            run_id: "run-fixture".into(),
+            transition: mews_protocol::AcpBindingTransition::New,
+            context: None,
+        },
+        event_tx,
+        &cancellation,
+    );
+    let events = async {
+        let bound = loop {
+            let event = event_rx.recv().await.unwrap();
+            if matches!(event, mews_protocol::AcpEvent::SessionBound { .. }) {
+                break event;
+            }
+        };
+        let mews_protocol::AcpEvent::SessionBound {
+            acknowledgement_id,
+            context,
+            ..
+        } = &bound
+        else {
+            panic!("first ACP event was not a SessionBound event");
+        };
+        connected
+            .acknowledge_acp_session_binding(acknowledgement_id.clone())
+            .await
+            .unwrap();
+        assert!(context.text.contains("fixture soul"));
+        assert_eq!(
+            context.hash,
+            mews_protocol::AcpContextSnapshot::hash_rendered(&context.text)
+        );
+        let delta = loop {
+            let event = event_rx.recv().await.unwrap();
+            match event {
+                mews_protocol::AcpEvent::ContextDispatched {
+                    acknowledgement_id, ..
+                } => connected
+                    .acknowledge_acp_session_binding(acknowledgement_id)
+                    .await
+                    .unwrap(),
+                event @ mews_protocol::AcpEvent::AssistantDelta { .. } => break event,
+                _ => {}
+            }
+        };
+        (bound, delta)
+    };
+    let (answer, (bound, delta)) = tokio::join!(run, events);
+    let answer = answer.unwrap();
 
     assert_eq!(answer.answer, "remote fixture reply");
     assert_eq!(answer.session_id, "fixture");
     assert!(matches!(
-        event_rx.recv().await,
-        Some(mews_protocol::AcpEvent::SessionBound { session_id, replaced: false, .. }) if session_id == "fixture"
+        bound,
+        mews_protocol::AcpEvent::SessionBound { session_id, transition: mews_protocol::AcpBindingTransition::New, .. } if session_id == "fixture"
     ));
     assert!(matches!(
-        event_rx.recv().await,
-        Some(mews_protocol::AcpEvent::AssistantDelta { delta, .. }) if delta == "remote fixture reply"
+        delta,
+        mews_protocol::AcpEvent::AssistantDelta { delta, .. } if delta == "remote fixture reply"
     ));
     assert!(cwd.join("acp-ran-on-bound-host").exists());
 }
@@ -121,6 +157,104 @@ async fn serialized_boundary_executes_and_rechecks_cwd() {
         .await
         .unwrap();
     assert_eq!(result["content"], "remote content");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropping_remote_tool_request_stops_shell_descendants() {
+    let directory = tempfile::tempdir().unwrap();
+    let pid_path = directory.path().join("remote-descendant.pid");
+    let host = ConnectedHost::in_process(HostId::new(), ToolRegistry::with_defaults())
+        .await
+        .unwrap();
+    let cwd = directory.path().canonicalize().unwrap();
+    let command = format!(
+        "sleep 30 & child=$!; printf %s $child > {}; wait",
+        pid_path.display()
+    );
+    let execution = tokio::spawn(async move {
+        host.execute_tool(
+            "bash",
+            serde_json::json!({"command": command, "timeout_seconds": 30}),
+            &cwd,
+        )
+        .await
+    });
+    let descendant = loop {
+        if let Ok(pid) = std::fs::read_to_string(&pid_path)
+            && let Ok(pid) = pid.parse::<i32>()
+        {
+            break pid;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+
+    execution.abort();
+    let _ = execution.await;
+    for _ in 0..100 {
+        // SAFETY: signal 0 only queries whether the test child still exists.
+        if unsafe { libc::kill(descendant, 0) } == -1 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("cancelled remote shell descendant {descendant} is still running");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_remote_capability_execution_stops_shell_descendants() {
+    struct NoProgress;
+    #[async_trait::async_trait(?Send)]
+    impl mews_agent::ProgressReporter for NoProgress {
+        async fn report(&self, _progress: serde_json::Value) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let pid_path = directory.path().join("cancelled-descendant.pid");
+    let host = ConnectedHost::in_process(HostId::new(), ToolRegistry::with_defaults())
+        .await
+        .unwrap();
+    let cancellation = mews_agent::CancellationToken::new();
+    let trigger = cancellation.clone();
+    let command = format!(
+        "sleep 30 & child=$!; printf %s $child > {}; wait",
+        pid_path.display()
+    );
+    let call = mews_agent::ToolCall {
+        id: "remote-cancel".into(),
+        name: "bash".into(),
+        arguments: serde_json::json!({"command": command, "timeout_seconds": 30}),
+        thought_signature: None,
+    };
+    let cwd = directory.path().canonicalize().unwrap();
+    let execution =
+        mews_agent::AgentCapabilities::execute(&host, &call, &cwd, &cancellation, &NoProgress);
+    tokio::pin!(execution);
+    let descendant = loop {
+        tokio::select! {
+            result = &mut execution => panic!("shell exited before cancellation: {result:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                if let Ok(pid) = std::fs::read_to_string(&pid_path)
+                    && let Ok(pid) = pid.parse::<i32>()
+                {
+                    break pid;
+                }
+            }
+        }
+    };
+    trigger.cancel();
+    assert!(execution.await.is_err());
+    for _ in 0..100 {
+        // SAFETY: signal 0 only queries whether the test child still exists.
+        if unsafe { libc::kill(descendant, 0) } == -1 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("cancelled remote shell descendant {descendant} is still running");
 }
 
 #[tokio::test]
@@ -154,6 +288,7 @@ async fn host_reads_context_and_refuses_to_overwrite_a_changed_replica() {
         Some(root.path()),
         HubToHost::ReadProjectContext {
             request_id: RequestId::new(),
+            agent_slug: "coder".into(),
             canonical_cwd: cwd,
         },
     )
@@ -208,6 +343,12 @@ fn host_renames_a_clean_agent_replica_and_retains_one_backup() {
         created_at: Utc::now(),
     };
     materialize_agent(root.path(), &agent, &revision, None, None).unwrap();
+    std::fs::create_dir_all(root.path().join("agents/coder/skills/review")).unwrap();
+    std::fs::write(
+        root.path().join("agents/coder/skills/review/SKILL.md"),
+        "skill",
+    )
+    .unwrap();
     let observed = read_agent(root.path(), "coder").unwrap().unwrap();
     let renamed = Agent {
         slug: "builder".into(),
@@ -227,6 +368,10 @@ fn host_renames_a_clean_agent_replica_and_retains_one_backup() {
     assert_eq!(
         read_agent(root.path(), "builder").unwrap().unwrap(),
         observed
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("agents/builder/skills/review/SKILL.md")).unwrap(),
+        "skill"
     );
     let backups = std::fs::read_dir(root.path().join("agents"))
         .unwrap()

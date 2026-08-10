@@ -5,12 +5,28 @@ use serde_json::Value;
 
 use crate::{
     Agent, AuthCredential, AuthStatus, ConsumerId, ConsumerKind, EventBatch, HostHarnessStatus,
-    HostId, HostStatus, Installation, MessageSource, ModelInfo, PermissionOutcome,
-    ProviderDefaults, ReasoningEffort, Run, RunId, Session, SessionId, SessionModelConfig,
+    HostId, HostStatus, Installation, Message, MessageSource, ModelInfo, PermissionOutcome,
+    ProviderDefaults, ReasoningEffort, Run, RunId, Session, SessionEntry, SessionId,
+    SessionModelConfig,
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_HUB_FRAME_BYTES: usize = 1024 * 1024;
+/// Reserved for the response tag, request ID, and JSON envelope around a
+/// paginated transcript or event response. Exact JSON overhead varies by item,
+/// so page boundary tests remain the authority.
+pub const HUB_PAGE_ENVELOPE_RESERVE_BYTES: usize = 256 * 1024;
+/// Page bodies fit inside a Hub frame with room for their serialized envelope.
+pub const MAX_SESSION_PAGE_PAYLOAD_BYTES: usize =
+    MAX_HUB_FRAME_BYTES - HUB_PAGE_ENVELOPE_RESERVE_BYTES;
+/// Event pages use the same frame budget as transcript pages.
+pub const MAX_EVENT_PAGE_PAYLOAD_BYTES: usize = MAX_SESSION_PAGE_PAYLOAD_BYTES;
+/// Every stored timeline item must fit in a page by itself.
+pub const MAX_SESSION_ITEM_BYTES: usize = 700 * 1024;
+/// ACP session IDs are opaque provider identifiers, not payload containers.
+/// Keeping them small ensures the binding and every observation that carries
+/// one remain safely pageable.
+pub const MAX_ACP_SESSION_ID_BYTES: usize = 4 * 1024;
 
 /// A stable, machine-readable error returned by the Hub.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +130,20 @@ pub enum HubRequest {
     GetSession {
         id: SessionId,
     },
+    GetSessionHistory {
+        id: SessionId,
+        #[serde(default)]
+        after: Option<u64>,
+        #[serde(default = "default_page_limit")]
+        limit: u16,
+    },
+    GetSessionEntries {
+        id: SessionId,
+        #[serde(default)]
+        after: Option<u64>,
+        #[serde(default = "default_page_limit")]
+        limit: u16,
+    },
     GetSessionModelConfig {
         id: SessionId,
     },
@@ -195,6 +225,8 @@ pub enum HubResponse {
     Agent(Agent),
     Sessions(Vec<Session>),
     Session(Session),
+    SessionHistory(SessionHistoryPage),
+    SessionEntries(SessionEntriesPage),
     SessionModelConfig(SessionModelConfig),
     Run(Run),
     Events(EventBatch),
@@ -206,6 +238,22 @@ pub enum HubResponse {
     HostInvitation(String),
     Ack,
     Error(ProtocolError),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionHistoryPage {
+    pub messages: Vec<Message>,
+    pub next: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionEntriesPage {
+    pub entries: Vec<SessionEntry>,
+    pub next: Option<u64>,
+}
+
+fn default_page_limit() -> u16 {
+    100
 }
 
 fn default_event_limit() -> u16 {
@@ -285,9 +333,10 @@ mod tests {
 
     #[test]
     fn structured_error_has_stable_json() {
-        let encoded =
-            serde_json::to_string(&HubResponse::Error(ProtocolError::unsupported_version(2)))
-                .unwrap();
+        let encoded = serde_json::to_string(&HubResponse::Error(
+            ProtocolError::unsupported_version(PROTOCOL_VERSION + 1),
+        ))
+        .unwrap();
         assert_eq!(
             encoded,
             r#"{"type":"error","data":{"code":"unsupported_version","message":"protocol version 2 is incompatible with version 1; restart the MEWS daemon","retryable":false}}"#

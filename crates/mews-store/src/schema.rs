@@ -16,6 +16,19 @@ impl Store {
         Ok(store)
     }
 
+    /// Opens a connection after the owning process has already initialized and
+    /// validated the development schema. This keeps request-scoped connections
+    /// from repeating schema DDL and WAL negotiation on the Hub hot path.
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let connection = Connection::open(path)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        Ok(Self {
+            connection,
+            _hub_lock: None,
+        })
+    }
+
     pub fn open_hub(
         path: impl AsRef<Path>,
         lock_path: impl AsRef<Path>,
@@ -117,6 +130,7 @@ impl Store {
                  host_id TEXT NOT NULL REFERENCES hosts(id),
                  working_directory TEXT NOT NULL,
                  model_override TEXT,
+                 leaf_entry_id TEXT,
                  created_at TEXT NOT NULL,
                  FOREIGN KEY (agent_id, agent_revision)
                      REFERENCES agent_revisions(agent_id, revision)
@@ -127,40 +141,50 @@ impl Store {
                  harness TEXT NOT NULL,
                  harness_definition_hash TEXT NOT NULL,
                  acp_session_id TEXT NOT NULL,
+                 context_version INTEGER NOT NULL,
+                 context_hash TEXT NOT NULL,
+                 context_channel TEXT NOT NULL,
+                 context_text TEXT NOT NULL,
+                 context_dispatched INTEGER NOT NULL,
                  created_at TEXT NOT NULL,
                  replaced_at TEXT,
+                 last_replacement_reason TEXT,
                  UNIQUE (host_id, harness, acp_session_id)
              );
-             CREATE TABLE IF NOT EXISTS messages (
+             CREATE TABLE IF NOT EXISTS session_entries (
                  id TEXT PRIMARY KEY,
                  session_id TEXT NOT NULL REFERENCES sessions(id),
                  sequence INTEGER NOT NULL,
-                 role_json TEXT NOT NULL,
-                 content_json TEXT NOT NULL,
-                 metadata_json TEXT NOT NULL,
-                 source_json TEXT NOT NULL,
+                 parent_id TEXT,
+                 kind TEXT NOT NULL,
+                 contextual INTEGER NOT NULL,
+                 observation_key TEXT,
+                 payload_json TEXT NOT NULL,
                  created_at TEXT NOT NULL,
-                 UNIQUE (session_id, sequence)
+                 UNIQUE (session_id, sequence),
+                 UNIQUE (session_id, id),
+                 FOREIGN KEY (session_id, parent_id)
+                     REFERENCES session_entries(session_id, id)
              );
              CREATE TABLE IF NOT EXISTS runs (
                  id TEXT PRIMARY KEY,
                  session_id TEXT NOT NULL REFERENCES sessions(id),
+                 idempotency_key TEXT,
                  harness TEXT,
                  harness_definition_hash TEXT,
                  harness_version TEXT,
+                 channel_origin_json TEXT,
                  status_json TEXT NOT NULL,
                  error TEXT,
                  created_at TEXT NOT NULL,
-                 completed_at TEXT
+                 completed_at TEXT,
+                 UNIQUE (session_id, idempotency_key)
              );
              CREATE UNIQUE INDEX IF NOT EXISTS one_active_run_per_session
                  ON runs(session_id) WHERE completed_at IS NULL;
-             CREATE TABLE IF NOT EXISTS turn_requests (
-                 session_id TEXT NOT NULL REFERENCES sessions(id),
-                 key TEXT NOT NULL,
-                 run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
-                 PRIMARY KEY (session_id, key)
-             );
+             CREATE UNIQUE INDEX IF NOT EXISTS acp_observation_idempotency
+                 ON session_entries(session_id, observation_key)
+                 WHERE observation_key IS NOT NULL;
              CREATE TABLE IF NOT EXISTS invitations (
                  id TEXT PRIMARY KEY,
                  secret_hash TEXT NOT NULL UNIQUE,
@@ -171,10 +195,20 @@ impl Store {
                  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                  id TEXT NOT NULL UNIQUE,
                  session_id TEXT NOT NULL REFERENCES sessions(id),
+                 entry_id TEXT,
+                 idempotency_key TEXT,
                  kind_json TEXT NOT NULL,
+                 channel_origin_json TEXT,
                  transient INTEGER NOT NULL,
-                 created_at TEXT NOT NULL
+                 created_at TEXT NOT NULL,
+                 FOREIGN KEY (session_id, entry_id)
+                     REFERENCES session_entries(session_id, id)
              );
+             CREATE UNIQUE INDEX IF NOT EXISTS client_event_idempotency
+                 ON client_events(session_id, idempotency_key)
+                 WHERE idempotency_key IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS client_events_session_sequence
+                 ON client_events(session_id, sequence);
              CREATE TABLE IF NOT EXISTS client_consumers (
                  id TEXT PRIMARY KEY,
                  cursor INTEGER NOT NULL,
@@ -186,6 +220,8 @@ impl Store {
                  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                  PRIMARY KEY (consumer_id, session_id)
              );
+             CREATE INDEX IF NOT EXISTS client_subscriptions_session
+                 ON client_subscriptions(session_id, consumer_id);
              PRAGMA user_version = 1;
              COMMIT;",
         )?;
@@ -212,13 +248,41 @@ impl Store {
         )?;
         for (run_id, session_id) in interrupted {
             let run_id: RunId = parse_id(run_id)?;
+            let session_id: SessionId = parse_id(session_id)?;
             let kind = ClientEventKind::RunFailed {
-                run_id,
+                run_id: run_id.clone(),
+                error: "Hub stopped before the Run completed".into(),
+            };
+            let leaf: Option<String> = transaction.query_row(
+                "SELECT leaf_entry_id FROM sessions WHERE id = ?1",
+                [session_id.as_str()],
+                |row| row.get(0),
+            )?;
+            let sequence: u64 = transaction.query_row(
+                "SELECT COALESCE(MAX(sequence) + 1, 1) FROM session_entries WHERE session_id = ?1",
+                [session_id.as_str()],
+                |row| row.get(0),
+            )?;
+            let payload = SessionEntryPayload::RunFailed {
+                run_id: run_id.clone(),
                 error: "Hub stopped before the Run completed".into(),
             };
             transaction.execute(
-                "INSERT INTO client_events (id, session_id, kind_json, transient, created_at) VALUES (?1, ?2, ?3, 0, ?4)",
-                params![EventId::new().as_str(), session_id, json(&kind)?, recovered_at],
+                "INSERT INTO session_entries
+                 (id, session_id, sequence, parent_id, kind, contextual, payload_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 'run_failed', 0, ?5, ?6)",
+                params![
+                    MessageId::new().as_str(),
+                    session_id.as_str(),
+                    sequence,
+                    leaf,
+                    json(&payload)?,
+                    recovered_at
+                ],
+            )?;
+            transaction.execute(
+                "INSERT INTO client_events (id, session_id, kind_json, channel_origin_json, transient, created_at) VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+                params![EventId::new().as_str(), session_id.as_str(), json(&kind)?, crate::events::channel_origin_json(&transaction, &kind)?, recovered_at],
             )?;
         }
         transaction.commit()?;
@@ -226,7 +290,7 @@ impl Store {
         let session_ids = {
             let mut statement = self
                 .connection
-                .prepare("SELECT DISTINCT session_id FROM messages")?;
+                .prepare("SELECT DISTINCT session_id FROM session_entries")?;
             statement
                 .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?
@@ -236,38 +300,38 @@ impl Store {
             let session_id: SessionId = value
                 .parse()
                 .map_err(|error: &str| StoreError::InvalidData(error.into()))?;
-            let messages = self.messages(&session_id)?;
-            let completed = messages
+            let entries = self.session_entries(&session_id)?;
+            let completed = entries
                 .iter()
-                .filter_map(|message| match &message.content {
-                    MessageContent::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                .filter_map(|entry| match &entry.payload {
+                    SessionEntryPayload::ToolResult { result, .. } => Some(result.call_id.as_str()),
                     _ => None,
                 })
                 .collect::<std::collections::HashSet<_>>();
-            for message in &messages {
-                if let MessageContent::ToolCall { call_id, tool, .. } = &message.content
-                    && !completed.contains(call_id.as_str())
+            for entry in &entries {
+                if let SessionEntryPayload::ToolStarted { run_id, call } = &entry.payload
+                    && !completed.contains(call.call_id.as_str())
                 {
-                    missing.push((session_id.clone(), call_id.clone(), tool.clone()));
+                    missing.push((
+                        session_id.clone(),
+                        run_id.clone(),
+                        call.call_id.clone(),
+                        call.tool.clone(),
+                    ));
                 }
             }
         }
-        for (session_id, call_id, tool) in missing {
-            self.append_message(
+        for (session_id, run_id, call_id, tool) in missing {
+            self.append_tool_result(
                 &session_id,
-                MessageRole::Tool,
-                MessageContent::ToolResult {
+                &run_id,
+                ToolResult {
                     call_id,
                     tool,
                     result: Value::String(
                         "outcome unknown because Hub stopped during tool execution".into(),
                     ),
                     is_error: true,
-                },
-                Value::Null,
-                MessageSource {
-                    kind: SourceKind::Host,
-                    id: "recovery".into(),
                 },
             )?;
         }

@@ -8,7 +8,9 @@ use std::{
 };
 
 use anyhow::Result;
-use mews_client::{MessageSource, MewsClient, Session, SourceKind};
+use mews_client::{
+    Message, MessageContent, MessageRole, MessageSource, MewsClient, Session, SourceKind,
+};
 use tokio::task::JoinHandle;
 
 pub async fn chat(client: &mut MewsClient, mut session: Session) -> Result<()> {
@@ -29,11 +31,20 @@ pub async fn chat(client: &mut MewsClient, mut session: Session) -> Result<()> {
     let effective = client.session_model_config(session.id.clone()).await?;
     let model = effective.model.as_deref().unwrap_or("not configured");
     let reasoning = effective.reasoning.map(reasoning_label).unwrap_or("none");
-
-    println!(
-        "{agent} on {host}\nsession: {}\nmodel: {model} ({reasoning})\n\n{} (/quit or Ctrl-D to exit)\n",
-        session.id,
-        display_path(&session.working_directory)
+    let colors = Colors::detect();
+    render_header(
+        &agent,
+        &effective.harness,
+        model,
+        reasoning,
+        &session,
+        &host,
+        &colors,
+    );
+    render_history(
+        &agent,
+        client.session_history(session.id.clone()).await?,
+        &colors,
     );
     loop {
         print!("> ");
@@ -54,10 +65,95 @@ pub async fn chat(client: &mut MewsClient, mut session: Session) -> Result<()> {
                 session.model_override.as_deref().unwrap_or("agent default")
             );
         } else if !prompt.is_empty() {
+            render_submitted_user_prompt(prompt, &colors)?;
             let answer = send_interactive(client, &session, prompt.to_owned()).await?;
-            println!("{}", answer.trim());
+            render_speaker_line(&agent, answer.trim(), &colors);
         }
     }
+}
+
+fn render_header(
+    agent: &str,
+    harness: &str,
+    model: &str,
+    reasoning: &str,
+    session: &Session,
+    host: &str,
+    colors: &Colors,
+) {
+    println!(
+        "{}------------------------------------{}",
+        colors.header, colors.reset
+    );
+    println!("{}{}{}", colors.agent_title, agent, colors.reset);
+    println!(
+        "{}------------------------------------{}",
+        colors.header, colors.reset
+    );
+    println!("{}harness: {harness}", colors.header);
+    println!("model: {model} ({reasoning})");
+    println!("cwd: {} [{host}]", display_path(&session.working_directory));
+    println!();
+    println!("session: {}", session.id);
+    println!("(/quit or Ctrl-D to exit)");
+    println!("------------------------------------{}", colors.reset);
+}
+
+fn render_history(agent: &str, messages: Vec<Message>, colors: &Colors) {
+    for message in messages {
+        if let Some((speaker, text)) = history_line(agent, &message.role, &message.content) {
+            render_speaker_line(speaker, text, colors);
+            continue;
+        }
+        match message.content {
+            MessageContent::ToolCall { tool, .. } => {
+                println!("{}· calling {tool}{}", colors.activity, colors.reset);
+            }
+            MessageContent::ToolResult { tool, is_error, .. } => {
+                let (marker, color, outcome) = if is_error {
+                    ("×", colors.error, "failed")
+                } else {
+                    ("·", colors.activity, "completed")
+                };
+                println!("{color}{marker} {tool} {outcome}{}", colors.reset);
+            }
+            MessageContent::ProviderState { .. } => {}
+            MessageContent::Text { .. } => unreachable!("text entries always render as history"),
+        }
+    }
+}
+
+fn history_line<'a>(
+    agent: &'a str,
+    role: &MessageRole,
+    content: &'a MessageContent,
+) -> Option<(&'a str, &'a str)> {
+    match content {
+        MessageContent::Text { text } => Some(match role {
+            MessageRole::User => ("You", text),
+            MessageRole::Assistant => (agent, text),
+            MessageRole::Tool => ("Tool", text),
+        }),
+        MessageContent::ToolCall { .. }
+        | MessageContent::ToolResult { .. }
+        | MessageContent::ProviderState { .. } => None,
+    }
+}
+
+fn render_speaker_line(speaker: &str, text: &str, colors: &Colors) {
+    println!("{}{}:{} {text}", colors.speaker, speaker, colors.reset);
+}
+
+fn render_submitted_user_prompt(prompt: &str, colors: &Colors) -> io::Result<()> {
+    if io::stdout().is_terminal() {
+        print!(
+            "\x1b[1A\r\x1b[2K{}You:{} {prompt}\n",
+            colors.speaker, colors.reset
+        );
+    } else {
+        render_speaker_line("You", prompt, colors);
+    }
+    io::stdout().flush()
 }
 
 async fn send_interactive(
@@ -96,6 +192,7 @@ async fn send_interactive_subscribed(
             MessageSource {
                 kind: SourceKind::Client,
                 id: "cli".into(),
+                channel_origin: None,
             },
         )
         .await?;
@@ -120,7 +217,7 @@ async fn send_interactive_subscribed(
         let mut display_events = Vec::new();
         for event in &batch.events {
             match &event.kind {
-                mews_client::ClientEventKind::AssistantMessage { message }
+                mews_client::ClientEventKind::AssistantMessage { message, .. }
                     if message.session_id == session.id =>
                 {
                     if let mews_client::MessageContent::Text { text } = &message.content {
@@ -334,6 +431,9 @@ impl Drop for ThinkingIndicator {
 
 struct Colors {
     interactive: bool,
+    header: &'static str,
+    agent_title: &'static str,
+    speaker: &'static str,
     activity: &'static str,
     reasoning: &'static str,
     error: &'static str,
@@ -359,6 +459,9 @@ impl Colors {
         if interactive && env::var_os("NO_COLOR").is_none() {
             Self {
                 interactive: true,
+                header: "\x1b[2;37m",
+                agent_title: agent_title_color(),
+                speaker: "\x1b[1;2;37m",
                 activity: "\x1b[2;36m",
                 reasoning: "\x1b[2;35m",
                 error: "\x1b[31m",
@@ -367,6 +470,9 @@ impl Colors {
         } else {
             Self {
                 interactive,
+                header: "",
+                agent_title: "",
+                speaker: "",
                 activity: "",
                 reasoning: "",
                 error: "",
@@ -374,6 +480,23 @@ impl Colors {
             }
         }
     }
+}
+
+fn agent_title_color() -> &'static str {
+    const COLORS: [&str; 6] = [
+        "\x1b[1;31m",
+        "\x1b[1;32m",
+        "\x1b[1;33m",
+        "\x1b[1;34m",
+        "\x1b[1;35m",
+        "\x1b[1;36m",
+    ];
+    let index = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos() as usize)
+        .unwrap_or_default()
+        % COLORS.len();
+    COLORS[index]
 }
 
 fn commit_reasoning(reasoning: &mut String, visible: &mut bool, colors: &Colors) -> Result<()> {
@@ -573,7 +696,32 @@ fn display_path(path: &Path) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{compact_trace, completed_activity, format_acp_activity, format_tool_activity};
+    use super::{
+        MessageContent, MessageRole, compact_trace, completed_activity, format_acp_activity,
+        format_tool_activity, history_line,
+    };
+
+    #[test]
+    fn history_lines_preserve_conversation_roles() {
+        assert_eq!(
+            history_line(
+                "cope",
+                &MessageRole::User,
+                &MessageContent::Text {
+                    text: "hello".into(),
+                },
+            ),
+            Some(("You", "hello"))
+        );
+        assert_eq!(
+            history_line(
+                "cope",
+                &MessageRole::Assistant,
+                &MessageContent::Text { text: "hi".into() },
+            ),
+            Some(("cope", "hi"))
+        );
+    }
 
     #[test]
     fn formats_common_tool_activity() {

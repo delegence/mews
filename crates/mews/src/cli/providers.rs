@@ -103,6 +103,7 @@ pub async fn run(root: &Path, command: Option<ProviderCommand>) -> Result<()> {
                     .reasoning
                     .iter()
                     .copied()
+                    .filter(|effort| *effort != mews_protocol::ReasoningEffort::Auto)
                     .map(|effort| (format!("{effort:?}"), Some(effort))),
             );
             let Some(choice) = prompt(

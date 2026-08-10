@@ -122,6 +122,7 @@ mod tests {
         assert_eq!(
             mews.session_model_config(&session).unwrap(),
             crate::SessionModelConfig {
+                harness: "mews".into(),
                 model: Some("openai/gpt-test".into()),
                 reasoning: Some(crate::ReasoningEffort::High),
             }
@@ -135,11 +136,73 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn native_provider_defaults_reject_auto_reasoning() {
+        let root = tempfile::tempdir().unwrap();
+        let mut mews = Mews::setup(root.path(), "laptop").unwrap();
+
+        let error = mews
+            .set_default_reasoning(Some(crate::ReasoningEffort::Auto))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("use Provider default instead"));
+
+        mews.store
+            .set_default_reasoning(Some(crate::ReasoningEffort::Auto))
+            .unwrap();
+        let error = mews.create_agent("coder").unwrap_err();
+        assert!(error.to_string().contains("use Provider default instead"));
+    }
+
+    #[test]
+    fn session_history_reads_the_active_timeline() {
+        let root = tempfile::tempdir().unwrap();
+        let mut mews = Mews::setup(root.path(), "laptop").unwrap();
+        let agent = mews.create_agent("coder").unwrap();
+        let session = mews
+            .store
+            .create_session(
+                &agent.id,
+                &mews.installation().unwrap().hub_host_id,
+                root.path(),
+            )
+            .unwrap();
+        let source = MessageSource {
+            kind: SourceKind::Client,
+            id: "cli".into(),
+            channel_origin: None,
+        };
+        mews.store
+            .append_message(
+                &session.id,
+                MessageRole::User,
+                MessageContent::Text {
+                    text: "remember maple".into(),
+                },
+                Value::Null,
+                source,
+            )
+            .unwrap();
+
+        let history = mews.session_history(&session.id).unwrap();
+        assert!(matches!(
+            history.as_slice(),
+            [message] if matches!(&message.content, MessageContent::Text { text } if text == "remember maple")
+        ));
+    }
+
     #[test]
     fn rename_agent_moves_the_editable_replica_after_synchronizing_it() {
         let root = tempfile::tempdir().unwrap();
         let mut mews = Mews::setup(root.path(), "laptop").unwrap();
         mews.create_agent("coder").unwrap();
+        std::fs::create_dir_all(root.path().join("agents/coder/skills/review")).unwrap();
+        std::fs::write(
+            root.path().join("agents/coder/skills/review/SKILL.md"),
+            "skill",
+        )
+        .unwrap();
         std::fs::write(root.path().join("agents/coder/SOUL.md"), "locally edited").unwrap();
 
         let renamed = mews.rename_agent("coder", "builder").unwrap();
@@ -153,6 +216,33 @@ mod tests {
         assert_eq!(
             mews.agent_revision(&renamed).unwrap().soul,
             "locally edited"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("agents/builder/skills/review/SKILL.md"))
+                .unwrap(),
+            "skill"
+        );
+    }
+
+    #[test]
+    fn synchronizing_an_agent_preserves_its_local_skills() {
+        let root = tempfile::tempdir().unwrap();
+        let mut mews = Mews::setup(root.path(), "laptop").unwrap();
+        mews.create_agent("coder").unwrap();
+        std::fs::create_dir_all(root.path().join("agents/coder/skills/review")).unwrap();
+        std::fs::write(
+            root.path().join("agents/coder/skills/review/SKILL.md"),
+            "skill",
+        )
+        .unwrap();
+        std::fs::remove_file(root.path().join("agents/coder/SOUL.md")).unwrap();
+
+        mews.synchronize_agent("coder").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("agents/coder/skills/review/SKILL.md"))
+                .unwrap(),
+            "skill"
         );
     }
 
@@ -199,6 +289,7 @@ mod tests {
         assert_eq!(
             mews.session_model_config(&session).unwrap(),
             crate::SessionModelConfig {
+                harness: "codex".into(),
                 model: Some("gpt-5.6-codex".into()),
                 reasoning: Some(crate::ReasoningEffort::Medium),
             }
@@ -337,7 +428,7 @@ mod tests {
         );
         let database = rusqlite::Connection::open(root.path().join("mews.db")).unwrap();
         let messages: u64 = database
-            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM session_entries", [], |row| row.get(0))
             .unwrap();
         assert_eq!(messages, 0);
     }

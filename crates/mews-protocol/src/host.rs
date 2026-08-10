@@ -10,6 +10,12 @@ use crate::{
 
 pub const HOST_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_HOST_FRAME_BYTES: usize = 256 * 1024;
+/// Reserved in Host frames for the request envelope, Agent configuration,
+/// tools, and other metadata surrounding project instructions.
+pub const HOST_REQUEST_ENVELOPE_RESERVE_BYTES: usize = 64 * 1024;
+/// Aggregate project context budget within one Host protocol frame.
+pub const MAX_PROJECT_CONTEXT_BYTES: usize =
+    MAX_HOST_FRAME_BYTES - HOST_REQUEST_ENVELOPE_RESERVE_BYTES;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -84,6 +90,7 @@ pub enum HubToHost {
     },
     ReadProjectContext {
         request_id: RequestId,
+        agent_slug: String,
         canonical_cwd: PathBuf,
     },
     ReadPrompt {
@@ -96,6 +103,9 @@ pub enum HubToHost {
         tool: String,
         arguments: Value,
         canonical_cwd: PathBuf,
+    },
+    CancelTool {
+        request_id: RequestId,
     },
     ExecuteHook {
         request_id: RequestId,
@@ -113,8 +123,14 @@ pub enum HubToHost {
         canonical_cwd: PathBuf,
         prompt: String,
         recovery_prompt: String,
-        #[serde(default)]
-        acp_session_id: Option<String>,
+        agent_slug: String,
+        soul: String,
+        mews_session_id: String,
+        run_id: String,
+        transition: crate::AcpBindingTransition,
+        /// Present only for a compatible resume. New/replaced Sessions are
+        /// rendered by the executing Host from its selected-Agent skill scope.
+        context: Option<crate::AcpBindingContext>,
     },
     CancelAcp {
         request_id: RequestId,
@@ -186,6 +202,21 @@ mod tests {
         assert!(
             matches!(decoded, HubToHost::WriteHubTransfer { data: value, .. } if value == data)
         );
+    }
+
+    #[test]
+    fn project_context_budget_leaves_room_in_a_host_frame() {
+        assert_eq!(
+            MAX_PROJECT_CONTEXT_BYTES + HOST_REQUEST_ENVELOPE_RESERVE_BYTES,
+            MAX_HOST_FRAME_BYTES
+        );
+        let encoded = encode(HostToHub::ProjectContext {
+            request_id: RequestId::new(),
+            context: Some("x".repeat(MAX_PROJECT_CONTEXT_BYTES)),
+            error: None,
+        })
+        .unwrap();
+        assert!(encoded.len() <= MAX_HOST_FRAME_BYTES);
     }
 }
 
@@ -309,25 +340,47 @@ pub struct AcpTimings {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AcpEvent {
     AssistantDelta {
+        event_key: crate::AcpEventKey,
         delta: String,
         message_id: Option<String>,
+        raw: Value,
     },
     ProviderState {
+        event_key: crate::AcpEventKey,
         data: Value,
     },
     ReasoningDelta {
+        event_key: crate::AcpEventKey,
         delta: String,
         message_id: Option<String>,
+        raw: Value,
     },
     ToolActivity {
+        event_key: crate::AcpEventKey,
         activity: crate::ToolActivity,
     },
-    SessionBound {
+    HookOutcome {
+        event_key: crate::AcpEventKey,
+        hook: String,
+        ok: bool,
+        detail: Option<String>,
+        tool: Option<String>,
+        call_id: Option<String>,
+    },
+    ContextDispatched {
+        event_key: crate::AcpEventKey,
         acknowledgement_id: String,
         session_id: String,
-        replaced: bool,
+    },
+    SessionBound {
+        event_key: crate::AcpEventKey,
+        acknowledgement_id: String,
+        session_id: String,
+        transition: crate::AcpBindingTransition,
+        context: crate::AcpBindingContext,
     },
     PermissionRequested {
+        event_key: crate::AcpEventKey,
         request: PermissionRequest,
     },
 }

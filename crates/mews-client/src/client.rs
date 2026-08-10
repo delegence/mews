@@ -68,6 +68,49 @@ impl MewsClient {
         response::session(self.request(HubRequest::GetSession { id }).await?)
     }
 
+    pub async fn session_history(&mut self, id: SessionId) -> Result<Vec<mews_protocol::Message>> {
+        let mut after = None;
+        let mut messages = Vec::new();
+        loop {
+            let page = response::session_history(
+                self.request(HubRequest::GetSessionHistory {
+                    id: id.clone(),
+                    after,
+                    limit: 100,
+                })
+                .await?,
+            )?;
+            messages.extend(page.messages);
+            let Some(next) = page.next else {
+                return Ok(messages);
+            };
+            after = Some(next);
+        }
+    }
+
+    pub async fn session_entries(
+        &mut self,
+        id: SessionId,
+    ) -> Result<Vec<mews_protocol::SessionEntry>> {
+        let mut after = None;
+        let mut entries = Vec::new();
+        loop {
+            let page = response::session_entries(
+                self.request(HubRequest::GetSessionEntries {
+                    id: id.clone(),
+                    after,
+                    limit: 100,
+                })
+                .await?,
+            )?;
+            entries.extend(page.entries);
+            let Some(next) = page.next else {
+                return Ok(entries);
+            };
+            after = Some(next);
+        }
+    }
+
     pub async fn session_model_config(
         &mut self,
         id: SessionId,
@@ -265,12 +308,14 @@ impl MewsClient {
     }
 
     pub async fn wait_for_run(&mut self, id: mews_protocol::RunId) -> Result<Run> {
+        let mut delay = std::time::Duration::from_millis(100);
         loop {
             let run = self.get_run(id.clone()).await?;
             if run.completed_at.is_some() {
                 return Ok(run);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(std::time::Duration::from_secs(1));
         }
     }
 

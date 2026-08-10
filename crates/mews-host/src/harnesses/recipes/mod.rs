@@ -45,22 +45,22 @@ pub(super) fn apply_profile_environment(
     }
 }
 
-pub(super) fn recipe_runtime(root: &Path, recipe: &Recipe) -> PathBuf {
+pub(super) fn recipe_acp(root: &Path, recipe: &Recipe) -> PathBuf {
     root.join("harnesses")
         .join(recipe.name)
-        .join("runtime")
+        .join("acp")
         .join(recipe.version)
 }
 
 pub(super) fn recipe_binary(root: &Path, recipe: &Recipe) -> PathBuf {
-    recipe_runtime(root, recipe)
+    recipe_acp(root, recipe)
         .join("node_modules")
         .join(".bin")
         .join(recipe.binary)
 }
 
 pub(super) fn recipe_node_path(root: &Path, recipe: &Recipe) -> PathBuf {
-    recipe_runtime(root, recipe).join("node-path")
+    recipe_acp(root, recipe).join("node-path")
 }
 
 pub(super) fn recipe_command(root: &Path, recipe: &Recipe) -> Option<Vec<std::ffi::OsString>> {
@@ -72,11 +72,11 @@ pub(super) fn recipe_command(root: &Path, recipe: &Recipe) -> Option<Vec<std::ff
 }
 
 pub(super) fn install_recipe(root: &Path, recipe: &Recipe) -> Result<()> {
-    let runtime = recipe_runtime(root, recipe);
-    fs::create_dir_all(&runtime)
-        .with_context(|| format!("create managed runtime {}", runtime.display()))?;
-    ensure_directory_is_not_a_symlink(&runtime)?;
-    restrict_directory_permissions(&runtime)?;
+    let acp = recipe_acp(root, recipe);
+    fs::create_dir_all(&acp)
+        .with_context(|| format!("create managed ACP directory {}", acp.display()))?;
+    ensure_directory_is_not_a_symlink(&acp)?;
+    restrict_directory_permissions(&acp)?;
 
     if !recipe_binary(root, recipe).is_file() {
         let package = format!("{}@{}", recipe.package, recipe.version);
@@ -84,9 +84,8 @@ pub(super) fn install_recipe(root: &Path, recipe: &Recipe) -> Result<()> {
             .args([
                 "install",
                 "--prefix",
-                runtime
-                    .to_str()
-                    .context("managed Harness runtime path is not UTF-8")?,
+                acp.to_str()
+                    .context("managed Harness ACP path is not UTF-8")?,
                 "--ignore-scripts",
                 "--no-audit",
                 "--no-fund",
@@ -208,4 +207,19 @@ pub(super) fn command_path(command: &str) -> Option<PathBuf> {
             .map(|directory| directory.join(command))
             .find(|candidate| candidate.is_file())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{recipe, recipe_acp};
+
+    #[test]
+    fn managed_adapter_uses_versioned_acp_directory() {
+        assert_eq!(
+            recipe_acp(Path::new("/mews"), recipe("codex").unwrap()),
+            Path::new("/mews/harnesses/codex/acp/1.1.9")
+        );
+    }
 }

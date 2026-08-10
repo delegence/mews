@@ -67,8 +67,10 @@ fn verify_signature(public_key: &str, message: &[u8], signature: &str) -> bool {
         .is_ok()
 }
 
-/// A conservative default until transports negotiate their own limits.
-pub const MAX_CIPHERTEXT_BYTES: usize = 1024 * 1024;
+/// Relay frames carry one encrypted MEWS transport record. The current Noise
+/// records are about 48 KiB at most; this leaves fixed headroom without letting
+/// a relay buffer an application-sized message.
+pub const MAX_CIPHERTEXT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -185,7 +187,28 @@ pub struct RelayFrame {
     pub destination_id: RelayPeerId,
     pub stream_id: String,
     pub sequence: u64,
+    #[serde(with = "base64_bytes")]
     pub ciphertext: Vec<u8>,
+}
+
+mod base64_bytes {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        STANDARD.decode(encoded).map_err(serde::de::Error::custom)
+    }
 }
 
 impl RelayFrame {
@@ -217,7 +240,7 @@ impl RelayFrame {
         })
     }
 
-    fn validate(&self) -> Result<(), RelayError> {
+    pub(crate) fn validate(&self) -> Result<(), RelayError> {
         if self.stream_id.is_empty() || self.stream_id.len() > 128 {
             return Err(RelayError::InvalidStreamId);
         }
@@ -647,6 +670,12 @@ mod tests {
             vec![0; MAX_CIPHERTEXT_BYTES + 1],
         )
         .unwrap_err();
-        assert!(matches!(error, RelayError::FrameTooLarge { .. }));
+        assert_eq!(
+            error,
+            RelayError::FrameTooLarge {
+                actual: MAX_CIPHERTEXT_BYTES + 1,
+                maximum: MAX_CIPHERTEXT_BYTES,
+            }
+        );
     }
 }

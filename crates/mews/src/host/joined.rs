@@ -134,6 +134,14 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
         RequestId,
         mews_agent::CancellationToken,
     >::new()));
+    let tool_cancellations = Arc::new(std::sync::Mutex::new(HashMap::<
+        RequestId,
+        mews_agent::CancellationToken,
+    >::new()));
+    let _acp_cancellation_owner =
+        super::connection::CancellationRegistryOwner::new(Arc::clone(&acp_cancellations));
+    let _tool_cancellation_owner =
+        super::connection::CancellationRegistryOwner::new(Arc::clone(&tool_cancellations));
     let (promotion_tx, mut promotion_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         while let Some(message) = peer_in.recv().await {
@@ -170,6 +178,16 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
                         if let Some(cancellation) = acp_cancellations
                             .lock()
                             .expect("ACP cancellations poisoned")
+                            .remove(request_id)
+                        {
+                            cancellation.cancel();
+                        }
+                        continue;
+                    }
+                    if let mews_protocol::HubToHost::CancelTool { request_id } = &body {
+                        if let Some(cancellation) = tool_cancellations
+                            .lock()
+                            .expect("tool cancellations poisoned")
                             .remove(request_id)
                         {
                             cancellation.cancel();
@@ -227,6 +245,48 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
                                 .lock()
                                 .expect("ACP cancellations poisoned")
                                 .remove(&request_id);
+                        });
+                        continue;
+                    }
+                    if matches!(
+                        &body,
+                        mews_protocol::HubToHost::ExecuteTool { .. }
+                            | mews_protocol::HubToHost::ExecuteHook { .. }
+                    ) {
+                        let request_id = match &body {
+                            mews_protocol::HubToHost::ExecuteTool { request_id, .. }
+                            | mews_protocol::HubToHost::ExecuteHook { request_id, .. } => {
+                                request_id.clone()
+                            }
+                            _ => unreachable!(),
+                        };
+                        let cancellation = mews_agent::CancellationToken::new();
+                        tool_cancellations
+                            .lock()
+                            .expect("tool cancellations poisoned")
+                            .insert(request_id.clone(), cancellation.clone());
+                        let registry = Arc::clone(&dispatch_registry);
+                        let root = agent_root.clone();
+                        let peer = dispatch_peer.clone();
+                        let cancellations = Arc::clone(&tool_cancellations);
+                        tokio::spawn(async move {
+                            let response = crate::host::handle_host_request_streaming(
+                                &registry,
+                                Some(&root),
+                                body,
+                                None,
+                                None,
+                                None,
+                                Some(cancellation),
+                            )
+                            .await;
+                            cancellations
+                                .lock()
+                                .expect("tool cancellations poisoned")
+                                .remove(&request_id);
+                            let _ = peer
+                                .send(PeerEnvelope::ToolResponse { body: response })
+                                .await;
                         });
                         continue;
                     }

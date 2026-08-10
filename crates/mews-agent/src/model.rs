@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use futures_util::Stream;
-use mews_protocol::{ReasoningEffort, ToolDefinition};
+use mews_protocol::{ModelUsage, ReasoningEffort, ToolDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -12,6 +12,25 @@ pub struct ModelRequest {
     pub system: String,
     pub messages: Vec<ModelMessage>,
     pub tools: Vec<ToolDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<ResponseContinuation>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResponseContinuation {
+    pub response_id: String,
+    pub provider: String,
+    pub model: String,
+    pub api: String,
+    /// Canonical full replay retained locally for the one safe cursor fallback.
+    #[serde(skip)]
+    pub fallback_messages: Vec<ModelMessage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContinuationCapability {
+    None,
+    ResponseId { provider: String, api: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -56,14 +75,33 @@ pub enum MessageContent {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ModelResponse {
+    pub provider: String,
+    pub model: String,
+    pub api: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
     pub parts: Vec<ModelPart>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ModelUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum ModelStreamEvent {
     Start,
+    ResponseMetadata {
+        provider: String,
+        model: String,
+        api: String,
+        response_id: Option<String>,
+    },
     TextDelta(String),
+    Reasoning {
+        text: String,
+        signature: Option<String>,
+    },
     ToolCall {
         id: String,
         name: String,
@@ -76,6 +114,10 @@ pub enum ModelStreamEvent {
         model: String,
         data: Value,
     },
+    ResponseCompleted {
+        usage: Option<ModelUsage>,
+        stop_reason: Option<String>,
+    },
     Done,
 }
 
@@ -87,6 +129,11 @@ pub type ModelStream =
 pub enum ModelPart {
     Text {
         text: String,
+    },
+    Reasoning {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
     ToolCall {
         id: String,
@@ -119,20 +166,37 @@ pub enum ProviderError {
     InvalidResponse(String),
     #[error("provider operation was cancelled")]
     Cancelled,
+    #[error("provider continuation cursor is missing, expired, or incompatible: {0}")]
+    CursorRejected(String),
 }
 
 pub type ProviderResult<T> = std::result::Result<T, ProviderError>;
 
 #[async_trait]
 pub trait Provider: Send + Sync {
+    fn continuation_capability(&self, _model: &str) -> ContinuationCapability {
+        ContinuationCapability::None
+    }
+
     async fn generate(&self, request: ModelRequest) -> ProviderResult<ModelResponse>;
 
     async fn stream(&self, request: ModelRequest) -> ProviderResult<ModelStream> {
         let response = self.generate(request).await?;
-        let mut events = vec![Ok(ModelStreamEvent::Start)];
+        let mut events = vec![
+            Ok(ModelStreamEvent::Start),
+            Ok(ModelStreamEvent::ResponseMetadata {
+                provider: response.provider.clone(),
+                model: response.model.clone(),
+                api: response.api.clone(),
+                response_id: response.response_id.clone(),
+            }),
+        ];
         events.extend(response.parts.into_iter().map(|part| {
             Ok(match part {
                 ModelPart::Text { text } => ModelStreamEvent::TextDelta(text),
+                ModelPart::Reasoning { text, signature } => {
+                    ModelStreamEvent::Reasoning { text, signature }
+                }
                 ModelPart::ToolCall {
                     id,
                     name,
@@ -154,6 +218,10 @@ pub trait Provider: Send + Sync {
                     data,
                 },
             })
+        }));
+        events.push(Ok(ModelStreamEvent::ResponseCompleted {
+            usage: response.usage,
+            stop_reason: response.stop_reason,
         }));
         events.push(Ok(ModelStreamEvent::Done));
         Ok(Box::pin(futures_util::stream::iter(events)))

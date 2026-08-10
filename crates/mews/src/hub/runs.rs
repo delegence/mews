@@ -122,8 +122,19 @@ pub(super) async fn poll_events(
         let notified = runtime.control.event_notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
+        // Long-poll waiting must not hold the handoff gate. Only the actual
+        // database read participates in the Hub movement fence.
+        let operation_guard = runtime.control.handoff_gate.read().await;
+        if runtime
+            .control
+            .moving
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            anyhow::bail!("Hub is moving; try again after handoff");
+        }
         let events =
             Mews::open_connection(root)?.client_events(&consumer_id, limit.clamp(1, 500))?;
+        drop(operation_guard);
         if events.advanced || tokio::time::Instant::now() >= deadline {
             return Ok(events);
         }
@@ -142,7 +153,16 @@ pub(super) async fn start_turn(
     source: Option<MessageSource>,
 ) -> Result<mews_protocol::Run> {
     let mews = Mews::open_connection(root)?;
-    let (run, created) = mews.start_run_idempotent(&session_id, &idempotency_key)?;
+    let source = source.unwrap_or(MessageSource {
+        kind: SourceKind::Client,
+        id: "client".into(),
+        channel_origin: None,
+    });
+    let (run, created) = mews.start_run_idempotent(
+        &session_id,
+        &idempotency_key,
+        source.channel_origin.as_ref(),
+    )?;
     let session = mews.session(&session_id)?;
     let installation = mews.installation()?;
     if !created {
@@ -150,10 +170,6 @@ pub(super) async fn start_turn(
     }
     runtime.control.event_notify.notify_waiters();
 
-    let source = source.unwrap_or(MessageSource {
-        kind: SourceKind::Client,
-        id: "client".into(),
-    });
     let root = root.to_path_buf();
     let remote_hosts = Arc::clone(&runtime.remote_hosts);
     let local_host = Arc::clone(&runtime.local_host);
@@ -161,6 +177,8 @@ pub(super) async fn start_turn(
     let run_task = run.clone();
     let tasks = Arc::clone(&runtime.control.run_tasks);
     let notify = Arc::clone(&runtime.control.event_notify);
+    let finished = Arc::new(tokio::sync::Notify::new());
+    let run_finished = Arc::clone(&finished);
     let permission_handler = permission_handler(
         &root,
         session.id.clone(),
@@ -229,12 +247,14 @@ pub(super) async fn start_turn(
         }
         tasks.lock().await.remove(&run_task.id);
         notify.notify_waiters();
+        run_finished.notify_waiters();
     });
     runtime.control.run_tasks.lock().await.insert(
         run.id.clone(),
         super::RunTask {
             cancellation,
             abort: task.abort_handle(),
+            finished,
         },
     );
     Ok(run)
@@ -243,6 +263,9 @@ pub(super) async fn start_turn(
 pub(crate) async fn cancel_run(control: &super::HubControl, root: &Path, run_id: &crate::RunId) {
     let task = control.run_tasks.lock().await.remove(run_id);
     if let Some(task) = task {
+        let finished = task.finished.notified();
+        tokio::pin!(finished);
+        finished.as_mut().enable();
         task.cancellation.cancel();
         let waiters = {
             let mut waiters = control.permission_waiters.lock().await;
@@ -266,7 +289,10 @@ pub(crate) async fn cancel_run(control: &super::HubControl, root: &Path, run_id:
             }
             let _ = waiter.sender.send(None);
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Let cancellation cross the active Host request boundary before a
+        // bounded abort fallback. This is a synchronization guard, not a
+        // timing assumption.
+        let _ = tokio::time::timeout(Duration::from_secs(5), finished).await;
         task.abort.abort();
     }
 }

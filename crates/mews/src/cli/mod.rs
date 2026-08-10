@@ -14,6 +14,7 @@ use inquire::InquireError;
 use mews_client::MewsClient;
 
 use command::{Cli, Command, HubCommand, RelayCommand};
+pub(crate) use setup::RestartFailure;
 
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
@@ -59,8 +60,7 @@ pub async fn run() -> Result<()> {
         Command::Daemon => runtime::serve_machine(cli.root, true).await?,
         Command::Router => mews_router::serve(cli.root).await?,
         Command::Restart => {
-            mews::daemon::restart()?;
-            setup::wait_for_hub(&cli.root).await?;
+            setup::restart(&cli.root).await?;
         }
         Command::Agents { args } => chat::agents(&cli.root, args).await?,
         Command::Sessions { id, args } => chat::sessions(&cli.root, id, args).await?,

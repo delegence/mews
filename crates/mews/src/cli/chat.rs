@@ -215,9 +215,12 @@ async fn select_mews_options(
         .unwrap_or_default();
     if !creation.harness_options.contains_key("reasoning") && !reasoning.is_empty() {
         let mut choices = vec![("Provider default".to_owned(), None)];
-        choices.extend(reasoning.iter().map(|value| {
+        choices.extend(reasoning.iter().filter_map(|value| {
+            if *value == mews_protocol::ReasoningEffort::Auto {
+                return None;
+            }
             let value = format!("{value:?}").to_lowercase();
-            (value.clone(), Some(value))
+            Some((value.clone(), Some(value)))
         }));
         let labels = choices.iter().map(|(label, _)| label.clone()).collect();
         let selected = prompt(Select::new("Choose reasoning effort", labels).prompt())?
@@ -466,6 +469,7 @@ async fn send(client: &mut MewsClient, session: &Session, prompt: String) -> Res
             MessageSource {
                 kind: SourceKind::Client,
                 id: "cli".into(),
+                channel_origin: None,
             },
         )
         .await

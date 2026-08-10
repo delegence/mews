@@ -11,11 +11,14 @@ use tokio_tungstenite::{
 };
 
 use crate::{
-    RelayConnection, RelayError, RelayFrame, RelayIdentity, RelayLink, RelayRouter, RelaySigner,
-    SignedAdmissionAuthenticator, registration_message,
+    MAX_CIPHERTEXT_BYTES, RelayConnection, RelayError, RelayFrame, RelayIdentity, RelayLink,
+    RelayRouter, RelaySigner, SignedAdmissionAuthenticator, registration_message,
 };
 
-const MAX_NETWORK_MESSAGE: usize = 1024 * 1024 + 64 * 1024;
+/// A max-size relay ciphertext expands by at most 4/3 when base64 encoded;
+/// this leaves ample room for the JSON frame envelope and registration stays
+/// separately bounded below.
+const MAX_NETWORK_MESSAGE: usize = MAX_CIPHERTEXT_BYTES * 2;
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -72,7 +75,9 @@ async fn serve_connection(stream: tokio::net::TcpStream, router: RelayRouter) ->
             }
             frame = connection.receive() => {
                 let Some(frame) = frame else { return Ok(()); };
-                socket.send(Message::Binary(serde_json::to_vec(&frame)?.into())).await?;
+                let encoded = serde_json::to_vec(&frame)?;
+                if encoded.len() > MAX_NETWORK_MESSAGE { bail!("relay network frame is too large"); }
+                socket.send(Message::Binary(encoded.into())).await?;
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
                 bail!("relay connection was idle for 120 seconds");
@@ -149,11 +154,14 @@ impl NetworkRelay {
                     frame = outgoing.recv() => {
                         let Some(frame) = frame else { return; };
                         let Ok(encoded) = serde_json::to_vec(&frame) else { return; };
+                        if encoded.len() > MAX_NETWORK_MESSAGE { return; }
                         if socket.send(Message::Binary(encoded.into())).await.is_err() { return; }
                     }
                     message = socket.next() => {
                         let Some(Ok(Message::Binary(bytes))) = message else { return; };
-                        let Ok(frame) = serde_json::from_slice(&bytes) else { return; };
+                        if bytes.len() > MAX_NETWORK_MESSAGE { return; }
+                        let Ok(frame) = serde_json::from_slice::<RelayFrame>(&bytes) else { return; };
+                        if frame.validate().is_err() { return; }
                         if incoming.send(frame).await.is_err() { return; }
                     }
                 }
@@ -166,6 +174,7 @@ impl NetworkRelay {
 #[async_trait]
 impl RelayLink for NetworkRelay {
     async fn send_frame(&self, frame: RelayFrame) -> Result<(), RelayError> {
+        frame.validate()?;
         self.sender
             .send(frame)
             .await
@@ -213,7 +222,7 @@ mod tests {
     use mews_protocol::InstallationId;
 
     #[tokio::test]
-    async fn websocket_relay_accepts_signed_admissions_and_forwards() {
+    async fn websocket_relay_forwards_a_maximum_sized_frame() {
         let authority = TestSigner::new();
         let alice_key = TestSigner::new();
         let bob_key = TestSigner::new();
@@ -253,10 +262,45 @@ mod tests {
             bob_identity.peer_id,
             "network-test",
             0,
-            b"opaque".to_vec(),
+            vec![u8::MAX; MAX_CIPHERTEXT_BYTES],
         )
         .unwrap();
         alice.send_frame(frame.clone()).await.unwrap();
         assert_eq!(bob.receive_frame().await, Some(frame));
+    }
+
+    #[test]
+    fn relay_ciphertext_uses_compact_base64_json() {
+        let frame = RelayFrame::new(
+            InstallationId::new(),
+            RelayPeerId::new("host:alice").unwrap(),
+            RelayPeerId::new("host:bob").unwrap(),
+            "stream",
+            1,
+            vec![0, 1, 2, 255],
+        )
+        .unwrap();
+        let encoded = serde_json::to_string(&frame).unwrap();
+        assert!(encoded.contains(r#""ciphertext":"AAEC/w==""#));
+        assert_eq!(serde_json::from_str::<RelayFrame>(&encoded).unwrap(), frame);
+    }
+
+    #[test]
+    fn maximum_relay_frame_fits_the_network_message_limit() {
+        let frame = RelayFrame::new(
+            InstallationId::new(),
+            RelayPeerId::new("host:alice").unwrap(),
+            RelayPeerId::new("host:bob").unwrap(),
+            "stream",
+            1,
+            vec![u8::MAX; MAX_CIPHERTEXT_BYTES],
+        )
+        .unwrap();
+        let encoded = serde_json::to_vec(&frame).unwrap();
+        assert!(encoded.len() <= MAX_NETWORK_MESSAGE);
+        assert_eq!(
+            serde_json::from_slice::<RelayFrame>(&encoded).unwrap(),
+            frame
+        );
     }
 }

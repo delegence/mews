@@ -60,6 +60,11 @@ impl Mews {
         &self,
         reasoning: Option<crate::ReasoningEffort>,
     ) -> Result<()> {
+        if reasoning == Some(crate::ReasoningEffort::Auto) {
+            bail!(
+                "reasoning auto is not supported by the native mews Harness; use Provider default instead"
+            );
+        }
         if let Some(reasoning) = reasoning {
             let defaults = self.provider_defaults()?;
             let default_model = defaults.model.context(

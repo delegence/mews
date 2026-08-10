@@ -6,7 +6,7 @@
 
 mod capabilities;
 mod context_budget;
-mod loop_run;
+mod r#loop;
 mod model;
 mod queue;
 mod tools;
@@ -14,7 +14,7 @@ mod types;
 
 pub use capabilities::*;
 pub use context_budget::{apply_context_budget, context_budget_bytes};
-pub use loop_run::{run, run_with_config};
+pub use r#loop::{run, run_with_config};
 pub use mews_protocol::{ReasoningEffort, ToolDefinition};
 pub use model::*;
 pub use queue::MessageQueue;

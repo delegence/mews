@@ -1,12 +1,12 @@
-# MEWS vision
+# MEWS
 
 ## The product
 
-MEWS is a personal operating layer for durable AI agents across all of a person's machines.
+MEWS is an operating layer for durable AI agents across all of a person's machines.
 
-A user should be able to install MEWS on a laptop, VPS, mini PC, workstation, or other general-purpose computer, connect that machine to their MEWS installation, and make the same agents available there. An agent can then work inside the directory where it is invoked, using the models and tools available through that Host.
+A user should be able to install MEWS on a laptop, VPS, mini PC, workstation, or any other general-purpose computer, connect that machine to their MEWS installation, and make the same agents available there. An agent can then work inside the directory where it is invoked, using the models and tools available through that Host.
 
-MEWS is not an operating system, a hosted agent marketplace, or a large autonomous-agent framework. It is a small set of dependable primitives from which those experiences can be built:
+MEWS is not an operating system, a hosted agent marketplace, or a large autonomous-agent framework. It is a small set of building blocks (dependable primitives) from which those experiences can be built:
 
 - portable agent identity and configuration;
 - durable conversations and execution history;
@@ -14,8 +14,6 @@ MEWS is not an operating system, a hosted agent marketplace, or a large autonomo
 - replaceable models, harnesses, tools, and user interfaces;
 - secure communication between a user's machines;
 - one movable source of truth.
-
-The intended feeling is closer to Pi than to a traditional agent platform: small, direct, inspectable, and easy to extend.
 
 ## The experience
 
@@ -114,7 +112,7 @@ A Session permanently captures:
 
 New Agent invocations create new Sessions by default. Resuming is explicit. An existing Session always routes back to its bound Host and directory, even when the request originates from another machine or a channel adapter.
 
-MEWS does not build implicit cross-session memory into the core. Memory, summaries, retrieval, or “last ten messages” continuity can be implemented later by a Harness or client using the durable primitives. The base system should not impose one context-management policy on every Agent and interface.
+MEWS does not build implicit cross-session memory into the core. Memory, summaries, retrieval, or “last ten messages” continuity can be implemented later by a Harness or client using the durable primitives. The base system is not imposing one context-management policy on every Agent and interface.
 
 ## A minimal, replaceable runtime
 

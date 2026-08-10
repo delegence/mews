@@ -205,6 +205,18 @@ impl RouterClient {
 
 #[async_trait]
 impl Provider for RouterClient {
+    fn continuation_capability(&self, model: &str) -> mews_agent::ContinuationCapability {
+        match model.split_once('/').map(|(provider, _)| provider) {
+            Some(provider @ ("openai" | "openai-codex")) => {
+                mews_agent::ContinuationCapability::ResponseId {
+                    provider: provider.into(),
+                    api: "responses".into(),
+                }
+            }
+            _ => mews_agent::ContinuationCapability::None,
+        }
+    }
+
     async fn generate(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
         match self.call(RouterRequest::Generate(request)).await? {
             RouterResponse::Generated(response) => response,
@@ -299,7 +311,7 @@ async fn handle(
         }
         RouterRequest::GenerateStream(_) => unreachable!(),
         RouterRequest::Providers => RouterResponse::Providers(crate::implemented_providers()),
-        RouterRequest::Models => RouterResponse::Models(load_models(&registry.root)),
+        RouterRequest::Models => RouterResponse::Models(load_models_locked(&registry).await),
         RouterRequest::RefreshModels { provider } => {
             RouterResponse::Models(refresh_models(&registry, provider.as_deref()).await)
         }
@@ -317,7 +329,7 @@ async fn handle(
         RouterRequest::RemoveAuth { provider } => {
             let removed = crate::AuthStore::remove(&registry.root, &provider).map_err(auth_error);
             if removed.is_ok() {
-                let _ = remove_cached_models(&registry.root, &provider);
+                let _ = remove_cached_models(&registry, &provider).await;
             }
             RouterResponse::Ack(removed)
         }
@@ -426,13 +438,6 @@ async fn refresh_models(
     registry: &ProviderRegistry,
     provider: Option<&str>,
 ) -> ProviderResult<Vec<ModelInfo>> {
-    let path = registry.root.join("models.json");
-    let mut catalog: ModelCatalog = if path.exists() {
-        serde_json::from_slice(&fs::read(&path).map_err(io_error)?)
-            .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?
-    } else {
-        ModelCatalog::default()
-    };
     let providers = if let Some(provider) = provider {
         vec![provider.to_owned()]
     } else {
@@ -444,19 +449,44 @@ async fn refresh_models(
             .collect()
     };
     let mut failures = Vec::new();
+    let mut discovered = Vec::new();
     for provider in providers {
         match registry.discover_models(&provider).await {
-            Ok(models) => {
-                catalog.providers.insert(provider, CachedModels { models });
-            }
+            Ok(models) => discovered.push((provider, models)),
             Err(error) => failures.push(error.to_string()),
         }
     }
-    save_catalog(&registry.root, &catalog)?;
+    update_catalog(registry, |catalog| {
+        for (provider, models) in discovered {
+            catalog.providers.insert(provider, CachedModels { models });
+        }
+    })
+    .await?;
     if !failures.is_empty() {
         return Err(ProviderError::Http(failures.join("; ")));
     }
+    load_models_locked(registry).await
+}
+
+async fn load_models_locked(registry: &ProviderRegistry) -> ProviderResult<Vec<ModelInfo>> {
+    let _guard = registry.catalog_lock.lock().await;
     load_models(&registry.root)
+}
+
+async fn update_catalog(
+    registry: &ProviderRegistry,
+    update: impl FnOnce(&mut ModelCatalog),
+) -> ProviderResult<()> {
+    let _guard = registry.catalog_lock.lock().await;
+    let path = registry.root.join("models.json");
+    let mut catalog = if path.exists() {
+        serde_json::from_slice(&fs::read(path).map_err(io_error)?)
+            .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?
+    } else {
+        ModelCatalog::default()
+    };
+    update(&mut catalog);
+    save_catalog(&registry.root, &catalog)
 }
 
 fn save_catalog(root: &Path, catalog: &ModelCatalog) -> ProviderResult<()> {
@@ -476,15 +506,11 @@ fn save_catalog(root: &Path, catalog: &ModelCatalog) -> ProviderResult<()> {
     Ok(())
 }
 
-fn remove_cached_models(root: &Path, provider: &str) -> ProviderResult<()> {
-    let path = root.join("models.json");
-    if !path.exists() {
-        return Ok(());
-    }
-    let mut catalog: ModelCatalog = serde_json::from_slice(&fs::read(path).map_err(io_error)?)
-        .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
-    catalog.providers.remove(provider);
-    save_catalog(root, &catalog)
+async fn remove_cached_models(registry: &ProviderRegistry, provider: &str) -> ProviderResult<()> {
+    update_catalog(registry, |catalog| {
+        catalog.providers.remove(provider);
+    })
+    .await
 }
 
 async fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> ProviderResult<()> {
@@ -574,6 +600,7 @@ mod tests {
                 system: String::new(),
                 messages: vec![],
                 tools: vec![],
+                continuation: None,
             })
             .await
             .unwrap();
@@ -590,6 +617,7 @@ mod tests {
                 system: String::new(),
                 messages: vec![],
                 tools: vec![],
+                continuation: None,
             })
             .await
             .unwrap()
@@ -602,7 +630,17 @@ mod tests {
             streamed,
             vec![
                 ModelStreamEvent::Start,
+                ModelStreamEvent::ResponseMetadata {
+                    provider: "test".into(),
+                    model: "test".into(),
+                    api: "test".into(),
+                    response_id: None,
+                },
                 ModelStreamEvent::TextDelta(" [test]".into()),
+                ModelStreamEvent::ResponseCompleted {
+                    usage: None,
+                    stop_reason: Some("stop".into())
+                },
                 ModelStreamEvent::Done,
             ]
         );
@@ -626,8 +664,8 @@ mod tests {
         assert!(validate_version(ROUTER_PROTOCOL_VERSION + 1).is_err());
     }
 
-    #[test]
-    fn cached_catalog_is_provider_scoped_and_survives_removal() {
+    #[tokio::test]
+    async fn cached_catalog_is_provider_scoped_and_survives_removal() {
         let root = tempfile::tempdir().unwrap();
         let catalog = ModelCatalog {
             providers: BTreeMap::from([
@@ -658,12 +696,48 @@ mod tests {
         save_catalog(root.path(), &catalog).unwrap();
         let serialized = std::fs::read_to_string(root.path().join("models.json")).unwrap();
         assert!(!serialized.contains("fetched_at"));
-        remove_cached_models(root.path(), "openai").unwrap();
+        let registry = ProviderRegistry::new(root.path().to_owned());
+        remove_cached_models(&registry, "openai").await.unwrap();
         let ids = load_models(root.path())
             .unwrap()
             .into_iter()
             .map(|model| model.id)
             .collect::<Vec<_>>();
         assert_eq!(ids, ["anthropic/test"]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_catalog_updates_preserve_each_provider() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ProviderRegistry::new(root.path().to_owned()));
+        let update = |provider: &'static str, registry: Arc<ProviderRegistry>| async move {
+            update_catalog(&registry, |catalog| {
+                catalog.providers.insert(
+                    provider.into(),
+                    CachedModels {
+                        models: vec![ModelInfo {
+                            id: format!("{provider}/test"),
+                            display_name: None,
+                            reasoning: vec![],
+                            default_reasoning: None,
+                        }],
+                    },
+                );
+            })
+            .await
+            .unwrap();
+        };
+        tokio::join!(
+            update("openai", Arc::clone(&registry)),
+            update("anthropic", Arc::clone(&registry))
+        );
+
+        let mut ids = load_models(root.path())
+            .unwrap()
+            .into_iter()
+            .map(|model| model.id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, ["anthropic/test", "openai/test"]);
     }
 }

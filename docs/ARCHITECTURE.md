@@ -10,6 +10,22 @@ An Agent is an immutable ID with a mutable slug and immutable revisions. Each re
 
 SQLite is the canonical store. It uses one clean schema, WAL, foreign keys, bounded metadata, one active Run per Session, and recovery records for interrupted Runs/tool calls. Agent folders are editable replicas. Synchronization compares their observed base revision, pushes valid edits through optimistic revision creation, and replaces pulled replicas by an atomic directory swap while retaining the previous directory for recovery.
 
+### Conversation authority and replay
+
+The Session transcript is the durable semantic center of MEWS. Every Harness writes the same typed entry vocabulary: user messages, Run lifecycle, rich assistant responses, tool lifecycle and results, visible reasoning, permissions, compaction, and opaque Harness observations. Contextual entries advance the Session leaf and participate in model replay; observational entries anchor to that leaf without entering model context. Streaming text/reasoning deltas remain transient delivery events and never become canonical transcript history.
+
+`runs` and ACP bindings are transactional current-state projections over that history. They retain the small indexes and constraints needed for one-active-Run enforcement, cancellation, crash recovery, idempotency, and external Session resume. The client event journal is a delivery outbox with a global sequence and consumer cursors; durable rows reference their producing transcript entry, while transient rows carry only live progress. These projections do not replace the transcript as the inspectable account of what happened.
+
+The native Harness maps provider and tool-loop events directly into typed transcript entries. ACP adapters normalize lossless common facts into the same entries and retain protocol-specific or incomplete facts as `HarnessObservation`; an ACP status-only tool completion, for example, is not fabricated into a semantic `ToolResult`. The ACP Session binding remains the external continuation authority, while the normalized transcript supplies portable user-visible history.
+
+The native `mews` Harness persists each provider invocation as one ordered rich assistant response. A response records provider/model/API provenance, an optional provider response ID, usage and stop reason, plus ordered visible-reasoning, text, tool-call, and opaque-state blocks. Signatures and encrypted or redacted provider state stay on their exact blocks. Visible reasoning is a separate typed block; opaque state is never presented as reasoning.
+
+The rich transcript is native continuation authority. Full canonical replay always works. OpenAI Responses may additionally use a response ID as an optimization cursor: MEWS selects the newest active-branch response with the same provider, model, and API, sends only the suffix after that anchor, and disables the cursor after branch movement or context compaction. A typed missing, expired, or incompatible cursor rejection permits exactly one retry with full replay. Timeout, disconnect, ambiguous transport failure, and any result that may have executed are never retried. Provider response IDs are attached to their producing response, never to a Session.
+
+Cross-provider or cross-model replay uses one portable projection: user text, final assistant text, tool calls without provider signatures, and necessary semantic tool outcomes. It strips response IDs, opaque/encrypted/redacted reasoning, signatures, raw provider state, and private metadata. ACP reconstruction and canonical ACP prompts use the same projection.
+
+`ContextCompaction` records a summary, the first retained entry ID, and pre-compaction token count. History is not deleted; the latest applicable compaction on the active branch deterministically supplies the summary plus its retained suffix and invalidates older response cursors.
+
 Successful file and replica replacement retains at most one MEWS-generated predecessor beside the active object. Database and credential backups use `<name>.previous-<uuid>`; Agent replicas use `.<slug>.previous-<uuid>`. Cleanup only matches those generated names.
 
 ## Extension boundaries
@@ -18,7 +34,7 @@ The public Rust interfaces are deliberately small:
 
 - `mews-protocol` owns stable IDs and data-transfer objects plus the versioned Hub/client and Hub/Host serialized contracts. It contains no storage, networking, or cryptographic key operations.
 - `mews-relay` owns relay admission verification, registration, bounded stateless routing, and its WebSocket client and server. It sees only opaque application ciphertext; MEWS retains relay lifecycle policy, persistence, and supervision.
-- `mews-client` connects only to the local MEWS daemon and exposes typed Hub operations. Its Channel runtime persists conversation-to-Session mappings, queues inbound messages per Session, and acknowledges durable outbound events after platform delivery.
+- `mews-client` connects only to the local MEWS daemon and exposes typed Hub operations. `mews-channel` is an optional standalone adapter runtime that persists conversation-to-Session mappings, queues inbound messages per Session, and routes subscribed Hub events to bounded per-conversation delivery lanes.
 - `mews-router` is a separately running local model gateway. It implements the `mews-agent` provider contract, deterministic `provider/model` dispatch, provider adapters, auth storage, OAuth refresh, and retries. Hub reaches it through an owner-only Unix socket and does not call provider adapters in-process.
 - `mews-agent` owns the complete provider-agnostic harness API: the streamed model/tool loop, schema validation, scheduling, steering/follow-ups, context transforms, cancellation, progress, lifecycle events, and the `AgentCapabilities` boundary for context, prompts, tools, and hooks. Its public `MessageQueue` supports reusable runtimes that implement steering/follow-ups; the MEWS composition root does not currently use that helper. It has no knowledge of Hub, concrete Hosts, SQLite, Sessions, or resource discovery.
 - `mews-runtime` composes Agent soul and environment context, adapts durable conversation storage, and connects `mews-agent` to a model provider and execution environment. It has no SQLite or concrete Host dependency.
@@ -35,23 +51,35 @@ The standalone binary exposes the client protocol over an owner-only Unix socket
 
 The runtime depends only on `AgentCapabilities`. Local and remote Hosts implement the same interface; transport, process execution, and filesystem location are invisible to the agent brain. The `mews` binary is the composition root that binds a durable Session to capabilities and a model provider.
 
-Channels are client implementations, not Hub plugins. A concrete channel implements the small `Channel` receive/send interface and delegates Session mapping, Run submission, replay, and delivery bookkeeping to `mews-client`. Channel credentials and platform state stay on the machine running that client.
+Channels are client implementations, not Hub plugins. A concrete channel implements the small `mews-channel` inbound/outbound interface and delegates Session mapping, Run submission, event routing, FIFO lanes, and bounded admission to that optional crate. Channel credentials and platform state stay on the machine running that client. Each standalone process configures its own worker and pending-delivery bounds; those defaults are deployment choices, not Hub protocol constants. A bundled process is only a deployment convenience and has the same boundary.
 
-Hub stores a checkpointed client event journal. Consumers subscribe to Sessions and long-poll through their local daemon using a stable `ConsumerId`. Assistant messages and terminal Run events are committed with Hub state; durable consumers acknowledge monotonically increasing checkpoints only after delivery, and rows are pruned after every relevant durable consumer passes them. Streaming deltas are transient and never retained beyond the relevant consumer floor. Unacknowledged durable events replay after reconnect. Delivery is at least once because no external messaging API and Hub transaction can commit atomically; local delivery receipts reduce duplicates across ordinary restarts.
+Hub stores a checkpointed client event journal. Consumers subscribe to Sessions and long-poll through their local daemon using a stable `ConsumerId`. Assistant responses, their delivery events, and the active Session leaf commit atomically. Channel consumers acknowledge a polled batch before admitting external delivery. A process crash after that acknowledgment may therefore lose the external copy intentionally; the canonical response remains in MEWS history. This best-effort ordering favors avoiding duplicate platform messages over preventing rare loss. Event polling is bounded by encoded bytes as well as count, and insertion rejects any single event that could not fit in a Hub frame. Streaming deltas are transient and never retained beyond the relevant consumer floor.
 
-`StartTurn` is idempotent, creates a durable Run, and returns immediately. Runs can be fetched, awaited, or cancelled. The typed client's synchronous `send_message` convenience is implemented by starting a Run and consuming its durable events. Run start, tool start/completion, assistant message, and terminal events share the journal. Channel clients can continue receiving platform traffic while a Run executes; their local durable queue serializes additional messages for the same Session.
+Each channel-originated Run durably records the standalone consumer identity and destination conversation that initiated it. That typed origin is projected onto completed, streaming, approval, and lifecycle events, so normal responses route only through the matching channel identity even when several channel processes subscribe to the same Session. Explicit broadcasts use a separate channel handle and enter each destination's ordinary FIFO lane. A destination key is the adapter-defined account/chat/thread conversation string; all messages and attachment batches for that key are serialized, while different keys may use the configurable worker pool concurrently. The pending-work bound includes queued, running, and delayed work. Empty lanes are removed.
+
+Adapters advertise only the capabilities they implement (currently streaming, edits, attachments, and typing) and subscribe only to the event families they consume (completed messages, streaming updates, approvals, and lifecycle events). Streaming subscriptions require streaming capability. The adapter owns platform rate limits, send timeouts, transient/permanent classification, retry counts, `Retry-After`, formatting, attachments, edits, and typing behavior. Its typed delivery outcome is delivered, retry after a chosen delay, or dropped. A delayed retry keeps its conversation lane blocked for FIFO but releases the generic worker slot. Terminal delivered receipts and dropped reasons are published through the channel handle's bounded in-process diagnostic stream; core neither persists them, invents retry policy, disables a channel, nor notifies an owner. Shutdown immediately cancels running sends and drops queued or delayed best-effort work; it does not promise draining.
+
+`StartTurn` is idempotent, creates a durable Run, and returns immediately. Channel turn keys are deterministically scoped by the stable channel consumer identity, destination conversation, and platform-local external message ID, so same-named adapters and shared Sessions cannot collapse distinct inputs. Runs can be fetched, awaited, or cancelled. The typed client's synchronous `send_message` convenience is implemented by starting a Run and consuming its durable events. Run start, tool start/completion, assistant message, and terminal events share the journal. Channel clients can continue receiving platform traffic while a Run executes; their local durable queue serializes additional messages for the same Session.
 
 Each external MEWS Session owns one durable ACP Session binding on its selected
-Host. New bindings are acknowledged by the Hub before the first prompt executes;
-later Runs resume that native Session and submit the current user turn in the
-standard MEWS identity wrapper. Only the
+Host. New bindings persist a versioned, hash-addressed MEWS context snapshot and
+are acknowledged by the Hub before the first prompt executes; later compatible
+Runs resume that native Session and submit only the current user turn. Managed
+Codex and Claude recipes deliver the initial context through their private
+instruction channels; unknown adapters receive a one-time first-prompt envelope.
+For those adapters, the Hub durably records and acknowledges context dispatch
+immediately before the Host sends the first prompt. Once that irreversible boundary
+is crossed, the binding is resumable even when the prompt outcome is ambiguous.
+Only the
 typed ACP `resource_not_found` error permits silent reconstruction from canonical
 MEWS history. Timeouts, disconnects, crashes, and other ambiguous failures never
 retry the prompt or replace the binding.
 
-The client reconnects automatically only for reads and explicitly idempotent operations; it reports an unknown outcome instead of blindly replaying unsafe mutations. A Channel state file is protected by an exclusive process lock, preventing two instances from consuming the same identity. On restart the runtime reconciles recorded active Runs with Hub. Outbound failures use bounded exponential retry and are moved to the local dead-letter table after exhaustion so later Hub events are not permanently blocked.
+ACP and native continuation remain deliberately distinct. An ACP Session ID is required continuation authority and stays in `acp_session_bindings`; provider response IDs hidden behind an ACP adapter remain invisible. Live ACP reasoning deltas are transient client events. MEWS durably stores at most one bounded completed semantic reasoning observation per provider item/message when visible, with explicit visible/redacted/omitted semantics, rather than retaining an unbounded delta log.
 
-A location-aware client supplies its canonicalizable working directory and therefore runs on the Host carrying that client connection. A locationless adapter omits the directory; Hub then selects the Hub Host and that OS user's home directory. Subsequent turns follow the Session's permanent Host binding.
+The client reconnects automatically only for reads and explicitly idempotent operations; it reports an unknown outcome instead of blindly replaying unsafe mutations. A Channel state file is protected by an exclusive process lock, preventing two instances from consuming the same identity. On restart the runtime reconciles recorded active Runs with Hub. Outbound delivery receipts, universal retries, and dead letters are deliberately not persisted; an adapter that returns a delayed retry owns whether another attempt should occur.
+
+A location-aware client supplies its canonicalizable working directory and therefore runs on the Host carrying that client connection. A locationless adapter omits the directory; Hub then selects the Hub Host and that OS user's home directory. Subsequent turns follow the Session's permanent Host binding. Remote tool calls are request-correlated; dropping or cancelling an in-flight request sends a Host cancellation that terminates the registered execution token and, for shell tools, its isolated process group.
 
 `agent.toml` selects an explicit logical Harness and its opaque Harness-owned options, a tool allowlist, and `tool_execution = "parallel" | "sequential"` (parallel by default). The allowlist applies to every tool exposed to the Harness, including the native `read`, `write`, `edit`, and `bash` tools. The native `mews` Harness owns its `model` and `reasoning` options; external Harnesses own their own selectors. A Session never silently changes Host and never falls back when its Host is offline.
 
@@ -73,9 +101,11 @@ schema = { type = "object", properties = { id = { type = "string" } }, required 
 The executable starts in the Session cwd, reads one JSON argument value from stdin, and must write one JSON result value to stdout. Exit failure, invalid JSON, timeout, and output limits become tool errors. The Host daemon rescans manifests and publishes catalog changes without a restart. Extensions run with the Host user's full authority and are therefore trusted Host configuration.
 
 For the native `mews` Harness, Skills use the Agent Skills layout and are
-discovered from `<MEWS_HOME>/skills/` plus `.agents/skills/` in the Session
-working directory and its ancestors. Only name, description, and `SKILL.md`
-path enter the system prompt; the Agent reads the full skill on demand. Prompt
+discovered from `<MEWS_HOME>/agents/<agent-slug>/skills/` plus `.agents/skills/`
+in the Session working directory and its ancestors. Project Skills override
+same-named Agent Skills. Skills are Host-local mutable resources outside Agent
+revisions. Only name, description, and `SKILL.md` path enter the system prompt;
+the Agent reads the full skill on demand. Prompt
 templates are discovered from `<MEWS_HOME>/prompts/` and ancestor
 `.agents/prompts/`. Sending `/name args` expands the matching Markdown template
 and replaces `$ARGUMENTS` with `args` before any Harness runs.
@@ -100,10 +130,12 @@ any other value replaces it for the next handler. `before_tool` may return
 `{ "block": "reason" }` or replace `name`/`arguments`; `after_tool` may
 replace `result`/`is_error`; `before_model` returns the model request. Extension
 files and registered tools hot-reload with the Host catalog. Native `mews` runs
-invoke these lifecycle hooks. ACP Harnesses currently receive extension tools
-through the run-scoped MCP bridge, but do not invoke lifecycle hooks or receive
-the Skill inventory. TODO: explore passing Skills and lifecycle hooks to ACP
-Harnesses. Like Pi extensions, they are unsandboxed and may modify MEWS itself
+invoke these lifecycle hooks. ACP Harnesses receive selected-Agent skill
+snapshots only through `mews_list_skills` and `mews_read_skill` on their
+run-scoped MCP bridge; project/global skills and filesystem paths are never
+exposed. ACP runs invoke run/model/turn lifecycle boundaries, and extension MCP
+calls are subject to `before_tool`/`after_tool` validation; provider-owned tools
+remain only observable ACP activity. Like Pi extensions, they are unsandboxed and may modify MEWS itself
 with the Host user's authority.
 
 ## Remote protocol
@@ -112,7 +144,7 @@ Enrollment offers are signed, expire after 15 minutes, and contain a single-use 
 
 The relay is stateless. It authenticates authority-scoped peer admission and proof of possession, enforces connection/frame/queue bounds, and routes opaque frames. Hub and Host then perform Noise XX, bind protocol version, roles, installation, peer IDs, stream ID, static Noise keys, and Ed25519 identities into the authenticated transcript, and encrypt all application data end to end. Encrypted messages are ordered and fragmented into bounded records. Thirty-second encrypted heartbeats preserve idle links; both sides reconnect, and Hub reconstructs per-Host listeners from SQLite after restart.
 
-Host frames are versioned and capped at 256 KiB. Client frames are capped at 1 MiB. Project context is capped at 192 KiB in aggregate, individual context/tool outputs are bounded, relay registration has a deadline, and relay connections/queues are bounded.
+Host frames are versioned and capped at 256 KiB. Project context uses up to 192 KiB, reserving 64 KiB for its request envelope, Agent configuration, tools, and metadata. Client frames are capped at 1 MiB; paginated transcript and event bodies reserve 256 KiB for their serialized response envelope. Individual context/tool outputs are bounded, relay registration has a deadline, and relay connections/queues are bounded.
 
 Hub setup supervises a bundled relay on `0.0.0.0:8787` by default and advertises a `.local` address derived from the configured Host name. LAN and private-overlay deployments may use `ws://` because Hub/Host application frames remain authenticated and end-to-end encrypted. Public relay deployment should advertise `wss://` and supply `--relay-listen`; the bundled relay serves plain WebSocket and expects TLS termination by a reverse proxy.
 
@@ -125,6 +157,8 @@ Hub advances the generation with a compare-and-set, creates a consistent SQLite 
 Failures before activation roll the source forward to a newer generation. During activation, a durable source recovery coordinator restarts fenced, reconnects only the target, and retries arm/activate before demoting. Once activation is armed, the source favors single-writer safety over availability if the final acknowledgment is lost. Successful demotion removes the old database, installation authority, provider credentials, and Hub Noise secret, then reconnects the same physical identity as a normal Host. Its relay retires after a migration grace period: 10 minutes when every enrolled remote Host acknowledged the replacement candidates, or 10 days otherwise. Moving back is the same protocol and is covered by the public end-to-end test.
 
 ## Operations and security boundary
+
+The development persistence schema is intentionally breaking and has no migrations or legacy decoder. After pulling this redesign, stop MEWS and clear `~/.mews/` before real local testing.
 
 State directories are mode `0700`; identities, provider credentials, sockets, state files, and databases are owner-only. When the router first creates `auth.json`, it imports supported provider variables visible in the router process's environment; an installed launchd or systemd service does not inherit the shell that invoked setup, so interactive provider commands are the reliable configuration path. The resulting file participates in Hub movement. Identity loading rejects symlinks and permissive modes. Tools deliberately execute with the Host OS user's authority—MEWS does not claim to be a sandbox. A channel adapter must treat user IDs and metadata as untrusted input, and a public relay should be rate-limited and TLS-terminated at the edge.
 
@@ -147,7 +181,7 @@ mews hosts invite --relay …  Create one enrollment offer
 mews hosts remove <host>     Revoke and remove a Host
 mews harnesses list          Inspect live Host Harness catalogs
 mews harnesses refresh       Refresh Host-local Harness discovery
-mews harnesses setup <name>  Install, authenticate, and probe one local managed Harness
+mews harnesses setup [name]  Choose Harnesses interactively, or set up one by name
 mews providers status             List configured provider credentials
 mews providers login              Select a provider and authenticate
 mews providers set-key [provider] Add or rotate an API key

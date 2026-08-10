@@ -122,8 +122,8 @@ pub enum HarnessesCommand {
     List,
     /// Refresh Harness discovery on every connected Host
     Refresh,
-    /// Prepare this Host's isolated profile for a trusted Harness definition
-    Setup { name: String },
+    /// Choose and set up additional Harnesses on this Host
+    Setup { name: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -162,7 +162,7 @@ pub enum ProviderModelsCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command};
+    use super::{Cli, Command, HarnessesCommand};
     use clap::{CommandFactory, Parser};
 
     #[test]
@@ -219,5 +219,25 @@ mod tests {
         assert!(
             matches!(explicit.command, Some(Command::Setup { name: Some(name), .. }) if name == "mini-pc")
         );
+    }
+
+    #[test]
+    fn harness_setup_supports_the_wizard_and_named_shortcut() {
+        assert!(matches!(
+            Cli::try_parse_from(["mews", "harnesses", "setup"])
+                .unwrap()
+                .command,
+            Some(Command::Harnesses {
+                command: Some(HarnessesCommand::Setup { name: None })
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["mews", "harnesses", "setup", "codex"])
+                .unwrap()
+                .command,
+            Some(Command::Harnesses {
+                command: Some(HarnessesCommand::Setup { name: Some(name) })
+            }) if name == "codex"
+        ));
     }
 }

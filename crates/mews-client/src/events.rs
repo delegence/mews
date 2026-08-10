@@ -51,7 +51,7 @@ impl MewsClient {
             let mut permissions = Vec::new();
             for event in &batch.events {
                 match &event.kind {
-                    mews_protocol::ClientEventKind::AssistantMessage { message }
+                    mews_protocol::ClientEventKind::AssistantMessage { message, .. }
                         if message.session_id == session_id =>
                     {
                         if let mews_protocol::MessageContent::Text { text } = &message.content {

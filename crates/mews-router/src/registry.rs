@@ -29,6 +29,7 @@ enum Adapter {
 
 pub(crate) struct ProviderRegistry {
     pub(crate) root: PathBuf,
+    pub(crate) catalog_lock: tokio::sync::Mutex<()>,
     client: Client,
     adapters: BTreeMap<&'static str, Adapter>,
 }
@@ -46,6 +47,7 @@ impl ProviderRegistry {
         }
         Self {
             root,
+            catalog_lock: tokio::sync::Mutex::new(()),
             client: Client::new(),
             adapters,
         }
@@ -103,6 +105,18 @@ pub(crate) fn test_model() -> ModelInfo {
 
 #[async_trait]
 impl Provider for ProviderRegistry {
+    fn continuation_capability(&self, model: &str) -> mews_agent::ContinuationCapability {
+        match model.split_once('/').map(|(provider, _)| provider) {
+            Some(provider @ ("openai" | "openai-codex")) => {
+                mews_agent::ContinuationCapability::ResponseId {
+                    provider: provider.into(),
+                    api: "responses".into(),
+                }
+            }
+            _ => mews_agent::ContinuationCapability::None,
+        }
+    }
+
     async fn generate(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
         let prefix = if request.model == "test" {
             "test".to_owned()
@@ -152,10 +166,21 @@ impl Provider for ProviderRegistry {
             return openai::stream(&self.client, &self.root, &prefix, request).await;
         }
         let response = self.generate(request).await?;
-        let mut events = vec![Ok(crate::ModelStreamEvent::Start)];
+        let mut events = vec![
+            Ok(crate::ModelStreamEvent::Start),
+            Ok(crate::ModelStreamEvent::ResponseMetadata {
+                provider: response.provider.clone(),
+                model: response.model.clone(),
+                api: response.api.clone(),
+                response_id: response.response_id.clone(),
+            }),
+        ];
         events.extend(response.parts.into_iter().map(|part| {
             Ok(match part {
                 ModelPart::Text { text } => crate::ModelStreamEvent::TextDelta(text),
+                ModelPart::Reasoning { text, signature } => {
+                    crate::ModelStreamEvent::Reasoning { text, signature }
+                }
                 ModelPart::ToolCall {
                     id,
                     name,
@@ -178,6 +203,10 @@ impl Provider for ProviderRegistry {
                 },
             })
         }));
+        events.push(Ok(crate::ModelStreamEvent::ResponseCompleted {
+            usage: response.usage,
+            stop_reason: response.stop_reason,
+        }));
         events.push(Ok(crate::ModelStreamEvent::Done));
         Ok(Box::pin(futures_util::stream::iter(events)))
     }
@@ -188,6 +217,12 @@ fn test_response(request: ModelRequest) -> ModelResponse {
         request.messages.last().map(|m| &m.content)
     {
         return ModelResponse {
+            provider: "test".into(),
+            model: request.model.clone(),
+            api: "test".into(),
+            response_id: None,
+            usage: None,
+            stop_reason: Some("stop".into()),
             parts: vec![ModelPart::Text {
                 text: result
                     .get("content")
@@ -210,6 +245,12 @@ fn test_response(request: ModelRequest) -> ModelResponse {
         .unwrap_or_default();
     if let Some(path) = prompt.strip_prefix("test:read ") {
         return ModelResponse {
+            provider: "test".into(),
+            model: request.model.clone(),
+            api: "test".into(),
+            response_id: None,
+            usage: None,
+            stop_reason: Some("tool_call".into()),
             parts: vec![ModelPart::ToolCall {
                 id: "test-call-1".into(),
                 name: "read".into(),
@@ -219,6 +260,12 @@ fn test_response(request: ModelRequest) -> ModelResponse {
         };
     }
     ModelResponse {
+        provider: "test".into(),
+        model: request.model.clone(),
+        api: "test".into(),
+        response_id: None,
+        usage: None,
+        stop_reason: Some("stop".into()),
         parts: vec![ModelPart::Text {
             text: format!("{prompt} [{}]", request.model),
         }],
@@ -247,6 +294,7 @@ mod tests {
                     },
                 }],
                 tools: Vec::new(),
+                continuation: None,
             })
             .await
             .unwrap();
@@ -265,6 +313,7 @@ mod tests {
                 system: String::new(),
                 messages: vec![],
                 tools: vec![],
+                continuation: None,
             })
             .await;
         assert!(matches!(result, Err(ProviderError::InvalidRequest(_))));
@@ -306,6 +355,7 @@ mod tests {
                     },
                 }],
                 tools: vec![],
+                continuation: None,
             })
             .await
             .unwrap();

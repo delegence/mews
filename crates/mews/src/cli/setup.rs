@@ -1,14 +1,16 @@
 use std::{
     env,
-    fs::OpenOptions,
+    fs::{self, OpenOptions},
     io::IsTerminal,
     net::SocketAddr,
     path::Path,
     process::{Command, Stdio},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
+use console::style;
+use indicatif::{ProgressBar, ProgressStyle};
 use inquire::{MultiSelect, Password, Select, Text};
 use mews::{
     enrollment::JoinOffer,
@@ -26,6 +28,10 @@ use super::{
     },
     prompt,
 };
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct RestartFailure(String);
 
 pub async fn run(
     root: &Path,
@@ -83,7 +89,7 @@ pub async fn run(
     Ok(())
 }
 
-async fn offer_harness_setup(root: &Path, host_name: &str) -> Result<()> {
+pub(crate) async fn offer_harness_setup(root: &Path, host_name: &str) -> Result<()> {
     let choices = mews_host::HarnessCatalog::discover(Some(root))?
         .descriptors()
         .into_iter()
@@ -100,8 +106,11 @@ async fn offer_harness_setup(root: &Path, host_name: &str) -> Result<()> {
             (format!("{} — {state}", descriptor.name), descriptor.name)
         })
         .collect::<Vec<_>>();
-    println!("\nSet up Harnesses on {host_name}");
-    println!("✓ mews — built-in default Harness, ready");
+    println!("{} Set up Harnesses on {host_name}", style(">").green());
+    println!(
+        "  {} mews — built-in default Harness, ready",
+        style("✓").green()
+    );
     if choices.is_empty() {
         println!("\nNo additional supported Harnesses were detected.");
         println!("\nMEWS is ready!");
@@ -116,20 +125,30 @@ async fn offer_harness_setup(root: &Path, host_name: &str) -> Result<()> {
         .prompt(),
     )?
     .unwrap_or_default();
+    let mut changed_catalog = false;
     for selection in selected {
         let name = choices
             .iter()
             .find(|(label, _)| label == &selection)
             .map(|(_, name)| name)
             .expect("selected Harness exists");
-        println!("setting up {name} ...");
+        println!("  setting up {name} ...");
         match mews_host::HarnessCatalog::setup(root, name).await {
             Ok(setup) if setup.descriptor.availability.ready() => {
-                println!("✓ {name} is ready.");
+                println!("  {} {name} is ready.", style("✓").green());
+                changed_catalog = true;
             }
-            Ok(_) => println!("{name} needs authentication; rerun `mews harnesses setup {name}`."),
+            Ok(_) => {
+                changed_catalog = true;
+                println!("{name} needs authentication; rerun `mews harnesses setup {name}`.");
+            }
             Err(error) => eprintln!("{name} setup failed: {error:#}"),
         }
+    }
+    // Initial setup starts the Hub before this interactive install loop. Refresh
+    // its live Host catalog so the just-installed adapter is immediately usable.
+    if changed_catalog && let Ok(mut client) = MewsClient::connect(root).await {
+        client.refresh_harnesses().await?;
     }
     println!("\nMEWS is ready!");
     Ok(())
@@ -149,12 +168,14 @@ struct SetupOptions {
 
 fn prompt_options(root: &Path) -> Result<Option<SetupOptions>> {
     ensure_empty(root)?;
-    println!("Set up MEWS\n");
+    println!("---------\n M E W S\n---------\n\nSet up MEWS\n");
     let Some(action) = prompt(
         Select::new(
             "What would you like to do?",
             vec!["Create a new MEWS", "Join an existing MEWS"],
         )
+        .without_filtering()
+        .with_help_message("↑↓ to move, Enter to select")
         .prompt(),
     )?
     else {
@@ -180,6 +201,7 @@ fn prompt_options(root: &Path) -> Result<Option<SetupOptions>> {
     let Some(name) = prompt(
         Text::new("Name this machine")
             .with_default(&default_name)
+            .with_help_message("Press Enter to use the default")
             .prompt(),
     )?
     else {
@@ -343,8 +365,133 @@ async fn spawn_and_wait(root: &Path, log_name: &str, args: &[&str], name: &str) 
     )
 }
 
-pub(super) async fn wait_for_hub(root: &Path) -> Result<()> {
-    wait_for_hub_ready(root, true).await
+pub(super) async fn restart(root: &Path) -> Result<()> {
+    let started = Instant::now();
+    println!("Restarting MEWS...\n");
+
+    let progress = spinner("Restarting daemon");
+    mews::daemon::restart()?;
+    finish_progress(progress, "\u{2713} Daemon ready");
+
+    let progress = spinner("Waiting for Hub");
+    let (mut client, installation) = match connect_to_hub(root).await {
+        Ok(ready) => ready,
+        Err(last_error) => {
+            progress.abandon();
+            return Err(RestartFailure(restart_failure(root, &last_error)).into());
+        }
+    };
+    let hosts = client.hosts().await.unwrap_or_default();
+    let hub = hosts
+        .iter()
+        .find(|status| status.host.id == installation.hub_host_id)
+        .map(|status| status.host.name.clone())
+        .unwrap_or_else(|| installation.hub_host_id.to_string());
+    finish_progress(progress, format!("\u{2713} Hub {hub} ready"));
+
+    let progress = spinner("Connecting to Hosts");
+    let connected_hosts = hosts.iter().filter(|status| status.connected).count();
+    finish_progress(
+        progress,
+        format!("\u{2713} Hosts {connected_hosts}/{} connected", hosts.len()),
+    );
+
+    let progress = spinner("Checking Harnesses");
+    let mut harnesses = client
+        .harnesses()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|status| {
+            status.host.id == installation.hub_host_id && status.descriptor.availability.ready()
+        })
+        .map(|status| status.descriptor.name)
+        .collect::<Vec<_>>();
+    harnesses.sort();
+    harnesses.dedup();
+    finish_progress(
+        progress,
+        format!(
+            "\u{2713} Harnesses {} available on this host",
+            harnesses.len()
+        ),
+    );
+
+    let progress = spinner("Checking Agents");
+    let agents = client
+        .agents()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|agent| !agent.archived)
+        .count();
+    finish_progress(progress, format!("\u{2713} Agents {agents} available"));
+
+    println!("\nMEWS is ready in {}ms.", started.elapsed().as_millis());
+    Ok(())
+}
+
+fn spinner(message: &'static str) -> ProgressBar {
+    let progress = ProgressBar::new_spinner();
+    progress.set_style(
+        ProgressStyle::with_template("{spinner} {msg}")
+            .expect("static spinner template is valid")
+            .tick_strings(&[
+                "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}",
+                "\u{2827}", "\u{2807}", "\u{280f}",
+            ]),
+    );
+    progress.set_message(message);
+    progress.enable_steady_tick(Duration::from_millis(80));
+    progress
+}
+
+fn finish_progress(progress: ProgressBar, message: impl Into<String>) {
+    let message = message.into();
+    if std::io::stderr().is_terminal() {
+        progress.finish_with_message(message);
+    } else {
+        progress.finish_and_clear();
+        println!("{message}");
+    }
+}
+
+async fn connect_to_hub(
+    root: &Path,
+) -> std::result::Result<(MewsClient, mews_protocol::Installation), String> {
+    let mut last_error = "Hub did not respond".to_owned();
+    for _ in 0..200 {
+        match MewsClient::connect(root).await {
+            Ok(mut client) => match client.status().await {
+                Ok(installation) => return Ok((client, installation)),
+                Err(error) => last_error = format!("{error:#}"),
+            },
+            Err(error) => last_error = format!("{error:#}"),
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    Err(last_error)
+}
+
+fn restart_failure(root: &Path, last_error: &str) -> String {
+    let socket = mews::hub::socket_path(root);
+    let log = mews::paths::log(root, "daemon.log");
+    let logged_error = fs::read_to_string(&log)
+        .ok()
+        .and_then(|contents| {
+            contents
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| last_error.to_owned());
+    format!(
+        "MEWS failed to restart\n\nDaemon restarted\nHub unavailable after 5s\nSocket: {}\nLog: {}\n\nLast error:\n{}",
+        socket.display(),
+        log.display(),
+        logged_error
+    )
 }
 
 async fn wait_for_hub_ready(root: &Path, announce: bool) -> Result<()> {
@@ -366,15 +513,41 @@ async fn wait_for_hub_ready(root: &Path, announce: bool) -> Result<()> {
 }
 
 async fn print_hub_ready(client: &mut MewsClient, installation: &mews_protocol::Installation) {
-    let name = match client.hosts().await {
-        Ok(hosts) => hosts
-            .into_iter()
-            .find(|status| status.host.id == installation.hub_host_id)
-            .map(|status| status.host.name),
-        Err(_) => None,
-    };
+    let hosts = client.hosts().await.unwrap_or_default();
+    let hub = hosts
+        .iter()
+        .find(|status| status.host.id == installation.hub_host_id)
+        .map(|status| status.host.name.clone())
+        .unwrap_or_else(|| installation.hub_host_id.to_string());
+    let connected_hosts = hosts.iter().filter(|status| status.connected).count();
+    let agents = client
+        .agents()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|agent| !agent.archived)
+        .count();
+    let mut harnesses = client
+        .harnesses()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|status| status.descriptor.availability.ready())
+        .map(|status| status.descriptor.name)
+        .collect::<Vec<_>>();
+    harnesses.sort();
+    harnesses.dedup();
+
+    println!("\nMEWS is ready.");
+    println!("Hub: {hub}");
+    println!("Hosts: {connected_hosts}/{} available", hosts.len());
+    println!("Agents: {agents} available");
     println!(
-        "MEWS is ready. Hub Host: {}",
-        name.unwrap_or_else(|| installation.hub_host_id.to_string())
+        "Harnesses: {}",
+        if harnesses.is_empty() {
+            "none ready".into()
+        } else {
+            harnesses.join(", ")
+        }
     );
 }

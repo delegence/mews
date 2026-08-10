@@ -35,6 +35,24 @@ mod tests {
     }
 
     #[test]
+    fn acp_event_key_round_trips_over_host_protocol() {
+        let request_id = RequestId::new();
+        let event = HostToHub::AcpEvent {
+            request_id: request_id.clone(),
+            event: AcpEvent::AssistantDelta {
+                event_key: "run-1:update-2".into(),
+                delta: "ha".into(),
+                message_id: None,
+                raw: serde_json::Value::Null,
+            },
+        };
+        let decoded: HostToHub = decode(&encode(event).unwrap()).unwrap();
+        assert!(
+            matches!(decoded, HostToHub::AcpEvent { request_id: id, event: AcpEvent::AssistantDelta { event_key, .. } } if id == request_id && event_key == "run-1:update-2")
+        );
+    }
+
+    #[test]
     fn remote_acp_request_round_trips_with_only_portable_launch_input() {
         let request_id = RequestId::new();
         let cwd = std::env::current_dir().unwrap();
@@ -50,7 +68,19 @@ mod tests {
                 canonical_cwd: cwd.clone(),
                 prompt: "canonical conversation".into(),
                 recovery_prompt: "recovery conversation".into(),
-                acp_session_id: Some("session-1".into()),
+                agent_slug: "fixture-agent".into(),
+                soul: "fixture soul".into(),
+                mews_session_id: "session-fixture".into(),
+                run_id: "run-fixture".into(),
+                transition: AcpBindingTransition::Resume {
+                    acp_session_id: "session-1".into(),
+                },
+                context: Some(AcpBindingContext {
+                    version: ACP_CONTEXT_VERSION,
+                    hash: "a".repeat(64),
+                    channel: AcpInstructionChannel::FirstPrompt,
+                    text: "fixture context".into(),
+                }),
             })
             .unwrap(),
         )

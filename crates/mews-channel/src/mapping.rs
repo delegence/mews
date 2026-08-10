@@ -29,10 +29,6 @@ impl MappingStore {
                  conversation TEXT PRIMARY KEY,
                  session_id TEXT NOT NULL UNIQUE
              );
-             CREATE TABLE IF NOT EXISTS deliveries (
-                 event_id TEXT PRIMARY KEY,
-                 external_id TEXT
-             );
              CREATE TABLE IF NOT EXISTS pending (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  external_id TEXT NOT NULL,
@@ -44,13 +40,6 @@ impl MappingStore {
              CREATE TABLE IF NOT EXISTS active_runs (
                  session_id TEXT PRIMARY KEY,
                  run_id TEXT NOT NULL UNIQUE
-             );
-             CREATE TABLE IF NOT EXISTS dead_letters (
-                 event_id TEXT PRIMARY KEY,
-                 conversation TEXT NOT NULL,
-                 text TEXT NOT NULL,
-                 error TEXT NOT NULL,
-                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
              );",
         )?;
         Ok(Self(connection, lock))
@@ -124,22 +113,6 @@ impl MappingStore {
                 Ok((conversation, session.parse().map_err(anyhow::Error::msg)?))
             })
             .collect()
-    }
-
-    pub(crate) fn delivered(&self, event_id: &str) -> Result<bool> {
-        Ok(self.0.query_row(
-            "SELECT EXISTS(SELECT 1 FROM deliveries WHERE event_id = ?1)",
-            [event_id],
-            |row| row.get(0),
-        )?)
-    }
-
-    pub(crate) fn record_delivery(&self, event_id: &str, external_id: Option<&str>) -> Result<()> {
-        self.0.execute(
-            "INSERT OR IGNORE INTO deliveries (event_id, external_id) VALUES (?1, ?2)",
-            params![event_id, external_id],
-        )?;
-        Ok(())
     }
 
     pub(crate) fn enqueue(
@@ -223,20 +196,6 @@ impl MappingStore {
             .map(|(session, run)| Ok((session.parse().map_err(anyhow::Error::msg)?, run)))
             .collect()
     }
-
-    pub(crate) fn dead_letter(
-        &self,
-        event_id: &str,
-        conversation: &str,
-        text: &str,
-        error: &str,
-    ) -> Result<()> {
-        self.0.execute(
-            "INSERT OR REPLACE INTO dead_letters (event_id, conversation, text, error) VALUES (?1, ?2, ?3, ?4)",
-            params![event_id, conversation, text, error],
-        )?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -270,24 +229,11 @@ mod tests {
         let (pending, _, text, _) = store.next(&session).unwrap().unwrap();
         assert_eq!(text, "hello");
         store.mark_started(pending, &session, "run-1").unwrap();
-        store
-            .dead_letter("event-failed", "chat:thread", "answer", "offline")
-            .unwrap();
-        store.record_delivery("event-1", Some("message-1")).unwrap();
-        assert!(store.delivered("event-1").unwrap());
         drop(store);
 
         let mut reopened = MappingStore::open(&path).unwrap();
         assert!(reopened.active(&session).unwrap());
         assert_eq!(reopened.next(&session).unwrap(), None);
-        assert_eq!(
-            reopened
-                .0
-                .query_row("SELECT COUNT(*) FROM dead_letters", [], |row| row
-                    .get::<_, u64>(0))
-                .unwrap(),
-            1
-        );
         assert_eq!(reopened.finish_run("run-1").unwrap(), Some(session));
     }
 

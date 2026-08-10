@@ -2,7 +2,7 @@ use crate::{CancellationToken, ProgressReporter, ToolCall, ToolProgress, ToolRes
 use anyhow::Result;
 use async_trait::async_trait;
 pub use mews_protocol::ToolExecutionMode;
-use mews_protocol::{ReasoningEffort, ToolDefinition};
+use mews_protocol::{AssistantResponse, ReasoningEffort, ToolDefinition};
 
 use crate::{ModelMessage, ModelRequest};
 
@@ -16,6 +16,7 @@ pub enum AgentEvent {
     AssistantStart,
     AssistantTextDelta(String),
     AssistantText(String),
+    AssistantResponse(AssistantResponse),
     ProviderState(ModelMessage),
     MessageInjected(ModelMessage),
     ToolCall(ToolCall),

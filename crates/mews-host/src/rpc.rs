@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use mews_agent::CancellationToken;
-use mews_protocol::{HostToHub, HubToHost};
+use mews_protocol::{HostToHub, HubToHost, MAX_PROJECT_CONTEXT_BYTES};
 use serde_json::Value;
 
 use crate::{ToolRegistry, context, resources};
@@ -12,12 +12,14 @@ use crate::{ToolRegistry, context, resources};
 pub async fn handle_execution_request(
     registry: &ToolRegistry,
     message: &HubToHost,
+    cancellation: Option<&CancellationToken>,
 ) -> Option<HostToHub> {
     Some(match message {
         HubToHost::ReadProjectContext {
             request_id,
+            agent_slug,
             canonical_cwd,
-        } => match project_context(registry.root(), canonical_cwd) {
+        } => match project_context(registry.root(), agent_slug, canonical_cwd) {
             Ok(context) => HostToHub::ProjectContext {
                 request_id: request_id.clone(),
                 context: Some(context),
@@ -79,13 +81,10 @@ pub async fn handle_execution_request(
                 if resolved != *canonical_cwd || !resolved.is_dir() {
                     bail!("Session working directory no longer resolves to its attested path");
                 }
+                let cancellation = cancellation
+                    .ok_or_else(|| anyhow::anyhow!("tool request has no cancellation scope"))?;
                 registry
-                    .execute(
-                        tool,
-                        arguments.clone(),
-                        &resolved,
-                        &CancellationToken::new(),
-                    )
+                    .execute(tool, arguments.clone(), &resolved, cancellation)
                     .await
             }
             .await;
@@ -99,6 +98,7 @@ pub async fn handle_execution_request(
                 error,
             }
         }
+        HubToHost::CancelTool { .. } => return None,
         HubToHost::ExecuteHook {
             request_id,
             hook,
@@ -110,8 +110,10 @@ pub async fn handle_execution_request(
                 if resolved != *canonical_cwd || !resolved.is_dir() {
                     bail!("Session working directory no longer resolves to its attested path");
                 }
+                let cancellation = cancellation
+                    .ok_or_else(|| anyhow::anyhow!("hook request has no cancellation scope"))?;
                 registry
-                    .execute_hooks(hook, payload.clone(), &resolved)
+                    .execute_hooks(hook, payload.clone(), &resolved, cancellation)
                     .await
             }
             .await;
@@ -132,7 +134,7 @@ pub async fn handle_execution_request(
     })
 }
 
-fn project_context(root: Option<&Path>, cwd: &Path) -> Result<String> {
+fn project_context(root: Option<&Path>, agent_slug: &str, cwd: &Path) -> Result<String> {
     let resolved = cwd.canonicalize()?;
     if resolved != cwd || !resolved.is_dir() {
         bail!("Session working directory no longer resolves to its attested path");
@@ -140,13 +142,13 @@ fn project_context(root: Option<&Path>, cwd: &Path) -> Result<String> {
     let mut output = String::new();
     for file in context::discover_agents_md(&resolved)? {
         let section = format!("\n\n# {}\n{}", file.path.display(), file.content);
-        if output.len() + section.len() > 192 * 1024 {
+        if output.len() + section.len() > MAX_PROJECT_CONTEXT_BYTES {
             bail!("combined AGENTS.md project context exceeds 192 KiB");
         }
         output.push_str(&section);
     }
-    let discovered = resources::prompt_context(root, &resolved)?;
-    if output.len() + discovered.len() > 192 * 1024 {
+    let discovered = resources::prompt_context(root, agent_slug, &resolved)?;
+    if output.len() + discovered.len() > MAX_PROJECT_CONTEXT_BYTES {
         bail!("combined project and resource context exceeds 192 KiB");
     }
     output.push_str(&discovered);

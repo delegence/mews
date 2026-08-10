@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use futures_util::StreamExt;
 use reqwest::{RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
@@ -10,52 +8,49 @@ const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 pub(crate) async fn send_with_retry(request: RequestBuilder) -> ProviderResult<Response> {
-    const ATTEMPTS: usize = 3;
-    for attempt in 0..ATTEMPTS {
-        let call = request.try_clone().ok_or_else(|| {
-            ProviderError::InvalidRequest("provider request body cannot be retried".into())
-        })?;
-        let response = match call.send().await {
-            Ok(response) => response,
-            Err(error) if attempt + 1 < ATTEMPTS && error.is_connect() => {
-                tokio::time::sleep(Duration::from_secs(1_u64 << attempt)).await;
-                continue;
-            }
-            Err(error) => return Err(ProviderError::Http(error.to_string())),
-        };
-        let status = response.status();
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok());
-        if status.is_success() {
-            return Ok(response);
-        }
-        let retryable = matches!(
-            status,
-            StatusCode::TOO_MANY_REQUESTS
-                | StatusCode::BAD_GATEWAY
-                | StatusCode::SERVICE_UNAVAILABLE
-                | StatusCode::GATEWAY_TIMEOUT
-        );
-        if retryable && attempt + 1 < ATTEMPTS {
-            let delay = retry_after.unwrap_or(1_u64 << attempt).min(30);
-            tokio::time::sleep(Duration::from_secs(delay)).await;
-            continue;
-        }
-        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-            return Err(ProviderError::Authentication(response_text(response).await));
-        }
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            return Err(ProviderError::RateLimited { retry_after });
-        }
-        return Err(ProviderError::Http(format!(
-            "HTTP {status}: {}",
-            response_text(response).await
-        )));
+    let response = request
+        .send()
+        .await
+        .map_err(|error| ProviderError::Http(error.to_string()))?;
+    let status = response.status();
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if status.is_success() {
+        return Ok(response);
     }
-    unreachable!("retry loop always returns")
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        return Err(ProviderError::Authentication(response_text(response).await));
+    }
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return Err(ProviderError::RateLimited { retry_after });
+    }
+    let body = response_text(response).await;
+    if matches!(status, StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND)
+        && definitive_cursor_rejection(&body)
+    {
+        return Err(ProviderError::CursorRejected(body));
+    }
+    Err(ProviderError::Http(format!("HTTP {status}: {body}")))
+}
+
+fn definitive_cursor_rejection(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    matches!(
+        value
+            .pointer("/error/code")
+            .and_then(serde_json::Value::as_str),
+        Some(
+            "previous_response_not_found"
+                | "response_not_found"
+                | "invalid_previous_response_id"
+                | "expired_response"
+        )
+    )
 }
 
 async fn response_text(response: Response) -> String {
@@ -97,6 +92,8 @@ async fn response_bytes_limited(response: Response, limit: usize) -> ProviderRes
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -106,31 +103,44 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn retries_rate_limits_and_returns_success() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let server_calls = calls.clone();
-        let server = tokio::spawn(async move {
-            for _ in 0..2 {
+    async fn ambiguous_http_responses_are_not_retried() {
+        for status in [429, 502, 503, 504] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let server_calls = calls.clone();
+            let server = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = [0_u8; 2048];
                 let _ = stream.read(&mut request).await.unwrap();
-                let call = server_calls.fetch_add(1, Ordering::SeqCst);
-                let response = if call == 0 {
-                    "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                } else {
-                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
-                };
+                server_calls.fetch_add(1, Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 {status} Error\r\nRetry-After: 7\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
                 stream.write_all(response.as_bytes()).await.unwrap();
-            }
-        });
-        let response = send_with_retry(reqwest::Client::new().get(format!("http://{address}")))
+            });
+
+            let error = send_with_retry(
+                reqwest::Client::new()
+                    .post(format!("http://{address}"))
+                    .body("work"),
+            )
             .await
-            .unwrap();
-        assert_eq!(response.text().await.unwrap(), "ok");
-        server.await.unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+            .unwrap_err();
+
+            if status == 429 {
+                assert!(matches!(
+                    error,
+                    ProviderError::RateLimited {
+                        retry_after: Some(7)
+                    }
+                ));
+            } else {
+                assert!(matches!(error, ProviderError::Http(_)));
+            }
+            server.await.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[tokio::test]

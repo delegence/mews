@@ -1,8 +1,7 @@
 use std::{fs, path::Path};
 
 use anyhow::{Context, Result, bail};
-
-const MAX_CONTEXT_BYTES: u64 = 192 * 1024;
+use mews_protocol::MAX_PROJECT_CONTEXT_BYTES;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextFile {
@@ -29,7 +28,7 @@ pub fn discover_agents_md(cwd: &Path) -> Result<Vec<ContextFile>> {
             );
         }
         total += metadata.len();
-        if total > MAX_CONTEXT_BYTES {
+        if total > MAX_PROJECT_CONTEXT_BYTES as u64 {
             bail!("combined AGENTS.md project context exceeds 192 KiB");
         }
         files.push(ContextFile {

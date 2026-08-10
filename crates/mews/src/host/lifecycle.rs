@@ -16,6 +16,15 @@ use mews_protocol::{
 };
 use mews_store::Store;
 
+const MAX_CONCURRENT_ACP_RUNS: usize = 8;
+
+fn acp_capacity() -> Arc<tokio::sync::Semaphore> {
+    static CAPACITY: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    Arc::clone(
+        CAPACITY.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ACP_RUNS))),
+    )
+}
+
 pub(crate) type AcpPermissionWaiters =
     Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<Option<String>>>>>;
 pub(crate) type AcpBindingWaiters = Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<()>>>>;
@@ -86,7 +95,21 @@ pub(crate) async fn handle_host_request(
     agent_root: Option<&Path>,
     message: HubToHost,
 ) -> HostToHub {
-    handle_host_request_streaming(registry, agent_root, message, None, None, None, None).await
+    let cancellation = matches!(
+        &message,
+        HubToHost::ExecuteTool { .. } | HubToHost::ExecuteHook { .. }
+    )
+    .then(mews_agent::CancellationToken::new);
+    handle_host_request_streaming(
+        registry,
+        agent_root,
+        message,
+        None,
+        None,
+        None,
+        cancellation,
+    )
+    .await
 }
 
 pub(crate) async fn handle_host_request_streaming(
@@ -98,7 +121,9 @@ pub(crate) async fn handle_host_request_streaming(
     binding_waiters: Option<AcpBindingWaiters>,
     cancellation: Option<mews_agent::CancellationToken>,
 ) -> HostToHub {
-    if let Some(response) = mews_host::handle_execution_request(registry, &message).await {
+    if let Some(response) =
+        mews_host::handle_execution_request(registry, &message, cancellation.as_ref()).await
+    {
         return response;
     }
     match message {
@@ -239,7 +264,12 @@ pub(crate) async fn handle_host_request_streaming(
             canonical_cwd,
             prompt,
             recovery_prompt,
-            acp_session_id,
+            agent_slug,
+            soul,
+            mews_session_id,
+            run_id,
+            transition,
+            context,
         } => {
             let cancellation = cancellation.unwrap_or_default();
             let result = async {
@@ -270,6 +300,30 @@ pub(crate) async fn handle_host_request_streaming(
                     }
                     catalog.launch(root, &harness)?
                 };
+                let skills = mews_host::resources::snapshot_agent_skills(root, &agent_slug)?;
+                match (transition.clone(), context) {
+                    (mews_protocol::AcpBindingTransition::Resume { .. }, Some(_)) => {}
+                    (mews_protocol::AcpBindingTransition::Resume { .. }, None) => bail!("compatible ACP Resume requires its stored context"),
+                    (mews_protocol::AcpBindingTransition::New | mews_protocol::AcpBindingTransition::Replace { .. }, Some(_)) => bail!("new or replacement ACP Session must not receive stored resume context"),
+                    (_, None) => {}
+                }
+                // This is intentionally rendered even for Resume: it is held
+                // unused on success, but is the fresh boundary for typed
+                // resource_not_found replacement.
+                let context = mews_protocol::AcpBindingContext::from_snapshot(
+                    &mews_protocol::AcpContextSnapshot {
+                        version: mews_protocol::ACP_CONTEXT_VERSION,
+                        agent_slug,
+                        soul,
+                        skills: skills.iter().map(|skill| mews_protocol::AcpSkillInventoryItem {
+                            name: skill.name.clone(), description: skill.description.clone(), hash: skill.hash.clone(),
+                        }).collect(),
+                    },
+                    launch.instruction_channel,
+                ).map_err(anyhow::Error::msg)?;
+                let skills = skills.into_iter().map(|skill| mews_acp::AcpSkill {
+                    name: skill.name, description: skill.description, hash: skill.hash, content: skill.content,
+                }).collect::<Vec<_>>();
                 let mut config = mews_acp::AcpHarnessConfig::new(launch.command)?;
                 config.environment = launch.environment;
                 if let (Some(events), Some(waiters)) = (events.clone(), permission_waiters.clone())
@@ -284,6 +338,12 @@ pub(crate) async fn handle_host_request_streaming(
                 // runtime. Run the capability bridge on its own current-thread
                 // runtime so Host extension implementations may retain their
                 // existing non-Send async boundary without widening authority.
+                // Each run needs a dedicated current-thread runtime (and may need
+                // an event-forwarding thread), so bound that OS resource explicitly.
+                let acp_permit = acp_capacity()
+                    .acquire_owned()
+                    .await
+                    .context("ACP execution capacity closed")?;
                 let (sender, receiver) = tokio::sync::oneshot::channel();
                 let registry = registry.clone();
                 let host_root = root.to_path_buf();
@@ -294,6 +354,7 @@ pub(crate) async fn handle_host_request_streaming(
                 std::thread::Builder::new()
                     .name("mews-acp-run".into())
                     .spawn(move || {
+                        let _acp_permit = acp_permit;
                         // ACP's stream callback is synchronous. A bounded sync
                         // handoff preserves backpressure without blocking the
                         // current-thread ACP runtime on Tokio's async sender.
@@ -329,17 +390,29 @@ pub(crate) async fn handle_host_request_streaming(
                                         canonical_cwd,
                                         harness_options,
                                         mews_acp::AcpSessionRequest {
+                                            transition,
                                             prompt,
                                             recovery_prompt,
-                                            session_id: acp_session_id,
+                                            context_text: context.text.clone(),
+                                            instruction_channel: context.channel,
+                                            skills,
+                                            hook_metadata: Some(mews_acp::AcpHookMetadata {
+                                                mews_session_id,
+                                                run_id,
+                                                harness: harness.clone(),
+                                                context_hash: context.hash.clone(),
+                                                context_channel: context.channel,
+                                                invoke_run_start: true,
+                                            }),
                                         },
                                         &environment,
                                         &tools,
                                         cancellation,
                                         &mut |event| {
                                             if let mews_acp::AcpStreamEvent::SessionBound {
+                                                event_key,
                                                 session_id,
-                                                replaced,
+                                                transition,
                                             } = event
                                             {
                                                 let acknowledgement_id = uuid::Uuid::now_v7().to_string();
@@ -351,9 +424,11 @@ pub(crate) async fn handle_host_request_streaming(
                                                     sender.send(HostToHub::AcpEvent {
                                                         request_id: event_request_id.clone(),
                                                         event: mews_protocol::AcpEvent::SessionBound {
+                                                            event_key,
                                                             acknowledgement_id: acknowledgement_id.clone(),
                                                             session_id,
-                                                            replaced,
+                                                            transition,
+                                                            context: context.clone(),
                                                         },
                                                     }).map_err(|_| anyhow::anyhow!("Hub disconnected during ACP run"))?;
                                                 }
@@ -368,40 +443,79 @@ pub(crate) async fn handle_host_request_streaming(
                                                 }
                                                 return Ok(());
                                             }
+                                            if let mews_acp::AcpStreamEvent::ContextDispatched {
+                                                event_key,
+                                                session_id,
+                                            } = event
+                                            {
+                                                let acknowledgement_id = uuid::Uuid::now_v7().to_string();
+                                                let (acknowledge, acknowledged) = std::sync::mpsc::channel();
+                                                if let Some(waiters) = &binding_waiters {
+                                                    waiters.lock().expect("ACP binding waiters poisoned").insert(acknowledgement_id.clone(), acknowledge);
+                                                }
+                                                if let Some(sender) = &callback_events {
+                                                    sender.send(HostToHub::AcpEvent {
+                                                        request_id: event_request_id.clone(),
+                                                        event: mews_protocol::AcpEvent::ContextDispatched {
+                                                            event_key,
+                                                            acknowledgement_id: acknowledgement_id.clone(),
+                                                            session_id,
+                                                        },
+                                                    }).map_err(|_| anyhow::anyhow!("Hub disconnected during ACP run"))?;
+                                                }
+                                                if binding_waiters.is_some() {
+                                                    let acknowledgement = acknowledged.recv_timeout(std::time::Duration::from_secs(30));
+                                                    if let Some(waiters) = &binding_waiters {
+                                                        waiters.lock().expect("ACP binding waiters poisoned").remove(&acknowledgement_id);
+                                                    }
+                                                    acknowledgement.map_err(|_| anyhow::anyhow!("Hub did not durably acknowledge the ACP context dispatch"))?;
+                                                }
+                                                return Ok(());
+                                            }
                                             let events = match event {
                                                 mews_acp::AcpStreamEvent::AssistantDelta {
+                                                    event_key,
                                                     delta,
                                                     message_id,
+                                                    raw,
                                                 } => split_stream_delta(&delta)
                                                     .into_iter()
-                                                    .map(|delta| {
+                                                    .enumerate()
+                                                    .map(|(index, delta)| {
                                                         mews_protocol::AcpEvent::AssistantDelta {
+                                                            event_key: format!("{event_key}:{index}"),
                                                             delta,
                                                             message_id: message_id.clone(),
+                                                            raw: raw.clone(),
                                                         }
                                                     })
                                                     .collect(),
-                                                mews_acp::AcpStreamEvent::ProviderState(
-                                                    data,
-                                                ) => vec![mews_protocol::AcpEvent::ProviderState {
+                                                mews_acp::AcpStreamEvent::ProviderState { event_key, data } => vec![mews_protocol::AcpEvent::ProviderState {
+                                                    event_key,
                                                     data,
                                                 }],
                                                 mews_acp::AcpStreamEvent::ReasoningDelta {
+                                                    event_key,
                                                     delta,
                                                     message_id,
+                                                    raw,
                                                 } => {
                                                     vec![mews_protocol::AcpEvent::ReasoningDelta {
+                                                        event_key,
                                                         delta,
                                                         message_id,
+                                                        raw,
                                                     }]
                                                 }
                                                 mews_acp::AcpStreamEvent::ToolActivity {
+                                                    event_key,
                                                     call_id,
                                                     title,
                                                     kind,
                                                     status,
                                                     input,
                                                 } => vec![mews_protocol::AcpEvent::ToolActivity {
+                                                    event_key,
                                                     activity: mews_protocol::ToolActivity {
                                                         call_id,
                                                         title,
@@ -410,6 +524,8 @@ pub(crate) async fn handle_host_request_streaming(
                                                         input,
                                                     },
                                                 }],
+                                                mews_acp::AcpStreamEvent::HookOutcome { event_key, hook, ok, detail, tool, call_id } => vec![mews_protocol::AcpEvent::HookOutcome { event_key, hook, ok, detail, tool, call_id }],
+                                                mews_acp::AcpStreamEvent::ContextDispatched { .. } => unreachable!(),
                                                 mews_acp::AcpStreamEvent::SessionBound { .. } => unreachable!(),
                                             };
                                             for event in events {
@@ -525,6 +641,10 @@ pub(crate) async fn handle_host_request_streaming(
             }
         }
         HubToHost::Ping { nonce } => HostToHub::Pong { nonce },
+        HubToHost::CancelTool { request_id } => HostToHub::ConfigurationResult {
+            request_id,
+            error: Some("tool cancellation reached the execution handler".into()),
+        },
     }
 }
 
@@ -964,12 +1084,21 @@ fn materialize_agent(
     let backup = if previous_directory.exists() {
         let backup = agents.join(format!(".{observed_slug}.previous-{unique}"));
         std::fs::rename(&previous_directory, &backup)?;
+        if backup.join("skills").exists()
+            && let Err(error) = std::fs::rename(backup.join("skills"), staged.join("skills"))
+        {
+            let _ = std::fs::rename(&backup, &previous_directory);
+            return Err(error.into());
+        }
         Some(backup)
     } else {
         None
     };
     if let Err(error) = std::fs::rename(&staged, &directory) {
         if let Some(backup) = &backup {
+            if staged.join("skills").exists() {
+                let _ = std::fs::rename(staged.join("skills"), backup.join("skills"));
+            }
             let _ = std::fs::rename(backup, &previous_directory);
         }
         return Err(error.into());

@@ -1,10 +1,13 @@
 use std::{io::IsTerminal, path::Path};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::CommandFactory;
 use mews_client::MewsClient;
 
-use super::command::{Cli, HarnessesCommand};
+use super::{
+    command::{Cli, HarnessesCommand},
+    setup,
+};
 
 pub async fn run(root: &Path, command: Option<HarnessesCommand>) -> Result<()> {
     let Some(command) = command else {
@@ -17,7 +20,16 @@ pub async fn run(root: &Path, command: Option<HarnessesCommand>) -> Result<()> {
         println!();
         return Ok(());
     };
-    if let HarnessesCommand::Setup { name } = command {
+    if let HarnessesCommand::Setup { name: None } = command {
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            bail!(
+                "`mews harnesses setup` requires an interactive terminal; use `mews harnesses setup <name>` instead"
+            );
+        }
+        setup::offer_harness_setup(root, "this Host").await?;
+        return Ok(());
+    }
+    if let HarnessesCommand::Setup { name: Some(name) } = command {
         let setup = mews_host::HarnessCatalog::setup(root, &name).await?;
         if let Some(profile) = setup.managed_profile {
             let action = if setup.profile_created {

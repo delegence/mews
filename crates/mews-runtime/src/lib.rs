@@ -20,13 +20,19 @@ pub use prompt::{canonical_prompt, initial_session_prompt};
 pub trait ConversationStore {
     fn begin_run(&self) -> Result<()>;
     fn finish_run(&self, error: Option<&str>) -> Result<()>;
-    fn history(&self) -> Result<Vec<ModelMessage>>;
+    fn history(&self, model: &str) -> Result<Vec<ModelMessage>>;
     fn append(&self, message: ModelMessage) -> Result<()>;
+    fn append_response(&self, response: mews_protocol::AssistantResponse) -> Result<()>;
+    fn tool_started(&self, call: ToolCall) -> Result<()>;
+    fn continuation(&self, _model: &str) -> Result<Option<mews_agent::ResponseContinuation>> {
+        Ok(None)
+    }
     fn assistant_delta(&self, delta: String) -> Result<()>;
 }
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
+    pub agent_slug: String,
     pub model: String,
     pub reasoning: Option<ReasoningEffort>,
     pub allowed_tools: Vec<String>,
@@ -42,6 +48,7 @@ pub struct HarnessRun<'a> {
     pub provider: &'a dyn Provider,
     pub environment: &'a dyn AgentCapabilities,
     pub store: &'a dyn ConversationStore,
+    pub agent_slug: String,
     pub agent: &'a AgentConfig,
     pub model_override: Option<String>,
     pub default_model: Option<String>,
@@ -79,6 +86,7 @@ impl Harness for MewsHarness {
             input.environment,
             input.store,
             RuntimeConfig {
+                agent_slug: input.agent_slug,
                 model,
                 reasoning: options.reasoning.or(if uses_installation_default {
                     input.default_reasoning
@@ -128,7 +136,7 @@ async fn run_mews(
 ) -> Result<HarnessOutcome> {
     store.begin_run()?;
     let outcome = async {
-        let context = environment.context(&config.cwd).await?;
+        let context = environment.context(&config.agent_slug, &config.cwd).await?;
         let runtime = MewsRuntime {
             environment,
             store,
@@ -190,7 +198,6 @@ impl MewsHarnessOptions {
 fn parse_reasoning(value: &str) -> Result<ReasoningEffort> {
     match value {
         "none" => Ok(ReasoningEffort::None),
-        "auto" => Ok(ReasoningEffort::Auto),
         "minimal" => Ok(ReasoningEffort::Minimal),
         "low" => Ok(ReasoningEffort::Low),
         "medium" => Ok(ReasoningEffort::Medium),
@@ -237,8 +244,9 @@ impl<E: AgentCapabilities + ?Sized> AgentRuntime for MewsRuntime<'_, E> {
             model: self.config.model.clone(),
             reasoning: self.config.reasoning,
             system,
-            messages: self.store.history()?,
+            messages: self.store.history(&self.config.model)?,
             tools,
+            continuation: self.store.continuation(&self.config.model)?,
         })
     }
 
@@ -276,25 +284,20 @@ impl<E: AgentCapabilities + ?Sized> AgentRuntime for MewsRuntime<'_, E> {
         };
         if let Some(hook) = hook {
             self.environment
-                .hook(hook, serde_json::json!({}), &self.config.cwd)
+                .hook(
+                    hook,
+                    serde_json::json!({}),
+                    &self.config.cwd,
+                    &self.config.cancellation,
+                )
                 .await?;
         }
         match event {
             AgentEvent::AssistantTextDelta(delta) => self.store.assistant_delta(delta)?,
-            AgentEvent::AssistantText(text) => self.store.append(ModelMessage {
-                role: MessageRole::Assistant,
-                content: MessageContent::Text { text },
-            })?,
+            AgentEvent::AssistantResponse(response) => self.store.append_response(response)?,
+            AgentEvent::AssistantText(_) => {}
             AgentEvent::ProviderState(message) => self.store.append(message)?,
-            AgentEvent::ToolCall(call) => self.store.append(ModelMessage {
-                role: MessageRole::Assistant,
-                content: MessageContent::ToolCall {
-                    call_id: call.id,
-                    tool: call.name,
-                    arguments: call.arguments,
-                    thought_signature: call.thought_signature,
-                },
-            })?,
+            AgentEvent::ToolCall(call) => self.store.tool_started(call)?,
             AgentEvent::ToolResult { call, result } => self.store.append(ModelMessage {
                 role: MessageRole::Tool,
                 content: MessageContent::ToolResult {
@@ -317,6 +320,7 @@ impl<E: AgentCapabilities + ?Sized> AgentRuntime for MewsRuntime<'_, E> {
                 LifecycleHook::BeforeModel,
                 serde_json::to_value(&*request)?,
                 &self.config.cwd,
+                &self.config.cancellation,
             )
             .await?;
         if !payload.is_null() {
@@ -332,6 +336,7 @@ impl<E: AgentCapabilities + ?Sized> AgentRuntime for MewsRuntime<'_, E> {
                 LifecycleHook::BeforeTool,
                 serde_json::to_value(&*call)?,
                 &self.config.cwd,
+                &self.config.cancellation,
             )
             .await?;
         if let Some(reason) = payload.get("block").and_then(Value::as_str) {
@@ -358,6 +363,7 @@ impl<E: AgentCapabilities + ?Sized> AgentRuntime for MewsRuntime<'_, E> {
                     "terminate": result.terminate,
                 }),
                 &self.config.cwd,
+                &self.config.cancellation,
             )
             .await?;
         if let Some(value) = payload.get("result") {
@@ -461,6 +467,11 @@ mod tests {
         let unknown =
             AgentConfig::parse("harness = \"mews\"\n[harness_options]\nmode = \"fast\"\n").unwrap();
         assert!(MewsHarnessOptions::from_agent(&unknown).is_err());
+
+        let auto =
+            AgentConfig::parse("harness = \"mews\"\n[harness_options]\nreasoning = \"auto\"\n")
+                .unwrap();
+        assert!(MewsHarnessOptions::from_agent(&auto).is_err());
     }
 
     struct SnapshotEnvironment {
@@ -470,7 +481,7 @@ mod tests {
 
     #[async_trait]
     impl AgentCapabilities for SnapshotEnvironment {
-        async fn context(&self, _: &std::path::Path) -> Result<ContextSnapshot> {
+        async fn context(&self, _: &str, _: &std::path::Path) -> Result<ContextSnapshot> {
             self.contexts.fetch_add(1, Ordering::SeqCst);
             Ok(ContextSnapshot {
                 documents: vec![ContextDocument {
@@ -506,6 +517,7 @@ mod tests {
             _: LifecycleHook,
             payload: Value,
             _: &std::path::Path,
+            _: &CancellationToken,
         ) -> Result<Value> {
             Ok(payload)
         }
@@ -521,11 +533,52 @@ mod tests {
         fn finish_run(&self, _: Option<&str>) -> Result<()> {
             Ok(())
         }
-        fn history(&self) -> Result<Vec<ModelMessage>> {
+        fn history(&self, _: &str) -> Result<Vec<ModelMessage>> {
             Ok(self.0.lock().unwrap().clone())
         }
         fn append(&self, message: ModelMessage) -> Result<()> {
             self.0.lock().unwrap().push(message);
+            Ok(())
+        }
+        fn append_response(&self, response: mews_protocol::AssistantResponse) -> Result<()> {
+            for block in response.blocks {
+                let content = match block {
+                    mews_protocol::AssistantResponseBlock::Text { text } => {
+                        Some(MessageContent::Text { text })
+                    }
+                    mews_protocol::AssistantResponseBlock::ToolCall {
+                        call_id,
+                        tool,
+                        arguments,
+                        thought_signature,
+                    } => Some(MessageContent::ToolCall {
+                        call_id,
+                        tool,
+                        arguments,
+                        thought_signature,
+                    }),
+                    mews_protocol::AssistantResponseBlock::OpaqueState {
+                        provider,
+                        model,
+                        data,
+                    } => Some(MessageContent::ProviderState {
+                        provider,
+                        model,
+                        data,
+                    }),
+                    mews_protocol::AssistantResponseBlock::Reasoning { .. } => None,
+                };
+                if let Some(content) = content {
+                    self.0.lock().unwrap().push(ModelMessage {
+                        role: MessageRole::Assistant,
+                        content,
+                    });
+                }
+            }
+            Ok(())
+        }
+
+        fn tool_started(&self, _call: ToolCall) -> Result<()> {
             Ok(())
         }
         fn assistant_delta(&self, _: String) -> Result<()> {
@@ -554,12 +607,20 @@ mod tests {
                         arguments: json!({}),
                         thought_signature: None,
                     },
+                    ModelStreamEvent::ResponseCompleted {
+                        usage: None,
+                        stop_reason: None,
+                    },
                     ModelStreamEvent::Done,
                 ]
             } else {
                 vec![
                     ModelStreamEvent::Start,
                     ModelStreamEvent::TextDelta("done".into()),
+                    ModelStreamEvent::ResponseCompleted {
+                        usage: None,
+                        stop_reason: None,
+                    },
                     ModelStreamEvent::Done,
                 ]
             };
@@ -580,6 +641,7 @@ mod tests {
             &environment,
             &MemoryStore::default(),
             RuntimeConfig {
+                agent_slug: "coder".into(),
                 model: "test/model".into(),
                 reasoning: None,
                 allowed_tools: vec!["*".into()],

@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, fmt, path::PathBuf, str::FromStr};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 // These types are persisted and sent over the wire. Development-state schema
@@ -176,6 +177,7 @@ pub struct ProviderDefaults {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionModelConfig {
+    pub harness: String,
     pub model: Option<String>,
     pub reasoning: Option<ReasoningEffort>,
 }
@@ -229,6 +231,103 @@ fn valid_name(value: &str) -> bool {
         })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acp_context_is_sorted_and_hashes_exact_rendering() {
+        let context = AcpContextSnapshot {
+            version: ACP_CONTEXT_VERSION,
+            agent_slug: "coder".into(),
+            soul: "Be useful.".into(),
+            skills: vec![
+                AcpSkillInventoryItem {
+                    name: "zeta".into(),
+                    description: "Z".into(),
+                    hash: "z".into(),
+                },
+                AcpSkillInventoryItem {
+                    name: "alpha".into(),
+                    description: "A".into(),
+                    hash: "a".into(),
+                },
+            ],
+        };
+        let rendered = context.render().unwrap();
+        assert!(rendered.find("alpha").unwrap() < rendered.find("zeta").unwrap());
+        assert_eq!(AcpContextSnapshot::hash_rendered(&rendered).len(), 64);
+        assert!(rendered.contains("mews_read_skill"));
+    }
+
+    #[test]
+    fn empty_acp_skill_context_does_not_advertise_skill_tools() {
+        let rendered = AcpContextSnapshot {
+            version: ACP_CONTEXT_VERSION,
+            agent_slug: "coder".into(),
+            soul: "Be useful.".into(),
+            skills: Vec::new(),
+        }
+        .render()
+        .unwrap();
+        assert!(!rendered.contains("mews_list_skills"));
+        assert!(!rendered.contains("mews_read_skill"));
+    }
+
+    #[test]
+    fn portable_projection_strips_private_native_state() {
+        let session_id = SessionId::new();
+        let entry = SessionEntry {
+            id: MessageId::new(),
+            session_id,
+            sequence: 1,
+            parent_id: None,
+            created_at: Utc::now(),
+            payload: SessionEntryPayload::AssistantResponse {
+                run_id: RunId::new(),
+                response: AssistantResponse {
+                    provider: "google".into(),
+                    model: "gemini".into(),
+                    api: "generate_content".into(),
+                    response_id: Some("private".into()),
+                    blocks: vec![
+                        AssistantResponseBlock::Reasoning {
+                            text: "secret thought".into(),
+                            signature: Some("sig".into()),
+                        },
+                        AssistantResponseBlock::Text {
+                            text: "answer".into(),
+                        },
+                        AssistantResponseBlock::ToolCall {
+                            call_id: "call".into(),
+                            tool: "read".into(),
+                            arguments: serde_json::json!({}),
+                            thought_signature: Some("thought-sig".into()),
+                        },
+                        AssistantResponseBlock::OpaqueState {
+                            provider: "google".into(),
+                            model: "gemini".into(),
+                            data: serde_json::json!({"secret":true}),
+                        },
+                    ],
+                    usage: None,
+                    stop_reason: None,
+                },
+            },
+        };
+        let projected = portable_history(&[entry]);
+        assert_eq!(projected.len(), 2);
+        assert!(matches!(&projected[0].content, MessageContent::Text { text } if text == "answer"));
+        assert!(matches!(
+            &projected[1].content,
+            MessageContent::ToolCall {
+                thought_signature: None,
+                ..
+            }
+        ));
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub id: SessionId,
@@ -237,6 +336,8 @@ pub struct Session {
     pub host_id: HostId,
     pub working_directory: PathBuf,
     pub model_override: Option<String>,
+    /// The contextual leaf used to reconstruct this Session's active history.
+    pub leaf_entry_id: Option<MessageId>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -247,8 +348,117 @@ pub struct AcpSessionBinding {
     pub harness: String,
     pub harness_definition_hash: String,
     pub acp_session_id: String,
+    pub context_version: u32,
+    pub context_hash: String,
+    pub context_channel: AcpInstructionChannel,
+    pub context_text: String,
+    /// A FirstPrompt binding exists before its context-bearing prompt is
+    /// dispatched, but is never eligible for resume until this is true.
+    pub context_dispatched: bool,
     pub created_at: DateTime<Utc>,
     pub replaced_at: Option<DateTime<Utc>>,
+    pub last_replacement_reason: Option<AcpReplacementReason>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpInstructionChannel {
+    CodexDeveloper,
+    ClaudeSystemAppend,
+    FirstPrompt,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpReplacementReason {
+    ResourceNotFound,
+    HarnessDefinitionChanged,
+    ContextNotDispatched,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum AcpBindingTransition {
+    New,
+    Resume { acp_session_id: String },
+    Replace { reason: AcpReplacementReason },
+}
+
+pub const ACP_CONTEXT_VERSION: u32 = 1;
+pub const MAX_ACP_CONTEXT_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpSkillInventoryItem {
+    pub name: String,
+    pub description: String,
+    pub hash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpContextSnapshot {
+    pub version: u32,
+    pub agent_slug: String,
+    pub soul: String,
+    pub skills: Vec<AcpSkillInventoryItem>,
+}
+
+/// The exact private instruction material attached to an ACP binding. The Hub
+/// stores this after the executing Host has rendered host-local skill inventory.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpBindingContext {
+    pub version: u32,
+    pub hash: String,
+    pub channel: AcpInstructionChannel,
+    pub text: String,
+}
+
+impl AcpBindingContext {
+    pub fn from_snapshot(
+        snapshot: &AcpContextSnapshot,
+        channel: AcpInstructionChannel,
+    ) -> Result<Self, String> {
+        let text = snapshot.render()?;
+        Ok(Self {
+            version: snapshot.version,
+            hash: AcpContextSnapshot::hash_rendered(&text),
+            channel,
+            text,
+        })
+    }
+}
+
+impl AcpContextSnapshot {
+    pub fn render(&self) -> Result<String, String> {
+        let mut skills = self.skills.clone();
+        skills.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut text = format!(
+            "<mews_context version=\"{}\">\n<agent slug={:?}>\n<soul>{}</soul>\n<skills>\n",
+            self.version, self.agent_slug, self.soul
+        );
+        for skill in skills {
+            text.push_str(&format!(
+                "<skill name={:?} description={:?} hash=\"{}\" />\n",
+                skill.name, skill.description, skill.hash
+            ));
+        }
+        text.push_str("</skills>\n");
+        // Do not advertise a capability when this selected agent has none.
+        // Some ACP adapters intentionally run without an MCP transport.
+        if !self.skills.is_empty() {
+            text.push_str(
+                "Read full selected-agent skill bodies only through mews_list_skills and mews_read_skill.\n",
+            );
+        }
+        text.push_str("</agent>\n</mews_context>");
+        if text.len() > MAX_ACP_CONTEXT_BYTES {
+            return Err("ACP context exceeds 64 KiB".into());
+        }
+        Ok(text)
+    }
+
+    pub fn hash_rendered(text: &str) -> String {
+        format!("{:x}", Sha256::digest(text.as_bytes()))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -389,6 +599,319 @@ pub struct Message {
     pub created_at: DateTime<Utc>,
 }
 
+/// One durable item in a Session timeline. This initial timeline stores only
+/// messages; future non-contextual entries can extend the payload enum.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionEntry {
+    pub id: MessageId,
+    pub session_id: SessionId,
+    pub sequence: u64,
+    pub parent_id: Option<MessageId>,
+    pub payload: SessionEntryPayload,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionEntryPayload {
+    UserMessage {
+        content: MessageContent,
+        metadata: Value,
+        source: MessageSource,
+    },
+    RunStarted {
+        run_id: RunId,
+        harness: HarnessProvenance,
+    },
+    /// One provider invocation. Blocks remain in provider order so replay can
+    /// preserve signatures and opaque state at their exact boundaries.
+    AssistantResponse {
+        run_id: RunId,
+        response: AssistantResponse,
+    },
+    ToolStarted {
+        run_id: RunId,
+        call: ToolCall,
+    },
+    ToolResult {
+        run_id: RunId,
+        result: ToolResult,
+    },
+    Reasoning {
+        run_id: RunId,
+        text: String,
+        visibility: ReasoningVisibility,
+        provenance: ReasoningProvenance,
+    },
+    PermissionRequested {
+        run_id: RunId,
+        request: PermissionRequest,
+    },
+    PermissionResolved {
+        run_id: RunId,
+        outcome: PermissionOutcome,
+    },
+    RunCompleted {
+        run_id: RunId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<String>,
+    },
+    RunFailed {
+        run_id: RunId,
+        error: String,
+    },
+    RunCancelled {
+        run_id: RunId,
+    },
+    ContextCompaction {
+        summary: String,
+        first_kept_entry_id: MessageId,
+        tokens_before: u64,
+    },
+    HarnessObservation {
+        run_id: RunId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        harness_session_id: Option<String>,
+        kind: String,
+        data: Value,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessProvenance {
+    pub name: String,
+    pub definition_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub call_id: String,
+    pub tool: String,
+    pub arguments: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub call_id: String,
+    pub tool: String,
+    pub result: Value,
+    pub is_error: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReasoningProvenance {
+    Provider {
+        provider: String,
+        model: String,
+    },
+    Harness {
+        harness: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AssistantResponse {
+    pub provider: String,
+    pub model: String,
+    /// Identifies the concrete provider API whose cursor/replay contract was
+    /// used (for example `responses` or `messages`).
+    pub api: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
+    pub blocks: Vec<AssistantResponseBlock>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ModelUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AssistantResponseBlock {
+    Text {
+        text: String,
+    },
+    /// Reasoning safe to show to the user. This is deliberately distinct from
+    /// provider state needed only for replay.
+    Reasoning {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    ToolCall {
+        call_id: String,
+        tool: String,
+        arguments: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
+    },
+    OpaqueState {
+        provider: String,
+        model: String,
+        data: Value,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PortableHistoryItem {
+    pub role: MessageRole,
+    pub content: MessageContent,
+}
+
+/// Provider-neutral projection used when native opaque state is not valid and
+/// when reconstructing ACP prompts. It intentionally excludes cursor IDs,
+/// signatures, opaque reasoning, and private metadata.
+pub fn portable_history(entries: &[SessionEntry]) -> Vec<PortableHistoryItem> {
+    let mut projected = Vec::new();
+    for entry in entries {
+        match &entry.payload {
+            SessionEntryPayload::UserMessage { content, .. } => {
+                if let MessageContent::Text { text } = content {
+                    projected.push(PortableHistoryItem {
+                        role: MessageRole::User,
+                        content: MessageContent::Text { text: text.clone() },
+                    });
+                }
+            }
+            SessionEntryPayload::AssistantResponse { response, .. } => {
+                for block in &response.blocks {
+                    match block {
+                        AssistantResponseBlock::Text { text } => {
+                            projected.push(PortableHistoryItem {
+                                role: MessageRole::Assistant,
+                                content: MessageContent::Text { text: text.clone() },
+                            })
+                        }
+                        AssistantResponseBlock::ToolCall {
+                            call_id,
+                            tool,
+                            arguments,
+                            ..
+                        } => {
+                            projected.push(PortableHistoryItem {
+                                role: MessageRole::Assistant,
+                                content: MessageContent::ToolCall {
+                                    call_id: call_id.clone(),
+                                    tool: tool.clone(),
+                                    arguments: arguments.clone(),
+                                    thought_signature: None,
+                                },
+                            });
+                        }
+                        AssistantResponseBlock::Reasoning { .. }
+                        | AssistantResponseBlock::OpaqueState { .. } => {}
+                    }
+                }
+            }
+            SessionEntryPayload::ToolResult { result, .. } => {
+                projected.push(PortableHistoryItem {
+                    role: MessageRole::Tool,
+                    content: MessageContent::ToolResult {
+                        call_id: result.call_id.clone(),
+                        tool: result.tool.clone(),
+                        result: result.result.clone(),
+                        is_error: result.is_error,
+                    },
+                });
+            }
+            SessionEntryPayload::ContextCompaction { summary, .. } => {
+                projected.push(PortableHistoryItem {
+                    role: MessageRole::User,
+                    content: MessageContent::Text {
+                        text: format!("[Earlier context summary]\n{summary}"),
+                    },
+                })
+            }
+            SessionEntryPayload::RunStarted { .. }
+            | SessionEntryPayload::ToolStarted { .. }
+            | SessionEntryPayload::Reasoning { .. }
+            | SessionEntryPayload::PermissionRequested { .. }
+            | SessionEntryPayload::PermissionResolved { .. }
+            | SessionEntryPayload::RunCompleted { .. }
+            | SessionEntryPayload::RunFailed { .. }
+            | SessionEntryPayload::RunCancelled { .. }
+            | SessionEntryPayload::HarnessObservation { .. } => {}
+        }
+    }
+    projected
+}
+
+/// A run-scoped identity assigned when MEWS accepts an ACP event. It is
+/// deliberately independent of the event payload so repeated chunks survive.
+pub type AcpEventKey = String;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AcpObservation {
+    AssistantDelta {
+        delta: String,
+        message_id: Option<String>,
+        raw: Value,
+    },
+    CompletedReasoning {
+        text: String,
+        message_id: Option<String>,
+        visibility: ReasoningVisibility,
+    },
+    ContextDispatched {
+        version: u32,
+        hash: String,
+        channel: AcpInstructionChannel,
+        /// Lossless, bounded record of the exact initialization context.
+        text: String,
+    },
+    BindingChanged {
+        transition: AcpBindingTransition,
+    },
+    ProviderUpdate {
+        data: Value,
+    },
+    ToolActivity {
+        activity: ToolActivity,
+    },
+    PermissionRequested {
+        request: PermissionRequest,
+    },
+    PermissionResolved {
+        request_id: String,
+        outcome: PermissionOutcome,
+    },
+    HookOutcome {
+        hook: String,
+        ok: bool,
+        detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningVisibility {
+    Visible,
+    Redacted,
+    Omitted,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
@@ -427,6 +950,15 @@ pub enum MessageContent {
 pub struct MessageSource {
     pub kind: SourceKind,
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_origin: Option<ChannelOrigin>,
+}
+
+/// The standalone Channel identity and destination that originated a Run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelOrigin {
+    pub consumer_id: ConsumerId,
+    pub conversation: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -443,6 +975,8 @@ pub struct ClientEvent {
     pub id: EventId,
     pub sequence: u64,
     pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_origin: Option<ChannelOrigin>,
     pub kind: ClientEventKind,
     pub created_at: DateTime<Utc>,
 }
@@ -470,6 +1004,7 @@ pub enum ClientEventKind {
         activity: ToolActivity,
     },
     AssistantMessage {
+        run_id: RunId,
         message: Message,
     },
     ToolStarted {
@@ -507,6 +1042,23 @@ impl ClientEventKind {
             self,
             Self::AssistantDelta { .. } | Self::ReasoningDelta { .. } | Self::ToolActivity { .. }
         )
+    }
+
+    pub fn run_id(&self) -> Option<&RunId> {
+        match self {
+            Self::RunStarted { run_id }
+            | Self::AssistantDelta { run_id, .. }
+            | Self::ReasoningDelta { run_id, .. }
+            | Self::ToolActivity { run_id, .. }
+            | Self::AssistantMessage { run_id, .. }
+            | Self::ToolStarted { run_id, .. }
+            | Self::ToolCompleted { run_id, .. }
+            | Self::PermissionRequested { run_id, .. }
+            | Self::PermissionResolved { run_id, .. }
+            | Self::RunCompleted { run_id }
+            | Self::RunFailed { run_id, .. }
+            | Self::RunCancelled { run_id } => Some(run_id),
+        }
     }
 }
 

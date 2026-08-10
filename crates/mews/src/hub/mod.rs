@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
-    sync::{Mutex, watch},
+    sync::{Mutex, Semaphore, watch},
 };
 
 use crate::{
@@ -44,6 +44,7 @@ pub(crate) struct HubControl {
 pub(crate) struct RunTask {
     pub cancellation: mews_agent::CancellationToken,
     pub abort: tokio::task::AbortHandle,
+    pub finished: Arc<tokio::sync::Notify>,
 }
 
 pub(crate) struct PermissionWaiter {
@@ -181,6 +182,7 @@ async fn serve_local(root: PathBuf, recovering_handoff: bool) -> Result<bool> {
         local_host,
         control: control.clone(),
     });
+    let client_capacity = Arc::new(Semaphore::new(128));
     for (relay_urls, accepted) in reconnecting {
         let root = root.clone();
         let remote_hosts = Arc::clone(&remote_hosts);
@@ -219,10 +221,16 @@ async fn serve_local(root: PathBuf, recovering_handoff: bool) -> Result<bool> {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
+                let Ok(permit) = Arc::clone(&client_capacity).try_acquire_owned() else {
+                    // Refuse excess clients without blocking Hub shutdown or handoff.
+                    drop(stream);
+                    continue;
+                };
                 let root = root.clone();
                 let shutdown = shutdown_tx.clone();
                 let runtime = Arc::clone(&runtime);
                 tokio::task::spawn_local(async move {
+                    let _permit = permit;
                     if let Err(error) = connection(stream, runtime, root, shutdown).await {
                         eprintln!("local client connection failed: {error:#}");
                     }
@@ -309,9 +317,9 @@ pub(crate) fn protocol_error(error: &anyhow::Error) -> ProtocolError {
         .find_map(|cause| cause.downcast_ref::<StoreError>())
         .map(|error| match error {
             StoreError::NotFound { .. } => ProtocolErrorCode::NotFound,
-            StoreError::DuplicateAgent(_) | StoreError::RevisionConflict { .. } => {
-                ProtocolErrorCode::Conflict
-            }
+            StoreError::DuplicateAgent(_)
+            | StoreError::RevisionConflict { .. }
+            | StoreError::LeafConflict { .. } => ProtocolErrorCode::Conflict,
             StoreError::InvalidAgent(_) | StoreError::InvalidData(_) => {
                 ProtocolErrorCode::InvalidRequest
             }

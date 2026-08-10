@@ -131,7 +131,7 @@ pub trait ProgressReporter {
 /// Everything the generic harness may observe or invoke outside the model.
 #[async_trait]
 pub trait AgentCapabilities: Send + Sync {
-    async fn context(&self, cwd: &Path) -> Result<ContextSnapshot>;
+    async fn context(&self, agent_slug: &str, cwd: &Path) -> Result<ContextSnapshot>;
     async fn read_prompt(&self, _cwd: &Path, _name: &str) -> Result<Option<String>> {
         Ok(None)
     }
@@ -149,7 +149,13 @@ pub trait AgentCapabilities: Send + Sync {
         cancellation: &CancellationToken,
         progress: &dyn ProgressReporter,
     ) -> Result<ToolResult>;
-    async fn hook(&self, hook: LifecycleHook, payload: Value, cwd: &Path) -> Result<Value>;
+    async fn hook(
+        &self,
+        hook: LifecycleHook,
+        payload: Value,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Value>;
 }
 
 #[cfg(test)]

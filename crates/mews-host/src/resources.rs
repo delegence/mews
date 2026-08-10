@@ -1,9 +1,10 @@
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 
 const MAX_RESOURCE_FILE: u64 = 256 * 1024;
 
@@ -14,15 +15,86 @@ pub struct Resource {
     pub path: PathBuf,
 }
 
-pub fn discover_skills(root: Option<&Path>, cwd: &Path) -> Result<Vec<Resource>> {
-    discover(root, cwd, "skills", true)
+/// Immutable, path-free skill authority passed to one ACP Run. Unlike native
+/// discovery this intentionally does not consider project or global resources.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcpSkillSnapshot {
+    pub name: String,
+    pub description: String,
+    pub hash: String,
+    pub content: String,
+}
+
+pub fn snapshot_agent_skills(root: &Path, agent_slug: &str) -> Result<Vec<AcpSkillSnapshot>> {
+    if !matches!(
+        Path::new(agent_slug)
+            .components()
+            .collect::<Vec<_>>()
+            .as_slice(),
+        [Component::Normal(_)]
+    ) {
+        bail!("invalid Agent slug {agent_slug:?}");
+    }
+    let directory = root.join("agents").join(agent_slug).join("skills");
+    let mut resources = Vec::new();
+    if directory.is_dir() {
+        collect(&directory, true, &mut resources)?;
+    }
+    let mut snapshots = std::collections::BTreeMap::new();
+    for resource in resources {
+        let content = fs::read_to_string(&resource.path)
+            .with_context(|| format!("read {}", resource.path.display()))?;
+        let snapshot = AcpSkillSnapshot {
+            name: resource.name.clone(),
+            description: resource.description,
+            hash: format!("{:x}", Sha256::digest(content.as_bytes())),
+            content,
+        };
+        if !valid_acp_skill_name(&snapshot.name) {
+            bail!("invalid selected Agent skill name {:?}", snapshot.name);
+        }
+        if snapshots.insert(resource.name, snapshot).is_some() {
+            bail!("duplicate selected Agent skill name");
+        }
+    }
+    if snapshots.len() > 256 {
+        bail!("selected Agent has too many skills for ACP");
+    }
+    Ok(snapshots.into_values().collect())
+}
+
+fn valid_acp_skill_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.contains(['/', '\\'])
+        && name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':')
+        })
+}
+
+pub fn discover_skills(root: Option<&Path>, agent_slug: &str, cwd: &Path) -> Result<Vec<Resource>> {
+    if !matches!(
+        Path::new(agent_slug)
+            .components()
+            .collect::<Vec<_>>()
+            .as_slice(),
+        [Component::Normal(_)]
+    ) {
+        bail!("invalid Agent slug {agent_slug:?}");
+    }
+    discover(
+        root.map(|root| root.join("agents").join(agent_slug)),
+        cwd,
+        "skills",
+        true,
+    )
 }
 
 pub fn discover_prompts(root: Option<&Path>, cwd: &Path) -> Result<Vec<Resource>> {
-    discover(root, cwd, "prompts", false)
+    discover(root.map(Path::to_path_buf), cwd, "prompts", false)
 }
 
-fn discover(root: Option<&Path>, cwd: &Path, kind: &str, skill: bool) -> Result<Vec<Resource>> {
+fn discover(root: Option<PathBuf>, cwd: &Path, kind: &str, skill: bool) -> Result<Vec<Resource>> {
     let mut directories = Vec::new();
     if let Some(root) = root {
         directories.push(root.join(kind));
@@ -124,8 +196,8 @@ fn parse(path: &Path, require_description: bool) -> Result<Resource> {
     })
 }
 
-pub fn prompt_context(root: Option<&Path>, cwd: &Path) -> Result<String> {
-    let skills = discover_skills(root, cwd)?;
+pub fn prompt_context(root: Option<&Path>, agent_slug: &str, cwd: &Path) -> Result<String> {
+    let skills = discover_skills(root, agent_slug, cwd)?;
     let prompts = discover_prompts(root, cwd)?;
     let mut output = String::new();
     if !skills.is_empty() {
@@ -167,14 +239,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn discovers_global_and_standard_project_resources_with_nearest_override() {
+    fn discovers_agent_and_project_resources_with_nearest_override() {
         let root = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let cwd = project.path().join("src");
-        fs::create_dir_all(root.path().join("skills/review")).unwrap();
+        fs::create_dir_all(root.path().join("agents/coder/skills/review")).unwrap();
         fs::write(
-            root.path().join("skills/review/SKILL.md"),
-            "---\nname: review\ndescription: global\n---\n",
+            root.path().join("agents/coder/skills/review/SKILL.md"),
+            "---\nname: review\ndescription: agent\n---\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.path().join("agents/writer/skills/write")).unwrap();
+        fs::write(
+            root.path().join("agents/writer/skills/write/SKILL.md"),
+            "---\nname: write\ndescription: other agent\n---\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.path().join("skills/legacy")).unwrap();
+        fs::write(
+            root.path().join("skills/legacy/SKILL.md"),
+            "---\nname: legacy\ndescription: old global location\n---\n",
         )
         .unwrap();
         fs::create_dir_all(project.path().join(".agents/skills/review")).unwrap();
@@ -190,11 +274,16 @@ mod tests {
             "---\nname: check\ndescription: Check it\n---\n$ARGUMENTS",
         )
         .unwrap();
-        let skills = discover_skills(Some(root.path()), &cwd).unwrap();
+        let skills = discover_skills(Some(root.path()), "coder", &cwd).unwrap();
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].description, "project");
+        let snapshot = snapshot_agent_skills(root.path(), "coder").unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].description, "agent");
+        assert!(snapshot[0].content.contains("description: agent"));
+        assert_ne!(snapshot[0].hash, "");
         assert!(
-            prompt_context(Some(root.path()), &cwd)
+            prompt_context(Some(root.path()), "coder", &cwd)
                 .unwrap()
                 .contains("check.md")
         );

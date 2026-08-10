@@ -24,7 +24,7 @@ pub(crate) async fn generate(
         .split_once('/')
         .map_or(request.model.as_str(), |(_, model)| model);
     let mut body = json!({
-        "contents": messages(&request.messages),
+        "contents": messages(&request.messages, model),
         "tools": [{"functionDeclarations": request.tools.into_iter().map(|tool| json!({
             "name": tool.name,
             "description": tool.description,
@@ -58,7 +58,7 @@ pub(crate) async fn generate(
         .await?,
     )
     .await?;
-    parse(response).map_err(|error| ProviderError::InvalidResponse(error.to_string()))
+    parse(response, model).map_err(|error| ProviderError::InvalidResponse(error.to_string()))
 }
 
 pub(crate) async fn models(client: &Client, root: &Path) -> ProviderResult<Vec<crate::ModelInfo>> {
@@ -107,7 +107,7 @@ fn credential(root: &Path) -> ProviderResult<(String, String)> {
     }
 }
 
-fn messages(messages: &[crate::ModelMessage]) -> Vec<Value> {
+fn messages(messages: &[crate::ModelMessage], target_model: &str) -> Vec<Value> {
     messages
         .iter()
         .filter_map(|message| {
@@ -143,13 +143,20 @@ fn messages(messages: &[crate::ModelMessage]) -> Vec<Value> {
                         "response": {"result": result},
                     }}],
                 }),
+                MessageContent::ProviderState {
+                    provider,
+                    model,
+                    data,
+                } if provider == "google" && model == target_model => {
+                    json!({"role":"model","parts":[data]})
+                }
                 MessageContent::ProviderState { .. } => return None,
             })
         })
         .collect()
 }
 
-fn parse(response: Value) -> Result<ModelResponse> {
+fn parse(response: Value, model: &str) -> Result<ModelResponse> {
     let parts = response
         .pointer("/candidates/0/content/parts")
         .and_then(Value::as_array)
@@ -157,6 +164,19 @@ fn parse(response: Value) -> Result<ModelResponse> {
         .iter()
         .filter_map(|part| {
             if let Some(text) = part.get("text").and_then(Value::as_str) {
+                if part
+                    .get("thought")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    return Some(ModelPart::Reasoning {
+                        text: text.into(),
+                        signature: part
+                            .get("thoughtSignature")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    });
+                }
                 return Some(ModelPart::Text { text: text.into() });
             }
             let call = part.get("functionCall")?;
@@ -175,7 +195,38 @@ fn parse(response: Value) -> Result<ModelResponse> {
             })
         })
         .collect();
-    Ok(ModelResponse { parts })
+    let usage = response
+        .get("usageMetadata")
+        .map(|usage| mews_protocol::ModelUsage {
+            input_tokens: usage
+                .get("promptTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            output_tokens: usage
+                .get("candidatesTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            cached_input_tokens: usage
+                .get("cachedContentTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            reasoning_tokens: usage
+                .get("thoughtsTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        });
+    Ok(ModelResponse {
+        provider: "google".into(),
+        model: model.into(),
+        api: "generate_content".into(),
+        response_id: None,
+        usage,
+        stop_reason: response
+            .pointer("/candidates/0/finishReason")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        parts,
+    })
 }
 
 fn model_info(entry: &Value) -> Option<crate::ModelInfo> {
@@ -251,34 +302,40 @@ mod tests {
 
     #[test]
     fn translates_and_parses_tool_calls() {
-        let input = messages(&[ModelMessage {
-            role: MessageRole::Tool,
-            content: MessageContent::ToolResult {
-                call_id: "call-1".into(),
-                tool: "read".into(),
-                result: json!({"content": "hello"}),
-                is_error: false,
-            },
-        }]);
+        let input = messages(
+            &[ModelMessage {
+                role: MessageRole::Tool,
+                content: MessageContent::ToolResult {
+                    call_id: "call-1".into(),
+                    tool: "read".into(),
+                    result: json!({"content": "hello"}),
+                    is_error: false,
+                },
+            }],
+            "gemini-test",
+        );
         assert_eq!(input[0]["parts"][0]["functionResponse"]["id"], "call-1");
         let response = parse(json!({"candidates":[{"content":{"parts":[
             {"text":"checking"},
             {"thoughtSignature":"signed-thought","functionCall":{"id":"call-2","name":"write","args":{"path":"b"}}}
-        ]}}]}))
+        ]}}]}), "gemini-test")
         .unwrap();
         assert!(
             matches!(&response.parts[1], ModelPart::ToolCall { id, name, arguments, thought_signature } if id == "call-2" && name == "write" && arguments["path"] == "b" && thought_signature.as_deref() == Some("signed-thought"))
         );
 
-        let replay = messages(&[ModelMessage {
-            role: MessageRole::Assistant,
-            content: MessageContent::ToolCall {
-                call_id: "call-2".into(),
-                tool: "write".into(),
-                arguments: json!({"path": "b"}),
-                thought_signature: Some("signed-thought".into()),
-            },
-        }]);
+        let replay = messages(
+            &[ModelMessage {
+                role: MessageRole::Assistant,
+                content: MessageContent::ToolCall {
+                    call_id: "call-2".into(),
+                    tool: "write".into(),
+                    arguments: json!({"path": "b"}),
+                    thought_signature: Some("signed-thought".into()),
+                },
+            }],
+            "gemini-test",
+        );
         assert_eq!(replay[0]["parts"][0]["thoughtSignature"], "signed-thought");
     }
 
@@ -394,6 +451,7 @@ mod tests {
                         "additionalProperties": false
                     }),
                 }],
+                continuation: None,
             },
         )
         .await

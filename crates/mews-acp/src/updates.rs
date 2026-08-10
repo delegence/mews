@@ -21,9 +21,25 @@ pub(crate) struct UpdateState {
     assistant_boundary: bool,
     assistant_message_id: Option<String>,
     tools: HashMap<String, ToolActivityState>,
+    next_event_ordinal: u64,
+    event_key_prefix: String,
 }
 
 impl UpdateState {
+    pub(crate) fn for_run(run_id: &str) -> Self {
+        Self {
+            event_key_prefix: run_id.into(),
+            ..Self::default()
+        }
+    }
+
+    fn event_key(&mut self) -> mews_protocol::AcpEventKey {
+        self.next_event_ordinal += 1;
+        format!(
+            "{}:update:{}",
+            self.event_key_prefix, self.next_event_ordinal
+        )
+    }
     pub(crate) fn answer(self) -> String {
         self.answer
     }
@@ -38,14 +54,19 @@ impl UpdateState {
             Some("agent_thought_chunk") => {
                 if let Some(text) = content_text(update) {
                     events(AcpStreamEvent::ReasoningDelta {
+                        event_key: self.event_key(),
                         delta: text.to_owned(),
                         message_id: update_message_id(update),
+                        raw: bounded_json(update),
                     })?;
                 }
             }
             Some("tool_call" | "tool_call_update") => self.apply_tool(update, events)?,
             Some("permission_request") => {
-                events(AcpStreamEvent::ProviderState(bounded_json(update)))?;
+                events(AcpStreamEvent::ProviderState {
+                    event_key: self.event_key(),
+                    data: bounded_json(update),
+                })?;
             }
             _ => {}
         }
@@ -69,8 +90,10 @@ impl UpdateState {
         if (self.assistant_boundary || message_changed) && !self.answer.is_empty() {
             self.answer.push_str("\n\n");
             events(AcpStreamEvent::AssistantDelta {
+                event_key: self.event_key(),
                 delta: "\n\n".into(),
                 message_id: message_id.clone(),
+                raw: bounded_json(update),
             })?;
         }
         self.assistant_boundary = false;
@@ -79,8 +102,10 @@ impl UpdateState {
         }
         self.answer.push_str(text);
         events(AcpStreamEvent::AssistantDelta {
+            event_key: self.event_key(),
             delta: text.to_owned(),
             message_id,
+            raw: bounded_json(update),
         })
     }
 
@@ -96,10 +121,12 @@ impl UpdateState {
             .filter(|call_id| !call_id.trim().is_empty())
             .map(str::to_owned)
         else {
-            return events(AcpStreamEvent::ProviderState(bounded_json(update)));
+            return events(AcpStreamEvent::ProviderState {
+                event_key: self.event_key(),
+                data: bounded_json(update),
+            });
         };
         let state = self.tools.entry(call_id.clone()).or_default();
-        let previous = state.clone();
         if let Some(title) = non_empty_string(update, "title") {
             state.title = title.to_owned();
         }
@@ -112,19 +139,39 @@ impl UpdateState {
         if let Some(input) = update.get("rawInput") {
             merge_json(&mut state.input, &bounded_json(input));
         }
-        if *state == previous {
-            return Ok(());
+        // ACP tool updates can carry output and locations independently of
+        // input. Keep their bounded raw form with the durable activity rather
+        // than reducing an accepted provider result to its title/status.
+        if (update.get("rawOutput").is_some() || update.get("locations").is_some())
+            && state.input.is_null()
+        {
+            state.input = Value::Object(Default::default());
         }
+        if let Value::Object(input) = &mut state.input {
+            if let Some(output) = update.get("rawOutput") {
+                input.insert("_mews_raw_output".into(), bounded_json(output));
+            }
+            if let Some(locations) = update.get("locations") {
+                input.insert("_mews_locations".into(), bounded_json(locations));
+            }
+        }
+        let title = if state.title.is_empty() {
+            "Tool call".into()
+        } else {
+            state.title.clone()
+        };
+        let kind = state.kind.clone();
+        let status = state.status.clone();
+        let input = state.input.clone();
+        let _ = state;
+        let event_key = self.event_key();
         events(AcpStreamEvent::ToolActivity {
+            event_key,
             call_id,
-            title: if state.title.is_empty() {
-                "Tool call".into()
-            } else {
-                state.title.clone()
-            },
-            kind: state.kind.clone(),
-            status: state.status.clone(),
-            input: state.input.clone(),
+            title,
+            kind,
+            status,
+            input,
         })
     }
 }
@@ -213,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_input_is_bounded_and_duplicate_updates_are_suppressed() {
+    fn raw_input_is_bounded_and_identical_tool_notifications_are_distinct() {
         let update = json!({
             "sessionUpdate":"tool_call", "toolCallId":"large-1",
             "title":"Large tool", "rawInput":{"body":"🙂".repeat(MAX_METADATA_BYTES)}
@@ -233,10 +280,18 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         assert!(matches!(
             &events[0],
             AcpStreamEvent::ToolActivity { input, .. } if input["truncated"] == true
         ));
+        let keys = events
+            .iter()
+            .map(|event| match event {
+                AcpStreamEvent::ToolActivity { event_key, .. } => event_key,
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(keys[0], keys[1]);
     }
 }

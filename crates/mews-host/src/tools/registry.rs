@@ -137,7 +137,13 @@ impl ToolRegistry {
         Ok(())
     }
 
-    pub async fn execute_hooks(&self, hook: &str, mut payload: Value, cwd: &Path) -> Result<Value> {
+    pub async fn execute_hooks(
+        &self,
+        hook: &str,
+        mut payload: Value,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Value> {
         let hooks = self
             .inner
             .hooks
@@ -148,10 +154,9 @@ impl ToolRegistry {
             let input = json!({
                 "type": "hook", "extension": extension.extension, "hook": hook, "payload": payload,
             });
-            let output =
-                super::process::execute(&extension.command, cwd, input, &CancellationToken::new())
-                    .await
-                    .with_context(|| format!("extension {:?} hook {hook}", extension.extension))?;
+            let output = super::process::execute(&extension.command, cwd, input, cancellation)
+                .await
+                .with_context(|| format!("extension {:?} hook {hook}", extension.extension))?;
             if !output.is_null() {
                 payload = output;
             }
@@ -453,6 +458,62 @@ schema = { type = "object" }
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn cancellation_stops_extension_hook_descendants() {
+        let root = tempfile::tempdir().unwrap();
+        let extensions = root.path().join("extensions");
+        std::fs::create_dir(&extensions).unwrap();
+        let pid_path = root.path().join("hook-descendant.pid");
+        let executable = root.path().join("hook.sh");
+        std::fs::write(
+            &executable,
+            format!(
+                "cat >/dev/null\nsleep 30 & child=$!\nprintf %s \"$child\" > {}\nwait\n",
+                pid_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            extensions.join("hook.toml"),
+            format!(
+                r#"name = "hook"
+command = ["sh", {:?}]
+hooks = ["before_model"]
+"#,
+                executable.display().to_string()
+            ),
+        )
+        .unwrap();
+
+        let registry = ToolRegistry::with_host_extensions(root.path()).unwrap();
+        let cancellation = CancellationToken::new();
+        let execution =
+            registry.execute_hooks("before_model", json!({}), root.path(), &cancellation);
+        tokio::pin!(execution);
+        let descendant = loop {
+            tokio::select! {
+                result = &mut execution => panic!("hook exited before cancellation: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                    if let Ok(pid) = std::fs::read_to_string(&pid_path) {
+                        break pid.parse::<i32>().unwrap();
+                    }
+                }
+            }
+        };
+        cancellation.cancel();
+        assert!(execution.await.is_err());
+
+        for _ in 0..100 {
+            // SAFETY: signal 0 only queries whether the test child still exists.
+            if unsafe { libc::kill(descendant, 0) } == -1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("cancelled extension hook descendant {descendant} is still running");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn timeout_stops_shell_descendants() {
         let directory = tempfile::tempdir().unwrap();
         let pid_path = directory.path().join("timed-out-descendant.pid");
@@ -637,7 +698,12 @@ schema = {{ type = "object" }}
         );
         assert_eq!(
             registry
-                .execute_hooks("before_tool", json!({}), root.path())
+                .execute_hooks(
+                    "before_tool",
+                    json!({}),
+                    root.path(),
+                    &CancellationToken::new(),
+                )
                 .await
                 .unwrap(),
             json!({"changed": true})

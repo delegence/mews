@@ -17,7 +17,7 @@ use mews_protocol::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
-    sync::{mpsc, oneshot},
+    sync::{Semaphore, mpsc, oneshot},
 };
 
 pub(super) async fn serve_local_clients(
@@ -32,14 +32,21 @@ pub(super) async fn serve_local_clients(
     let listener = UnixListener::bind(&path)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let client_capacity = Arc::new(Semaphore::new(128));
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
+                let Ok(permit) = Arc::clone(&client_capacity).try_acquire_owned() else {
+                    // Keep the proxy responsive to shutdown while at capacity.
+                    drop(stream);
+                    continue;
+                };
                 let peer = peer.clone();
                 let pending = Arc::clone(&pending);
                 let shutdown = shutdown_tx.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(error) = local_client(stream, peer, pending, shutdown).await {
                         eprintln!("local client connection failed: {error:#}");
                     }

@@ -7,14 +7,17 @@
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use mews_agent::{
-    AgentCapabilities, CancellationToken, ProgressReporter, ToolCall, ToolCatalog, ToolDefinition,
-    ToolResult,
+    AgentCapabilities, CancellationToken, LifecycleHook, ProgressReporter, ToolCall, ToolCatalog,
+    ToolDefinition, ToolResult,
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -23,6 +26,24 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 use uuid::Uuid;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcpSkill {
+    pub name: String,
+    pub description: String,
+    pub hash: String,
+    pub content: String,
+}
+
+/// Stable metadata included in every extension hook. The provider session id
+/// becomes available only after session/new or session/resume succeeds.
+#[derive(Clone, Debug)]
+pub struct McpCorrelation {
+    pub mews_session_id: String,
+    pub run_id: String,
+    pub harness: String,
+    pub acp_session_id: std::sync::Arc<Mutex<Option<String>>>,
+}
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
@@ -37,18 +58,41 @@ pub struct RunMcpBridge<'a> {
     cancellation: CancellationToken,
     tools: BTreeMap<String, ToolDefinition>,
     catalog: ToolCatalog,
+    skills: BTreeMap<String, AcpSkill>,
     active: AtomicBool,
     next_call_id: AtomicU64,
+    hook_outcomes: Mutex<Vec<McpHookOutcome>>,
+    correlation: Option<McpCorrelation>,
+}
+
+#[derive(Clone, Debug)]
+pub struct McpHookOutcome {
+    pub hook: String,
+    pub ok: bool,
+    pub detail: Option<String>,
+    pub tool: Option<String>,
+    pub call_id: Option<String>,
 }
 
 impl<'a> RunMcpBridge<'a> {
+    #[cfg(test)]
     pub fn for_extensions(
         environment: &'a dyn AgentCapabilities,
         cwd: PathBuf,
         cancellation: CancellationToken,
         allowed_tools: &[String],
     ) -> Result<Self> {
-        let definitions = environment
+        Self::for_extensions_and_skills(environment, cwd, cancellation, allowed_tools, Vec::new())
+    }
+
+    pub fn for_extensions_and_skills(
+        environment: &'a dyn AgentCapabilities,
+        cwd: PathBuf,
+        cancellation: CancellationToken,
+        allowed_tools: &[String],
+        skills: Vec<AcpSkill>,
+    ) -> Result<Self> {
+        let mut definitions = environment
             .extension_tools()
             .into_iter()
             // Defense in depth: native MEWS tools cannot be exposed over MCP
@@ -60,6 +104,31 @@ impl<'a> RunMcpBridge<'a> {
                     .any(|pattern| tool_allowed(pattern, &tool.name))
             })
             .collect::<Vec<_>>();
+        let skills = skills
+            .into_iter()
+            .map(|skill| (skill.name.clone(), skill))
+            .collect::<BTreeMap<_, _>>();
+        for (name, description, schema) in [
+            (
+                "mews_list_skills",
+                "List selected-agent skill metadata.",
+                json!({"type":"object","additionalProperties":false}),
+            ),
+            (
+                "mews_read_skill",
+                "Read one selected-agent SKILL.md snapshot.",
+                json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}),
+            ),
+        ] {
+            if definitions.iter().any(|tool| tool.name == name) {
+                anyhow::bail!("Host extension conflicts with reserved MCP tool {name:?}");
+            }
+            definitions.push(ToolDefinition {
+                name: name.into(),
+                description: description.into(),
+                schema,
+            });
+        }
         let catalog = ToolCatalog::compile(definitions.clone())?;
         let tools = definitions
             .into_iter()
@@ -71,9 +140,25 @@ impl<'a> RunMcpBridge<'a> {
             cancellation,
             tools,
             catalog,
+            skills,
             active: AtomicBool::new(true),
             next_call_id: AtomicU64::new(1),
+            hook_outcomes: Mutex::new(Vec::new()),
+            correlation: None,
         })
+    }
+
+    pub fn set_correlation(&mut self, correlation: McpCorrelation) {
+        self.correlation = Some(correlation);
+    }
+
+    pub fn set_acp_session_id(&self, session_id: String) {
+        if let Some(correlation) = &self.correlation {
+            *correlation
+                .acp_session_id
+                .lock()
+                .expect("MCP correlation poisoned") = Some(session_id);
+        }
     }
 
     /// Invalidates the capability before the owning Run is dropped.
@@ -81,8 +166,62 @@ impl<'a> RunMcpBridge<'a> {
         self.active.store(false, Ordering::SeqCst);
     }
 
-    pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        self.tools.values().cloned().collect()
+    pub fn needs_transport(&self) -> bool {
+        !self.skills.is_empty()
+            || self
+                .tools
+                .keys()
+                .any(|name| name != "mews_list_skills" && name != "mews_read_skill")
+    }
+
+    pub fn drain_hook_outcomes(&self) -> Vec<McpHookOutcome> {
+        std::mem::take(
+            &mut *self
+                .hook_outcomes
+                .lock()
+                .expect("MCP hook outcomes poisoned"),
+        )
+    }
+
+    fn record_hook(&self, hook: &str, ok: bool, detail: Option<String>, call: Option<&ToolCall>) {
+        self.hook_outcomes
+            .lock()
+            .expect("MCP hook outcomes poisoned")
+            .push(McpHookOutcome {
+                hook: hook.into(),
+                ok,
+                detail: detail.map(|value| value.chars().take(1024).collect()),
+                tool: call.map(|call| call.name.clone()),
+                call_id: call.map(|call| call.id.clone()),
+            });
+    }
+
+    fn hook_payload(&self, call: &ToolCall, extra: Value) -> Value {
+        let mut payload = serde_json::Map::from_iter([
+            ("tool".into(), Value::String(call.name.clone())),
+            ("arguments".into(), call.arguments.clone()),
+            ("call_id".into(), Value::String(call.id.clone())),
+        ]);
+        if let Some(correlation) = &self.correlation {
+            payload.insert(
+                "session_id".into(),
+                Value::String(correlation.mews_session_id.clone()),
+            );
+            payload.insert("run_id".into(), Value::String(correlation.run_id.clone()));
+            payload.insert("harness".into(), Value::String(correlation.harness.clone()));
+            if let Some(session_id) = correlation
+                .acp_session_id
+                .lock()
+                .expect("MCP correlation poisoned")
+                .clone()
+            {
+                payload.insert("acp_session_id".into(), Value::String(session_id));
+            }
+        }
+        if let Value::Object(extra) = extra {
+            payload.extend(extra);
+        }
+        Value::Object(payload)
     }
 
     /// Creates a local, unguessable HTTP endpoint for this Run. Both managed
@@ -159,30 +298,191 @@ impl<'a> RunMcpBridge<'a> {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| Value::Object(Default::default()));
-        let call = ToolCall {
+        let mut call = ToolCall {
             id: format!("mcp-{}", self.next_call_id.fetch_add(1, Ordering::Relaxed)),
             name: name.to_owned(),
             arguments,
             thought_signature: None,
         };
-        self.catalog
-            .validate(&call)
-            .map_err(|error| McpError::invalid(error.to_string()))?;
-        let progress = NoProgress;
-        let result = self
+        let before = self
             .environment
-            .execute(&call, &self.cwd, &self.cancellation, &progress)
+            .hook(
+                LifecycleHook::BeforeTool,
+                self.hook_payload(&call, Value::Null),
+                &self.cwd,
+                &self.cancellation,
+            )
+            .await;
+        let before = match before {
+            Ok(value) => value,
+            Err(error) => {
+                self.record_hook("before_tool", false, Some(error.to_string()), Some(&call));
+                return Err(McpError::invalid(format!(
+                    "before_tool hook failed: {error:#}"
+                )));
+            }
+        };
+        let before = match parse_before_tool(before) {
+            Ok(before) => before,
+            Err(detail) => {
+                self.record_hook("before_tool", false, Some(detail.clone()), Some(&call));
+                return Err(McpError::invalid(format!(
+                    "invalid before_tool hook response: {detail}"
+                )));
+            }
+        };
+        if let Some(reason) = before.block {
+            self.record_hook("before_tool", false, Some(reason.to_owned()), Some(&call));
+            return Err(McpError::invalid(format!(
+                "before_tool hook blocked MCP call: {reason}"
+            )));
+        }
+        if let Some(tool) = before.name {
+            call.name = tool;
+        }
+        if let Some(arguments) = before.arguments {
+            call.arguments = arguments;
+        }
+        self.catalog.validate(&call).map_err(|error| {
+            self.record_hook("before_tool", false, Some(error.to_string()), Some(&call));
+            McpError::invalid(error.to_string())
+        })?;
+        self.record_hook("before_tool", true, None, Some(&call));
+        let mut result = if call.name == "mews_list_skills" {
+            let inventory = self.skills.values().map(|skill| json!({"name":skill.name,"description":skill.description,"hash":skill.hash})).collect::<Vec<_>>();
+            mews_agent::ToolResult::success(Value::String(
+                serde_json::to_string(&inventory).expect("skill inventory serializes"),
+            ))
+        } else if call.name == "mews_read_skill" {
+            match call
+                .arguments
+                .get("name")
+                .and_then(Value::as_str)
+                .and_then(|name| self.skills.get(name))
+            {
+                Some(skill) => {
+                    mews_agent::ToolResult::success(Value::String(skill.content.clone()))
+                }
+                None => mews_agent::ToolResult::error("selected Agent skill is unavailable"),
+            }
+        } else {
+            let progress = NoProgress;
+            match self
+                .environment
+                .execute(&call, &self.cwd, &self.cancellation, &progress)
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => mews_agent::ToolResult::error(error),
+            }
+        };
+        // A failed after hook cannot undo a provider-visible extension action.
+        match self
+            .environment
+            .hook(
+                LifecycleHook::AfterTool,
+                self.hook_payload(
+                    &call,
+                    json!({"result": result.value, "is_error": result.is_error}),
+                ),
+                &self.cwd,
+                &self.cancellation,
+            )
             .await
-            .map_err(|error| McpError {
-                code: -32000,
-                message: error.to_string(),
-            })?;
+        {
+            Ok(after) => match parse_after_tool(after) {
+                Ok(after) => {
+                    self.record_hook("after_tool", true, None, Some(&call));
+                    if let Some(value) = after.result {
+                        result.value = value.clone();
+                    }
+                    if let Some(is_error) = after.is_error {
+                        result.is_error = is_error;
+                    }
+                }
+                Err(detail) => self.record_hook("after_tool", false, Some(detail), Some(&call)),
+            },
+            Err(error) => {
+                self.record_hook("after_tool", false, Some(error.to_string()), Some(&call))
+            }
+        }
         Ok(tool_result(result))
     }
 
     fn is_available(&self) -> bool {
         self.active.load(Ordering::SeqCst) && !self.cancellation.is_cancelled()
     }
+}
+
+struct BeforeTool {
+    block: Option<String>,
+    name: Option<String>,
+    arguments: Option<Value>,
+}
+
+fn hook_object(
+    value: Value,
+) -> std::result::Result<Option<serde_json::Map<String, Value>>, String> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Object(object) => Ok(Some(object)),
+        _ => Err("hook response must be an object or null".into()),
+    }
+}
+
+fn optional_string(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> std::result::Result<Option<String>, String> {
+    object.get(key).map_or(Ok(None), |value| {
+        value
+            .as_str()
+            .map(str::to_owned)
+            .map(Some)
+            .ok_or_else(|| format!("{key} must be a string"))
+    })
+}
+
+fn parse_before_tool(value: Value) -> std::result::Result<BeforeTool, String> {
+    let Some(object) = hook_object(value)? else {
+        return Ok(BeforeTool {
+            block: None,
+            name: None,
+            arguments: None,
+        });
+    };
+    let name = optional_string(&object, "name")?.or(optional_string(&object, "tool")?);
+    Ok(BeforeTool {
+        block: optional_string(&object, "block")?,
+        name,
+        arguments: object.get("arguments").cloned(),
+    })
+}
+
+struct AfterTool {
+    result: Option<Value>,
+    is_error: Option<bool>,
+}
+
+fn parse_after_tool(value: Value) -> std::result::Result<AfterTool, String> {
+    let Some(object) = hook_object(value)? else {
+        return Ok(AfterTool {
+            result: None,
+            is_error: None,
+        });
+    };
+    let is_error = match object.get("is_error") {
+        Some(value) => Some(
+            value
+                .as_bool()
+                .ok_or_else(|| "is_error must be a boolean".to_owned())?,
+        ),
+        None => None,
+    };
+    Ok(AfterTool {
+        result: object.get("result").cloned(),
+        is_error,
+    })
 }
 
 fn tool_allowed(pattern: &str, name: &str) -> bool {
@@ -389,7 +689,7 @@ mod tests {
 
     #[async_trait]
     impl AgentCapabilities for Capabilities {
-        async fn context(&self, _: &Path) -> Result<ContextSnapshot> {
+        async fn context(&self, _: &str, _: &Path) -> Result<ContextSnapshot> {
             Ok(ContextSnapshot::default())
         }
         fn tools(&self) -> Vec<ToolDefinition> {
@@ -419,7 +719,13 @@ mod tests {
             self.calls.lock().unwrap().push(call.clone());
             Ok(ToolResult::success(json!({"called": call.name})))
         }
-        async fn hook(&self, _: LifecycleHook, _: Value, _: &Path) -> Result<Value> {
+        async fn hook(
+            &self,
+            _: LifecycleHook,
+            _: Value,
+            _: &Path,
+            _: &CancellationToken,
+        ) -> Result<Value> {
             Ok(Value::Null)
         }
     }
@@ -525,7 +831,7 @@ mod tests {
         struct StrictCapabilities;
         #[async_trait]
         impl AgentCapabilities for StrictCapabilities {
-            async fn context(&self, _: &Path) -> Result<ContextSnapshot> {
+            async fn context(&self, _: &str, _: &Path) -> Result<ContextSnapshot> {
                 Ok(ContextSnapshot::default())
             }
             fn tools(&self) -> Vec<ToolDefinition> {
@@ -552,7 +858,13 @@ mod tests {
             ) -> Result<ToolResult> {
                 panic!("invalid arguments must not cross the capability boundary")
             }
-            async fn hook(&self, _: LifecycleHook, _: Value, _: &Path) -> Result<Value> {
+            async fn hook(
+                &self,
+                _: LifecycleHook,
+                _: Value,
+                _: &Path,
+                _: &CancellationToken,
+            ) -> Result<Value> {
                 Ok(Value::Null)
             }
         }
@@ -572,6 +884,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn skill_tools_return_one_direct_mcp_content_envelope() {
+        let capabilities = Capabilities {
+            calls: Mutex::new(Vec::new()),
+            delay: std::time::Duration::ZERO,
+        };
+        let bridge = RunMcpBridge::for_extensions_and_skills(
+            &capabilities,
+            PathBuf::from("/tmp"),
+            CancellationToken::new(),
+            &[],
+            vec![AcpSkill {
+                name: "review".into(),
+                description: "Review code".into(),
+                hash: "a".repeat(64),
+                content: "---\nname: review\n---\nbody".into(),
+            }],
+        )
+        .unwrap();
+        let listed = bridge.handle(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mews_list_skills","arguments":{}}})).await.unwrap();
+        let inventory: Value =
+            serde_json::from_str(listed["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(inventory[0]["name"], "review");
+        let read = bridge.handle(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"mews_read_skill","arguments":{"name":"review"}}})).await.unwrap();
+        assert_eq!(
+            read["result"]["content"][0]["text"],
+            "---\nname: review\n---\nbody"
+        );
+        let invalid = bridge.handle(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"mews_read_skill","arguments":{}}})).await.unwrap();
+        assert_eq!(invalid["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn empty_skills_need_no_transport_but_remain_listable_with_extensions() {
+        let capabilities = Capabilities {
+            calls: Mutex::new(Vec::new()),
+            delay: std::time::Duration::ZERO,
+        };
+        let empty = RunMcpBridge::for_extensions_and_skills(
+            &capabilities,
+            PathBuf::from("/tmp"),
+            CancellationToken::new(),
+            &[],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(!empty.needs_transport());
+
+        let with_extension = RunMcpBridge::for_extensions_and_skills(
+            &capabilities,
+            PathBuf::from("/tmp"),
+            CancellationToken::new(),
+            &["issue_lookup".into()],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(with_extension.needs_transport());
+        let listed = with_extension
+            .handle(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mews_list_skills","arguments":{}}}))
+            .await
+            .unwrap();
+        assert_eq!(listed["result"]["content"][0]["text"], "[]");
     }
 
     #[tokio::test]

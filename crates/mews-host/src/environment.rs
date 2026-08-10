@@ -30,7 +30,7 @@ impl LocalEnvironment {
 
 #[async_trait]
 impl AgentCapabilities for LocalEnvironment {
-    async fn context(&self, cwd: &Path) -> Result<ContextSnapshot> {
+    async fn context(&self, agent_slug: &str, cwd: &Path) -> Result<ContextSnapshot> {
         let documents = context::discover_agents_md(cwd)?
             .into_iter()
             .map(|file| ContextDocument {
@@ -45,7 +45,7 @@ impl AgentCapabilities for LocalEnvironment {
         };
         Ok(ContextSnapshot {
             documents,
-            skills: resources::discover_skills(self.root.as_deref(), cwd)?
+            skills: resources::discover_skills(self.root.as_deref(), agent_slug, cwd)?
                 .into_iter()
                 .map(convert)
                 .collect(),
@@ -99,7 +99,13 @@ impl AgentCapabilities for LocalEnvironment {
         Ok(ToolResult::success(value))
     }
 
-    async fn hook(&self, hook: LifecycleHook, payload: Value, cwd: &Path) -> Result<Value> {
+    async fn hook(
+        &self,
+        hook: LifecycleHook,
+        payload: Value,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Value> {
         let name = match hook {
             LifecycleHook::RunStart => "run_start",
             LifecycleHook::BeforeModel => "before_model",
@@ -108,6 +114,8 @@ impl AgentCapabilities for LocalEnvironment {
             LifecycleHook::AfterTurn => "after_turn",
             LifecycleHook::RunEnd => "run_end",
         };
-        self.registry.execute_hooks(name, payload, cwd).await
+        self.registry
+            .execute_hooks(name, payload, cwd, cancellation)
+            .await
     }
 }

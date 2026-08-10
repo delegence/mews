@@ -2,8 +2,8 @@ use super::*;
 
 use super::{
     acp_execution::{
-        checked_acp_binding, finish_acp_run, persist_local_acp_event, persist_remote_acp_binding,
-        resolve_remote_permission,
+        AcpReasoningAggregate, checked_acp_binding, finish_acp_run, persist_local_acp_event,
+        persist_remote_acp_binding, persist_remote_acp_dispatch, resolve_remote_permission,
     },
     sessions::expand_prompt,
 };
@@ -35,8 +35,11 @@ impl Mews {
         &self,
         session_id: &crate::SessionId,
         key: &str,
+        channel_origin: Option<&crate::ChannelOrigin>,
     ) -> Result<(crate::Run, bool)> {
-        Ok(self.store.start_run_idempotent(session_id, key)?)
+        Ok(self
+            .store
+            .start_run_idempotent(session_id, key, channel_origin)?)
     }
 
     pub fn run(&self, run_id: &crate::RunId) -> Result<crate::Run> {
@@ -58,15 +61,12 @@ impl Mews {
 
     pub fn cancel_run(&self, run_id: &crate::RunId) -> Result<()> {
         let run = self.store.run(run_id)?;
-        if run.status == RunStatus::Cancelled {
+        if run.completed_at.is_some() {
             return Ok(());
         }
-        if run.completed_at.is_some() {
-            bail!("Run already finished with status {:?}", run.status);
-        }
-        Ok(self
-            .store
-            .finish_run(run_id, RunStatus::Cancelled, Some("cancelled by client"))?)
+        self.store
+            .finish_run(run_id, RunStatus::Cancelled, Some("cancelled by client"))?;
+        Ok(())
     }
 
     pub fn fail_run(&self, run_id: &crate::RunId, error: &str) -> Result<()> {
@@ -81,8 +81,16 @@ impl Mews {
         run_id: &crate::RunId,
         request: mews_protocol::PermissionRequest,
     ) -> Result<()> {
-        Ok(self.store.append_client_event(
+        Ok(self.store.append_acp_observation_with_client_event(
             session_id,
+            run_id.clone(),
+            self.store
+                .acp_session_binding(session_id)?
+                .map(|binding| binding.acp_session_id),
+            Some(format!("permission_requested:{}", request.id)),
+            mews_protocol::AcpObservation::PermissionRequested {
+                request: request.clone(),
+            },
             crate::ClientEventKind::PermissionRequested {
                 run_id: run_id.clone(),
                 request,
@@ -97,8 +105,17 @@ impl Mews {
         request_id: &str,
         outcome: mews_protocol::PermissionOutcome,
     ) -> Result<()> {
-        Ok(self.store.append_client_event(
+        Ok(self.store.append_acp_observation_with_client_event(
             session_id,
+            run_id.clone(),
+            self.store
+                .acp_session_binding(session_id)?
+                .map(|binding| binding.acp_session_id),
+            Some(format!("permission_resolved:{request_id}")),
+            mews_protocol::AcpObservation::PermissionResolved {
+                request_id: request_id.to_owned(),
+                outcome: outcome.clone(),
+            },
             crate::ClientEventKind::PermissionResolved {
                 run_id: run_id.clone(),
                 request_id: request_id.to_owned(),
@@ -153,6 +170,7 @@ impl Mews {
             MessageSource {
                 kind: SourceKind::Client,
                 id: "cli".into(),
+                channel_origin: None,
             },
         )
         .await
@@ -220,6 +238,7 @@ impl Mews {
             MessageSource {
                 kind: SourceKind::Client,
                 id: "cli".into(),
+                channel_origin: None,
             },
         )
         .await
@@ -361,9 +380,16 @@ impl Mews {
             let launch = catalog.launch(&self.root, &config.harness)?;
             let mut acp = mews_acp::AcpHarnessConfig::new(launch.command)?;
             acp.environment = launch.environment;
-            Some(acp)
+            Some((acp, launch.instruction_channel))
         };
         let system = revision.soul;
+        let agent_slug = self
+            .store
+            .agents()?
+            .into_iter()
+            .find(|agent| agent.id == session.agent_id)
+            .context("Session Agent no longer exists")?
+            .slug;
         let prompt = expand_prompt(environment, &session.working_directory, prompt).await?;
         if source.id.is_empty() || source.id.len() > 256 {
             bail!("message source ID must contain 1 to 256 bytes");
@@ -386,32 +412,90 @@ impl Mews {
                 None => self.store.start_run(&session.id)?.id,
             };
             self.record_run_harness(&run, &harness_descriptor)?;
-            let binding = checked_acp_binding(
+            let transition = checked_acp_binding(
                 self.store.acp_session_binding(&session.id)?,
                 session,
                 &harness_descriptor,
             )?;
-            let recovery_prompt =
-                runtime_store::canonical_acp_prompt(&self.store, session, &system)?;
-            let mut acp = acp.context("local ACP Harness launch is unavailable")?;
+            let recovery_prompt = runtime_store::canonical_acp_prompt(&self.store, session, "")?;
+            let (mut acp, launch_channel) =
+                acp.context("local ACP Harness launch is unavailable")?;
+            let skills = mews_host::resources::snapshot_agent_skills(&self.root, &agent_slug)?;
+            let context = mews_protocol::AcpContextSnapshot {
+                version: mews_protocol::ACP_CONTEXT_VERSION,
+                agent_slug: agent_slug.clone(),
+                soul: system.clone(),
+                skills: skills
+                    .iter()
+                    .map(|skill| mews_protocol::AcpSkillInventoryItem {
+                        name: skill.name.clone(),
+                        description: skill.description.clone(),
+                        hash: skill.hash.clone(),
+                    })
+                    .collect(),
+            };
+            // Replacements, including a failed Resume recovery, always use
+            // this current Host snapshot. A successful Resume never sends it.
+            let context_text = context.render().map_err(anyhow::Error::msg)?;
+            let channel = launch_channel;
             if let Some(handler) = permission_handler {
                 acp.permission_handler = handler;
             }
+            let mut reasoning = AcpReasoningAggregate::default();
             let outcome = mews_acp::run_acp_session_with_extensions_and_events(
                 acp,
                 session.working_directory.clone(),
                 config.harness_options.clone(),
                 mews_acp::AcpSessionRequest {
-                    prompt: mews_runtime::initial_session_prompt(&system, &prompt),
+                    transition: transition.clone(),
+                    prompt: prompt.clone(),
                     recovery_prompt,
-                    session_id: binding
-                        .as_ref()
-                        .map(|binding| binding.acp_session_id.clone()),
+                    context_text: context_text.clone(),
+                    instruction_channel: channel,
+                    skills: skills
+                        .into_iter()
+                        .map(|skill| mews_acp::AcpSkill {
+                            name: skill.name,
+                            description: skill.description,
+                            hash: skill.hash,
+                            content: skill.content,
+                        })
+                        .collect(),
+                    hook_metadata: Some(mews_acp::AcpHookMetadata {
+                        mews_session_id: session.id.to_string(),
+                        run_id: run.to_string(),
+                        harness: harness_descriptor.name.clone(),
+                        context_hash: mews_protocol::AcpContextSnapshot::hash_rendered(
+                            &context_text,
+                        ),
+                        context_channel: channel,
+                        invoke_run_start: true,
+                    }),
                 },
                 environment,
                 &config.tools,
                 cancellation.clone(),
                 &mut |event| {
+                    if let mews_acp::AcpStreamEvent::SessionBound {
+                        session_id,
+                        transition,
+                        ..
+                    } = &event
+                    {
+                        self.store.bind_acp_session_with_observations(
+                            &session.id,
+                            &session.host_id,
+                            &harness_descriptor.name,
+                            &harness_descriptor.definition_hash,
+                            session_id,
+                            transition,
+                            &context,
+                            &context_text,
+                            channel,
+                            channel != mews_protocol::AcpInstructionChannel::FirstPrompt,
+                            run.clone(),
+                        )?;
+                    }
                     persist_local_acp_event(
                         &self.store,
                         session,
@@ -419,10 +503,12 @@ impl Mews {
                         &harness_descriptor,
                         &event,
                         event_notify.as_ref(),
+                        &mut reasoning,
                     )
                 },
             )
             .await;
+            reasoning.persist(&self.store, session, &run)?;
             return finish_acp_run(
                 &self.store,
                 session,
@@ -445,13 +531,41 @@ impl Mews {
                 session,
                 &harness_descriptor,
             )?;
-            let recovery_prompt =
-                runtime_store::canonical_acp_prompt(&self.store, session, &system)?;
-            let on_event = |event: mews_protocol::AcpEvent| -> Result<()> {
+            let recovery_prompt = runtime_store::canonical_acp_prompt(&self.store, session, "")?;
+            let resume_context = match &binding {
+                mews_protocol::AcpBindingTransition::Resume { .. } => self
+                    .store
+                    .acp_session_binding(&session.id)?
+                    .map(|binding| mews_protocol::AcpBindingContext {
+                        version: binding.context_version,
+                        hash: binding.context_hash,
+                        channel: binding.context_channel,
+                        text: binding.context_text,
+                    }),
+                mews_protocol::AcpBindingTransition::New
+                | mews_protocol::AcpBindingTransition::Replace { .. } => None,
+            };
+            let mut reasoning = AcpReasoningAggregate::default();
+            let mut on_event = |event: mews_protocol::AcpEvent| -> Result<()> {
                 match event {
-                    mews_protocol::AcpEvent::AssistantDelta { delta, message_id } => {
-                        self.store.append_client_event(
+                    mews_protocol::AcpEvent::AssistantDelta {
+                        event_key,
+                        delta,
+                        message_id,
+                        raw,
+                    } => {
+                        self.store.append_acp_observation_with_client_event(
                             &session.id,
+                            run.clone(),
+                            self.store
+                                .acp_session_binding(&session.id)?
+                                .map(|binding| binding.acp_session_id),
+                            Some(event_key),
+                            mews_protocol::AcpObservation::AssistantDelta {
+                                delta: delta.clone(),
+                                message_id: message_id.clone(),
+                                raw,
+                            },
                             crate::ClientEventKind::AssistantDelta {
                                 run_id: run.clone(),
                                 delta,
@@ -459,23 +573,25 @@ impl Mews {
                             },
                         )?;
                     }
-                    mews_protocol::AcpEvent::ProviderState { data } => {
-                        self.store.append_message(
+                    mews_protocol::AcpEvent::ProviderState { event_key, data } => {
+                        self.store.append_acp_observation(
                             &session.id,
-                            MessageRole::Assistant,
-                            MessageContent::ProviderState {
-                                provider: "acp".into(),
-                                model: "external".into(),
-                                data,
-                            },
-                            Value::Null,
-                            MessageSource {
-                                kind: SourceKind::Harness,
-                                id: "default".into(),
-                            },
+                            run.clone(),
+                            self.store
+                                .acp_session_binding(&session.id)?
+                                .map(|binding| binding.acp_session_id),
+                            Some(event_key),
+                            mews_protocol::AcpObservation::ProviderUpdate { data },
                         )?;
                     }
-                    mews_protocol::AcpEvent::ReasoningDelta { delta, message_id } => {
+                    mews_protocol::AcpEvent::ReasoningDelta {
+                        event_key,
+                        delta,
+                        message_id,
+                        raw,
+                    } => {
+                        let _ = (event_key, raw);
+                        reasoning.push(message_id.clone(), &delta);
                         self.store.append_client_event(
                             &session.id,
                             crate::ClientEventKind::ReasoningDelta {
@@ -485,13 +601,65 @@ impl Mews {
                             },
                         )?;
                     }
-                    mews_protocol::AcpEvent::ToolActivity { activity } => {
-                        self.store.append_client_event(
+                    mews_protocol::AcpEvent::ToolActivity {
+                        event_key,
+                        activity,
+                    } => {
+                        self.store.append_acp_observation_with_client_event(
                             &session.id,
+                            run.clone(),
+                            self.store
+                                .acp_session_binding(&session.id)?
+                                .map(|binding| binding.acp_session_id),
+                            Some(event_key),
+                            mews_protocol::AcpObservation::ToolActivity {
+                                activity: activity.clone(),
+                            },
                             crate::ClientEventKind::ToolActivity {
                                 run_id: run.clone(),
                                 activity,
                             },
+                        )?;
+                    }
+                    mews_protocol::AcpEvent::HookOutcome {
+                        event_key,
+                        hook,
+                        ok,
+                        detail,
+                        tool,
+                        call_id,
+                    } => {
+                        self.store.append_acp_observation(
+                            &session.id,
+                            run.clone(),
+                            self.store
+                                .acp_session_binding(&session.id)?
+                                .map(|binding| binding.acp_session_id),
+                            Some(event_key),
+                            mews_protocol::AcpObservation::HookOutcome {
+                                hook,
+                                ok,
+                                detail,
+                                tool,
+                                call_id,
+                            },
+                        )?;
+                    }
+                    mews_protocol::AcpEvent::ContextDispatched {
+                        session_id: acp_session_id,
+                        ..
+                    } => {
+                        let binding = self
+                            .store
+                            .acp_session_binding(&session.id)?
+                            .context("ACP context dispatched without a binding")?;
+                        if binding.acp_session_id != acp_session_id {
+                            bail!("ACP context dispatched for an unexpected Session");
+                        }
+                        self.store.mark_acp_context_dispatched_with_observation(
+                            &session.id,
+                            run.clone(),
+                            &acp_session_id,
                         )?;
                     }
                     mews_protocol::AcpEvent::SessionBound { .. } => {
@@ -514,11 +682,14 @@ impl Mews {
                     harness_options: config.harness_options.clone(),
                     tools: config.tools.clone(),
                     cwd: session.working_directory.clone(),
-                    prompt: mews_runtime::initial_session_prompt(&system, &prompt),
+                    prompt: prompt.clone(),
                     recovery_prompt,
-                    session_id: binding
-                        .as_ref()
-                        .map(|binding| binding.acp_session_id.clone()),
+                    agent_slug: agent_slug.clone(),
+                    soul: system.clone(),
+                    mews_session_id: session.id.to_string(),
+                    run_id: run.to_string(),
+                    transition: binding,
+                    context: resume_context,
                 },
                 event_tx,
                 &cancellation,
@@ -530,18 +701,25 @@ impl Mews {
                     event = event_rx.recv() => {
                         if let Some(event) = event {
                             match event {
-                                mews_protocol::AcpEvent::PermissionRequested { request } => {
+                                mews_protocol::AcpEvent::PermissionRequested { request, .. } => {
                                     resolve_remote_permission(
                                         host,
                                         permission_handler.as_deref(),
                                         &session.id,
                                         request,
+                                        &cancellation,
                                     ).await?;
                                 }
-                                mews_protocol::AcpEvent::SessionBound { acknowledgement_id, session_id: acp_session_id, replaced } => {
+                                mews_protocol::AcpEvent::SessionBound { acknowledgement_id, session_id: acp_session_id, transition, context, .. } => {
                                     persist_remote_acp_binding(
-                                        &self.store, host, session, &harness_descriptor,
-                                        acknowledgement_id, acp_session_id, replaced,
+                                        &self.store, host, session, &run, &harness_descriptor,
+                                        acknowledgement_id, acp_session_id, transition, context,
+                                    ).await?;
+                                }
+                                mews_protocol::AcpEvent::ContextDispatched { acknowledgement_id, session_id: acp_session_id, .. } => {
+                                    persist_remote_acp_dispatch(
+                                        &self.store, host, session, &run,
+                                        acknowledgement_id, acp_session_id,
                                     ).await?;
                                 }
                                 event => on_event(event)?,
@@ -552,34 +730,55 @@ impl Mews {
             };
             while let Ok(event) = event_rx.try_recv() {
                 match event {
-                    mews_protocol::AcpEvent::PermissionRequested { request } => {
+                    mews_protocol::AcpEvent::PermissionRequested { request, .. } => {
                         resolve_remote_permission(
                             host,
                             permission_handler.as_deref(),
                             &session.id,
                             request,
+                            &cancellation,
                         )
                         .await?;
                     }
                     mews_protocol::AcpEvent::SessionBound {
                         acknowledgement_id,
                         session_id: acp_session_id,
-                        replaced,
+                        transition,
+                        context,
+                        ..
                     } => {
                         persist_remote_acp_binding(
                             &self.store,
                             host,
                             session,
+                            &run,
                             &harness_descriptor,
                             acknowledgement_id,
                             acp_session_id,
-                            replaced,
+                            transition,
+                            context,
+                        )
+                        .await?;
+                    }
+                    mews_protocol::AcpEvent::ContextDispatched {
+                        acknowledgement_id,
+                        session_id: acp_session_id,
+                        ..
+                    } => {
+                        persist_remote_acp_dispatch(
+                            &self.store,
+                            host,
+                            session,
+                            &run,
+                            acknowledgement_id,
+                            acp_session_id,
                         )
                         .await?;
                     }
                     event => on_event(event)?,
                 }
             }
+            reasoning.persist(&self.store, session, &run)?;
             match outcome {
                 Ok(outcome) => {
                     return finish_acp_run(
@@ -592,9 +791,17 @@ impl Mews {
                     );
                 }
                 Err(error) => {
+                    let cancelled = cancellation.is_cancelled() || mews_acp::is_cancelled(&error);
                     let error = format!("{error:#}");
-                    self.store
-                        .finish_run(&run, RunStatus::Failed, Some(&error))?;
+                    self.store.finish_run(
+                        &run,
+                        if cancelled {
+                            RunStatus::Cancelled
+                        } else {
+                            RunStatus::Failed
+                        },
+                        (!cancelled).then_some(error.as_str()),
+                    )?;
                     if let Some(notify) = event_notify {
                         notify.notify_waiters();
                     }

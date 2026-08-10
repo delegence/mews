@@ -30,6 +30,23 @@ pub enum AcpErrorKind {
     Other,
 }
 
+/// Cancellation is a control-flow outcome, not an adapter failure.  Keep it
+/// typed while crossing the otherwise anyhow-based ACP boundary.
+#[derive(Debug)]
+pub struct AcpCancelled;
+
+impl fmt::Display for AcpCancelled {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ACP harness run cancelled")
+    }
+}
+
+impl std::error::Error for AcpCancelled {}
+
+pub fn is_cancelled(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<AcpCancelled>().is_some()
+}
+
 #[derive(Debug)]
 struct AcpRpcError {
     method: String,
@@ -116,7 +133,7 @@ impl<'a, W: AsyncWriteExt + Unpin> RpcClient<'a, W> {
                 tokio::select! {
                     _ = cancellation.cancelled() => {
                         self.cancel_with_grace(session_id.as_deref()).await;
-                        bail!("ACP Harness run cancelled");
+                        return Err(anyhow!(AcpCancelled));
                     }
                     result = http.accept_and_handle(mcp.context("MCP endpoint requires a Run bridge")?, deadline) => {
                         result?;
@@ -129,7 +146,7 @@ impl<'a, W: AsyncWriteExt + Unpin> RpcClient<'a, W> {
                 tokio::select! {
                     _ = cancellation.cancelled() => {
                         self.cancel_with_grace(session_id.as_deref()).await;
-                        bail!("ACP Harness run cancelled");
+                        return Err(anyhow!(AcpCancelled));
                     }
                     _ = time::sleep_until(deadline) => bail!("ACP request timed out"),
                     line = read_acp_line(self.reader, deadline) => line?,
@@ -148,7 +165,7 @@ impl<'a, W: AsyncWriteExt + Unpin> RpcClient<'a, W> {
                 continue;
             }
             if message.get("method").is_some() && message.get("id").is_some() {
-                self.handle_client_request(&message, cancellation, &mut on_update)
+                self.handle_client_request(&message, cancellation, deadline, &mut on_update)
                     .await?;
                 continue;
             }
@@ -175,6 +192,7 @@ impl<'a, W: AsyncWriteExt + Unpin> RpcClient<'a, W> {
         &mut self,
         message: &Value,
         cancellation: &mews_agent::CancellationToken,
+        deadline: time::Instant,
         on_update: &mut F,
     ) -> Result<()>
     where
@@ -196,10 +214,9 @@ impl<'a, W: AsyncWriteExt + Unpin> RpcClient<'a, W> {
             }))?;
             let request: AcpPermissionRequest = serde_json::from_value(params)
                 .context("invalid ACP session/request_permission parameters")?;
-            let decision = tokio::select! {
-                _ = cancellation.cancelled() => AcpPermissionDecision::Cancelled,
-                decision = self.permission_handler.request_permission(&request, cancellation) => decision?,
-            };
+            let decision =
+                request_permission(self.permission_handler, &request, cancellation, deadline)
+                    .await?;
             let outcome = match decision {
                 AcpPermissionDecision::Selected(option_id) => {
                     if !request
@@ -254,6 +271,19 @@ impl<'a, W: AsyncWriteExt + Unpin> RpcClient<'a, W> {
     }
 }
 
+async fn request_permission(
+    handler: &dyn AcpPermissionHandler,
+    request: &AcpPermissionRequest,
+    cancellation: &mews_agent::CancellationToken,
+    deadline: time::Instant,
+) -> Result<AcpPermissionDecision> {
+    tokio::select! {
+        _ = cancellation.cancelled() => Ok(AcpPermissionDecision::Cancelled),
+        _ = time::sleep_until(deadline) => bail!("ACP request timed out"),
+        decision = handler.request_permission(request, cancellation) => decision,
+    }
+}
+
 async fn read_acp_line<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
     deadline: time::Instant,
@@ -301,6 +331,46 @@ pub(crate) fn acp_rpc_error(method: &str, error: &Value) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+
+    struct StalledPermissionHandler;
+
+    #[async_trait]
+    impl AcpPermissionHandler for StalledPermissionHandler {
+        async fn request_permission(
+            &self,
+            _: &AcpPermissionRequest,
+            _: &mews_agent::CancellationToken,
+        ) -> Result<AcpPermissionDecision> {
+            std::future::pending().await
+        }
+    }
+
+    struct AllowPermissionHandler;
+
+    #[async_trait]
+    impl AcpPermissionHandler for AllowPermissionHandler {
+        async fn request_permission(
+            &self,
+            _: &AcpPermissionRequest,
+            _: &mews_agent::CancellationToken,
+        ) -> Result<AcpPermissionDecision> {
+            Ok(AcpPermissionDecision::Selected("allow".into()))
+        }
+    }
+
+    fn permission_request() -> AcpPermissionRequest {
+        serde_json::from_value(json!({
+            "sessionId": "fixture",
+            "toolCall": {},
+            "options": [{
+                "optionId": "allow",
+                "name": "Allow once",
+                "kind": "allow_once"
+            }]
+        }))
+        .unwrap()
+    }
 
     #[tokio::test]
     async fn rejects_oversized_no_newline_output_at_the_ingress_bound() {
@@ -310,5 +380,39 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("exceeds 1 MiB"));
+    }
+
+    #[tokio::test]
+    async fn stalled_permission_handler_respects_the_request_deadline() {
+        let cancellation = mews_agent::CancellationToken::new();
+        let error = time::timeout(
+            Duration::from_secs(1),
+            request_permission(
+                &StalledPermissionHandler,
+                &permission_request(),
+                &cancellation,
+                time::Instant::now() + Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("permission wait must finish at the request deadline")
+        .unwrap_err();
+
+        assert!(error.to_string().contains("ACP request timed out"));
+    }
+
+    #[tokio::test]
+    async fn prompt_permission_handler_completes_before_the_request_deadline() {
+        let cancellation = mews_agent::CancellationToken::new();
+        let decision = request_permission(
+            &AllowPermissionHandler,
+            &permission_request(),
+            &cancellation,
+            time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(decision, AcpPermissionDecision::Selected("allow".into()));
     }
 }

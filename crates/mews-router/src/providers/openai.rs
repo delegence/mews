@@ -66,8 +66,13 @@ pub(crate) async fn generate(
             "type":"function", "name":tool.name, "description":tool.description,
             "parameters":tool.schema, "strict":true
         })).collect::<Vec<_>>(),
-        "store": false,
+        "store": !codex,
     });
+    if let Some(cursor) = request.continuation.as_ref().filter(|cursor| {
+        cursor.provider == provider && cursor.model == model && cursor.api == "responses"
+    }) {
+        body["previous_response_id"] = Value::String(cursor.response_id.clone());
+    }
     if include_reasoning {
         body["include"] = json!(["reasoning.encrypted_content"]);
     }
@@ -148,9 +153,14 @@ pub(crate) async fn stream(
             "type":"function", "name":tool.name, "description":tool.description,
             "parameters":tool.schema, "strict":true
         })).collect::<Vec<_>>(),
-        "store": false,
+        "store": !codex,
         "stream": true,
     });
+    if let Some(cursor) = request.continuation.as_ref().filter(|cursor| {
+        cursor.provider == provider && cursor.model == model && cursor.api == "responses"
+    }) {
+        body["previous_response_id"] = Value::String(cursor.response_id.clone());
+    }
     if include_reasoning {
         body["include"] = json!(["reasoning.encrypted_content"]);
     }
@@ -242,10 +252,30 @@ fn openai_response_stream(
                     return;
                 }
                 let item = match event_type {
+                    Some("response.created") => {
+                        event
+                            .get("response")
+                            .map(|response| ModelStreamEvent::ResponseMetadata {
+                                provider: state_provider.clone(),
+                                model: state_model.clone(),
+                                api: "responses".into(),
+                                response_id: response
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                            })
+                    }
                     Some("response.output_text.delta") => event
                         .get("delta")
                         .and_then(Value::as_str)
                         .map(|delta| ModelStreamEvent::TextDelta(delta.to_owned())),
+                    Some("response.reasoning_summary_text.delta") => event
+                        .get("delta")
+                        .and_then(Value::as_str)
+                        .map(|text| ModelStreamEvent::Reasoning {
+                            text: text.to_owned(),
+                            signature: None,
+                        }),
                     Some("response.output_item.done")
                         if event.pointer("/item/type").and_then(Value::as_str)
                             == Some("function_call") =>
@@ -276,6 +306,16 @@ fn openai_response_stream(
                         })
                     }
                     Some("response.completed") => {
+                        let response = event.get("response").unwrap_or(&Value::Null);
+                        let _ = sender
+                            .send(Ok(ModelStreamEvent::ResponseCompleted {
+                                usage: openai_usage(response),
+                                stop_reason: response
+                                    .get("status")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                            }))
+                            .await;
                         let _ = sender.send(Ok(ModelStreamEvent::Done)).await;
                         return;
                     }
@@ -287,6 +327,10 @@ fn openai_response_stream(
                     return;
                 }
             }
+            // Completed frames were drained above, so `buffer` now contains only
+            // an incomplete event. Cap it here as well: a peer may never send a
+            // delimiter, and waiting for `sse_frame_end` must not grow memory
+            // without bound.
             if buffer.len() > MAX_SSE_EVENT_BYTES {
                 let _ = sender.send(Err(sse_event_too_large())).await;
                 return;
@@ -480,42 +524,109 @@ fn messages(messages: &[crate::ModelMessage], provider: &str, model: &str) -> Re
 }
 
 fn parse(response: Value, provider: &str, model: &str) -> Result<ModelResponse> {
-    let parts = response
+    let output = response
         .get("output")
         .and_then(Value::as_array)
-        .context("OpenAI response has no output")?
-        .iter()
-        .filter_map(|part| match part.get("type").and_then(Value::as_str) {
-            Some("message") => part
-                .get("content")?
-                .as_array()?
-                .iter()
-                .find_map(|content| content.get("text").and_then(Value::as_str))
-                .map(|text| ModelPart::Text {
-                    text: text.to_owned(),
-                }),
-            Some("function_call") => Some(ModelPart::ToolCall {
-                id: part.get("call_id")?.as_str()?.to_owned(),
-                name: part.get("name")?.as_str()?.to_owned(),
-                arguments: serde_json::from_str(part.get("arguments")?.as_str()?).ok()?,
-                thought_signature: None,
-            }),
-            Some("reasoning")
+        .context("OpenAI response has no output")?;
+    let mut parts = Vec::new();
+    for part in output {
+        match part.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                for content in part
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(text) = content.get("text").and_then(Value::as_str) {
+                        parts.push(ModelPart::Text {
+                            text: text.to_owned(),
+                        });
+                    }
+                }
+            }
+            Some("function_call") => {
+                if let (Some(id), Some(name), Some(arguments)) = (
+                    part.get("call_id").and_then(Value::as_str),
+                    part.get("name").and_then(Value::as_str),
+                    part.get("arguments")
+                        .and_then(Value::as_str)
+                        .and_then(|value| serde_json::from_str(value).ok()),
+                ) {
+                    parts.push(ModelPart::ToolCall {
+                        id: id.into(),
+                        name: name.into(),
+                        arguments,
+                        thought_signature: None,
+                    });
+                }
+            }
+            Some("reasoning") => {
+                for summary in part
+                    .get("summary")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(text) = summary.get("text").and_then(Value::as_str) {
+                        parts.push(ModelPart::Reasoning {
+                            text: text.into(),
+                            signature: None,
+                        });
+                    }
+                }
                 if part
                     .get("encrypted_content")
                     .and_then(Value::as_str)
-                    .is_some_and(|value| !value.is_empty()) =>
-            {
-                Some(ModelPart::ProviderState {
-                    provider: provider.into(),
-                    model: model.into(),
-                    data: part.clone(),
-                })
+                    .is_some_and(|value| !value.is_empty())
+                {
+                    parts.push(ModelPart::ProviderState {
+                        provider: provider.into(),
+                        model: model.into(),
+                        data: part.clone(),
+                    });
+                }
             }
-            _ => None,
-        })
-        .collect();
-    Ok(ModelResponse { parts })
+            _ => {}
+        }
+    }
+    Ok(ModelResponse {
+        provider: provider.into(),
+        model: model.into(),
+        api: "responses".into(),
+        response_id: response
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        usage: openai_usage(&response),
+        stop_reason: response
+            .get("status")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        parts,
+    })
+}
+
+fn openai_usage(response: &Value) -> Option<mews_protocol::ModelUsage> {
+    let usage = response.get("usage")?;
+    Some(mews_protocol::ModelUsage {
+        input_tokens: usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        output_tokens: usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cached_input_tokens: usage
+            .pointer("/input_tokens_details/cached_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        reasoning_tokens: usage
+            .pointer("/output_tokens_details/reasoning_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    })
 }
 
 fn parse_sse(body: &str, provider: &str, model: &str) -> Result<ModelResponse> {
@@ -898,7 +1009,11 @@ mod tests {
 
         assert!(matches!(
             events.as_slice(),
-            [Ok(ModelStreamEvent::Start), Ok(ModelStreamEvent::Done)]
+            [
+                Ok(ModelStreamEvent::Start),
+                Ok(ModelStreamEvent::ResponseCompleted { .. }),
+                Ok(ModelStreamEvent::Done)
+            ]
         ));
     }
 
@@ -1010,9 +1125,15 @@ mod tests {
 
     #[test]
     fn parses_codex_completed_sse() {
-        let body = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]}}\n\ndata: [DONE]\n";
+        let body = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":4},\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]}}\n\ndata: [DONE]\n";
+        let response = parse_sse(body, "openai-codex", "gpt-test").unwrap();
+        assert_eq!(response.response_id.as_deref(), Some("resp_1"));
         assert_eq!(
-            parse_sse(body, "openai-codex", "gpt-test").unwrap().parts,
+            response.usage.as_ref().map(|usage| usage.output_tokens),
+            Some(4)
+        );
+        assert_eq!(
+            response.parts,
             vec![ModelPart::Text {
                 text: "done".into()
             }]
@@ -1088,6 +1209,7 @@ mod tests {
                 system: "help".into(),
                 messages: vec![],
                 tools: vec![],
+                continuation: None,
             },
         )
         .await

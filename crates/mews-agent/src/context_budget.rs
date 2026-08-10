@@ -111,6 +111,7 @@ mod tests {
                 message(MessageRole::Assistant, "y".repeat(100 * 1024)),
             ],
             tools: Vec::new(),
+            continuation: None,
         };
 
         assert_eq!(apply_context_budget(&mut request).unwrap(), 2);

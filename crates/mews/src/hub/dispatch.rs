@@ -26,6 +26,16 @@ pub(crate) async fn dispatch(
     origin: RequestOrigin<'_>,
     request: HubRequest,
 ) -> Result<(HubResponse, bool)> {
+    if let HubRequest::PollEvents {
+        consumer_id,
+        limit,
+        wait_ms,
+    } = &request
+    {
+        let events =
+            runs::poll_events(runtime, root, consumer_id.clone(), *limit, *wait_ms).await?;
+        return Ok((HubResponse::Events(events), false));
+    }
     let is_move = matches!(&request, HubRequest::MoveHub { .. });
     let _operation_guard = if is_move {
         None
@@ -41,14 +51,7 @@ pub(crate) async fn dispatch(
         bail!("Hub is moving; try again after handoff");
     }
     let request = match request {
-        HubRequest::PollEvents {
-            consumer_id,
-            limit,
-            wait_ms,
-        } => {
-            let events = runs::poll_events(runtime, root, consumer_id, limit, wait_ms).await?;
-            return Ok((HubResponse::Events(events), false));
-        }
+        HubRequest::PollEvents { .. } => unreachable!("handled before acquiring the handoff gate"),
         HubRequest::StartTurn {
             idempotency_key,
             session_id,
@@ -179,6 +182,12 @@ pub(crate) async fn dispatch(
         }
         HubRequest::ListSessions => HubResponse::Sessions(mews.sessions()?),
         HubRequest::GetSession { id } => HubResponse::Session(mews.session(&id)?),
+        HubRequest::GetSessionHistory { id, after, limit } => {
+            HubResponse::SessionHistory(mews.session_history_page(&id, after, limit)?)
+        }
+        HubRequest::GetSessionEntries { id, after, limit } => {
+            HubResponse::SessionEntries(mews.session_entries_page(&id, after, limit)?)
+        }
         HubRequest::GetSessionModelConfig { id } => {
             let session = mews.session(&id)?;
             HubResponse::SessionModelConfig(mews.session_model_config(&session)?)
@@ -249,8 +258,11 @@ pub(crate) async fn dispatch(
                 .context("Hub Host is missing from installation")?
                 .clone();
             let connected = runtime.remote_hosts.lock().await;
-            let mut catalog = mews_host::HarnessCatalog::discover(Some(root))?
-                .descriptors()
+            let local_descriptors = mews_host::HarnessCatalog::discover(Some(root))?.descriptors();
+            runtime
+                .local_host
+                .replace_harness_catalog(local_descriptors.clone());
+            let mut catalog = local_descriptors
                 .into_iter()
                 .map(|descriptor| crate::HostHarnessStatus {
                     host: hub_host.clone(),
@@ -287,8 +299,11 @@ pub(crate) async fn dispatch(
                 .context("Hub Host is missing from installation")?
                 .clone();
             let connected = runtime.remote_hosts.lock().await;
-            let mut catalog = mews_host::HarnessCatalog::discover(Some(root))?
-                .descriptors()
+            let local_descriptors = mews_host::HarnessCatalog::discover(Some(root))?.descriptors();
+            runtime
+                .local_host
+                .replace_harness_catalog(local_descriptors.clone());
+            let mut catalog = local_descriptors
                 .into_iter()
                 .map(|descriptor| crate::HostHarnessStatus {
                     host: hub_host.clone(),

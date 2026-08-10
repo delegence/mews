@@ -608,7 +608,14 @@ fn parse(
                 arguments: part.get("input")?.clone(),
                 thought_signature: None,
             }),
-            Some("thinking" | "redacted_thinking") => Some(ModelPart::ProviderState {
+            Some("thinking") => Some(ModelPart::Reasoning {
+                text: part.get("thinking")?.as_str()?.to_owned(),
+                signature: part
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            }),
+            Some("redacted_thinking") => Some(ModelPart::ProviderState {
                 provider: "anthropic".into(),
                 model: model.into(),
                 data: part.clone(),
@@ -616,7 +623,38 @@ fn parse(
             _ => None,
         })
         .collect();
-    Ok(ModelResponse { parts })
+    let usage = response
+        .get("usage")
+        .map(|usage| mews_protocol::ModelUsage {
+            input_tokens: usage
+                .get("input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            output_tokens: usage
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            cached_input_tokens: usage
+                .get("cache_read_input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            reasoning_tokens: 0,
+        });
+    Ok(ModelResponse {
+        provider: "anthropic".into(),
+        model: model.into(),
+        api: "messages".into(),
+        response_id: response
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        usage,
+        stop_reason: response
+            .get("stop_reason")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        parts,
+    })
 }
 
 #[cfg(test)]
@@ -681,8 +719,8 @@ mod tests {
         assert_eq!(response.parts.len(), 3);
         assert!(matches!(
             &response.parts[0],
-            ModelPart::ProviderState { provider, model, data }
-                if provider == "anthropic" && model == "claude-test" && data["signature"] == "sig"
+            ModelPart::Reasoning { text, signature }
+                if text == "plan" && signature.as_deref() == Some("sig")
         ));
         assert!(
             matches!(&response.parts[2], ModelPart::ToolCall { id, name, arguments, .. } if id == "tool-2" && name == "write" && arguments["path"] == "b")
@@ -824,6 +862,7 @@ mod tests {
                 system: "help".into(),
                 messages: vec![],
                 tools: vec![],
+                continuation: None,
             },
         )
         .await

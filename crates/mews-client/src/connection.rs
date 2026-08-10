@@ -2,16 +2,16 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use mews_protocol::{
-    Frame, HubRequest, HubResponse, RequestId, decode_hub_body, decode_hub_envelope,
-    encode_hub_frame, validate_hub_version,
+    Frame, HubRequest, HubResponse, MAX_HUB_FRAME_BYTES, RequestId, decode_hub_body,
+    decode_hub_envelope, encode_hub_frame, validate_hub_version,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
 };
 
 struct Transport {
-    reader: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
     writer: tokio::net::unix::OwnedWriteHalf,
 }
 
@@ -34,7 +34,7 @@ impl LocalConnection {
             .context("connect to local MEWS daemon; run mews setup")?;
         let (reader, writer) = stream.into_split();
         Ok(Transport {
-            reader: BufReader::new(reader).lines(),
+            reader: BufReader::new(reader),
             writer,
         })
     }
@@ -83,15 +83,20 @@ impl LocalConnection {
         let encoded = encode_hub_frame(&Frame::with_request_id(request, request_id.clone()))?;
         self.transport.writer.write_all(&encoded).await?;
         self.transport.writer.write_all(b"\n").await?;
-        let line = self
-            .transport
-            .reader
-            .next_line()
-            .await?
-            .context(
+        let mut encoded = Vec::new();
+        let read = (&mut self.transport.reader)
+            .take(MAX_HUB_FRAME_BYTES as u64 + 1)
+            .read_until(b'\n', &mut encoded)
+            .await?;
+        if read == 0 {
+            anyhow::bail!(
                 "MEWS daemon closed the connection; it may be running an older protocol version, run `mews restart`",
-            )?;
-        let frame = decode_hub_envelope(line.as_bytes())?;
+            );
+        }
+        if encoded.len() > MAX_HUB_FRAME_BYTES || !encoded.ends_with(b"\n") {
+            bail!("daemon response frame exceeds 1 MiB");
+        }
+        let frame = decode_hub_envelope(&encoded)?;
         validate_hub_version(&frame)?;
         let frame: Frame<HubResponse> = decode_hub_body(frame)?;
         if frame.request_id != request_id {
@@ -111,6 +116,8 @@ fn retry_safe(request: &HubRequest) -> bool {
             | HubRequest::ListAgents
             | HubRequest::ListSessions
             | HubRequest::GetSession { .. }
+            | HubRequest::GetSessionHistory { .. }
+            | HubRequest::GetSessionEntries { .. }
             | HubRequest::GetSessionModelConfig { .. }
             | HubRequest::ListHosts
             | HubRequest::ListAuth
@@ -208,5 +215,30 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("protocol version 999 is incompatible"));
         assert!(message.contains("restart the MEWS daemon"));
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_response_frames() {
+        let root = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(root.path().join("hub.sock")).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            lines.next_line().await.unwrap().unwrap();
+            writer
+                .write_all(&vec![b' '; MAX_HUB_FRAME_BYTES + 1])
+                .await
+                .unwrap();
+        });
+
+        let mut connection = LocalConnection::connect(root.path()).await.unwrap();
+        let error = connection
+            .request(HubRequest::ArchiveAgent {
+                slug: "coder".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("response frame exceeds 1 MiB"));
     }
 }

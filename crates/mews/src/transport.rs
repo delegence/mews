@@ -265,6 +265,15 @@ pub async fn run_host_rpc(mut peer: EncryptedRelayPeer, registry: ToolRegistry) 
             RequestId,
             mews_agent::CancellationToken,
         >::new()));
+    let tool_cancellations =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            RequestId,
+            mews_agent::CancellationToken,
+        >::new()));
+    let _acp_cancellation_owner =
+        crate::host::CancellationRegistryOwner::new(std::sync::Arc::clone(&acp_cancellations));
+    let _tool_cancellation_owner =
+        crate::host::CancellationRegistryOwner::new(std::sync::Arc::clone(&tool_cancellations));
     let (output_tx, mut output_rx) =
         tokio::sync::mpsc::channel(crate::host::ACP_EVENT_CHANNEL_CAPACITY);
     loop {
@@ -289,20 +298,36 @@ pub async fn run_host_rpc(mut peer: EncryptedRelayPeer, registry: ToolRegistry) 
                     }
                     continue;
                 }
+                if let HubToHost::CancelTool { request_id } = request {
+                    if let Some(cancellation) = tool_cancellations.lock().expect("tool cancellations poisoned").remove(&request_id) {
+                        cancellation.cancel();
+                    }
+                    continue;
+                }
                 let acp_request_id = match &request {
                     HubToHost::RunAcp { request_id, .. } => Some(request_id.clone()),
+                    _ => None,
+                };
+                let tool_request_id = match &request {
+                    HubToHost::ExecuteTool { request_id, .. }
+                    | HubToHost::ExecuteHook { request_id, .. } => Some(request_id.clone()),
                     _ => None,
                 };
                 let cancellation = acp_request_id.as_ref().map(|request_id| {
                     let cancellation = mews_agent::CancellationToken::new();
                     acp_cancellations.lock().expect("ACP cancellations poisoned").insert(request_id.clone(), cancellation.clone());
                     cancellation
-                });
+                }).or_else(|| tool_request_id.as_ref().map(|request_id| {
+                    let cancellation = mews_agent::CancellationToken::new();
+                    tool_cancellations.lock().expect("tool cancellations poisoned").insert(request_id.clone(), cancellation.clone());
+                    cancellation
+                }));
                 let registry = registry.clone();
                 let output = output_tx.clone();
                 let waiters = std::sync::Arc::clone(&permission_waiters);
                 let binding_waiters = std::sync::Arc::clone(&binding_waiters);
                 let cancellations = std::sync::Arc::clone(&acp_cancellations);
+                let tool_cancellations = std::sync::Arc::clone(&tool_cancellations);
                 tokio::spawn(async move {
                     let (event_tx, mut event_rx) =
                         tokio::sync::mpsc::channel(crate::host::ACP_EVENT_CHANNEL_CAPACITY);
@@ -324,6 +349,9 @@ pub async fn run_host_rpc(mut peer: EncryptedRelayPeer, registry: ToolRegistry) 
                     let _ = output.send(response).await;
                     if let Some(request_id) = acp_request_id {
                         cancellations.lock().expect("ACP cancellations poisoned").remove(&request_id);
+                    }
+                    if let Some(request_id) = tool_request_id {
+                        tool_cancellations.lock().expect("tool cancellations poisoned").remove(&request_id);
                     }
                 });
             }

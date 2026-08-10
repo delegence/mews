@@ -10,8 +10,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use mews_protocol::{
-    HarnessAvailability, HarnessDescriptor, HarnessModelCapability, HarnessProtocol,
-    HarnessReadiness,
+    AcpInstructionChannel, HarnessAvailability, HarnessDescriptor, HarnessModelCapability,
+    HarnessProtocol, HarnessReadiness,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -32,6 +32,7 @@ use super::{
 pub struct HarnessCatalog {
     descriptors: Vec<HarnessDescriptor>,
     commands: BTreeMap<String, Vec<std::ffi::OsString>>,
+    managed_recipes: std::collections::BTreeSet<String>,
 }
 
 /// The result of the Host-local portion of Harness setup.
@@ -51,6 +52,7 @@ pub struct HarnessSetup {
 pub struct HarnessLaunch {
     pub command: Vec<std::ffi::OsString>,
     pub environment: BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+    pub instruction_channel: AcpInstructionChannel,
 }
 
 impl HarnessCatalog {
@@ -58,6 +60,7 @@ impl HarnessCatalog {
         let mut definitions = root.map(load_definitions).transpose()?.unwrap_or_default();
         let mut descriptors = vec![native_mews()];
         let mut commands = BTreeMap::new();
+        let mut managed_recipes = std::collections::BTreeSet::new();
 
         for recipe in NAMES {
             if let Some(definition) = definitions.remove(recipe) {
@@ -75,6 +78,7 @@ impl HarnessCatalog {
                 let (descriptor, command) = detected_recipe(root, recipe);
                 if let Some(command) = command {
                     commands.insert(recipe.into(), command);
+                    managed_recipes.insert(recipe.into());
                 }
                 descriptors.push(descriptor);
             }
@@ -95,6 +99,7 @@ impl HarnessCatalog {
         Ok(Self {
             descriptors,
             commands,
+            managed_recipes,
         })
     }
 
@@ -143,10 +148,21 @@ impl HarnessCatalog {
         // execution context needed by native tools, then override only the
         // provider's profile location below.
         let mut environment = inherited_launch_environment();
-        apply_profile_environment(name, profile, &mut environment);
+        if self.managed_recipes.contains(name) {
+            apply_profile_environment(name, profile, &mut environment);
+        }
         Ok(HarnessLaunch {
             command,
             environment,
+            instruction_channel: match name {
+                "codex" if self.managed_recipes.contains(name) => {
+                    AcpInstructionChannel::CodexDeveloper
+                }
+                "claude" if self.managed_recipes.contains(name) => {
+                    AcpInstructionChannel::ClaudeSystemAppend
+                }
+                _ => AcpInstructionChannel::FirstPrompt,
+            },
         })
     }
 
