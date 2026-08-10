@@ -6,7 +6,7 @@ use serde_json::Value;
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct AcpPermissionRequest {
+pub(crate) struct AcpPermissionRequest {
     pub session_id: String,
     pub tool_call: Value,
     pub options: Vec<AcpPermissionOption>,
@@ -16,7 +16,7 @@ pub struct AcpPermissionRequest {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct AcpPermissionOption {
+pub(crate) struct AcpPermissionOption {
     pub option_id: String,
     pub name: String,
     pub kind: AcpPermissionOptionKind,
@@ -26,7 +26,7 @@ pub struct AcpPermissionOption {
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum AcpPermissionOptionKind {
+pub(crate) enum AcpPermissionOptionKind {
     AllowOnce,
     AllowAlways,
     RejectOnce,
@@ -34,13 +34,13 @@ pub enum AcpPermissionOptionKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AcpPermissionDecision {
+pub(crate) enum AcpPermissionDecision {
     Selected(String),
     Cancelled,
 }
 
 #[async_trait]
-pub trait AcpPermissionHandler: Send + Sync {
+pub(crate) trait AcpPermissionHandler: Send + Sync {
     async fn request_permission(
         &self,
         request: &AcpPermissionRequest,
@@ -49,10 +49,10 @@ pub trait AcpPermissionHandler: Send + Sync {
 }
 
 #[derive(Debug)]
-pub(crate) struct RejectPermissions;
+pub(crate) struct AllowPermissions;
 
 #[async_trait]
-impl AcpPermissionHandler for RejectPermissions {
+impl AcpPermissionHandler for AllowPermissions {
     async fn request_permission(
         &self,
         request: &AcpPermissionRequest,
@@ -61,14 +61,58 @@ impl AcpPermissionHandler for RejectPermissions {
         Ok(request
             .options
             .iter()
-            .find(|option| {
-                matches!(
-                    option.kind,
-                    AcpPermissionOptionKind::RejectOnce | AcpPermissionOptionKind::RejectAlways
-                )
+            .find(|option| matches!(option.kind, AcpPermissionOptionKind::AllowAlways))
+            .or_else(|| {
+                request
+                    .options
+                    .iter()
+                    .find(|option| matches!(option.kind, AcpPermissionOptionKind::AllowOnce))
             })
             .map_or(AcpPermissionDecision::Cancelled, |option| {
                 AcpPermissionDecision::Selected(option.option_id.clone())
             }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn permissions_prefer_persistent_then_one_time_approval() {
+        let handler = AllowPermissions;
+        let request = |options| AcpPermissionRequest {
+            session_id: "session".into(),
+            tool_call: Value::Null,
+            options,
+            metadata: None,
+        };
+        let option = |id: &str, kind| AcpPermissionOption {
+            option_id: id.into(),
+            name: id.into(),
+            kind,
+            metadata: None,
+        };
+
+        let decision = handler
+            .request_permission(
+                &request(vec![
+                    option("once", AcpPermissionOptionKind::AllowOnce),
+                    option("always", AcpPermissionOptionKind::AllowAlways),
+                ]),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(decision, AcpPermissionDecision::Selected("always".into()));
+
+        let decision = handler
+            .request_permission(
+                &request(vec![option("once", AcpPermissionOptionKind::AllowOnce)]),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(decision, AcpPermissionDecision::Selected("once".into()));
     }
 }

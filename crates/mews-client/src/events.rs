@@ -48,7 +48,6 @@ impl MewsClient {
             let batch = self.poll_events(consumer.clone(), 30_000).await?;
             let mut finished = false;
             let mut failure = None;
-            let mut permissions = Vec::new();
             for event in &batch.events {
                 match &event.kind {
                     mews_protocol::ClientEventKind::AssistantMessage { message, .. }
@@ -73,11 +72,6 @@ impl MewsClient {
                     {
                         failure = Some("Run cancelled".into())
                     }
-                    mews_protocol::ClientEventKind::PermissionRequested { run_id, request }
-                        if *run_id == run.id =>
-                    {
-                        permissions.push(request.clone())
-                    }
                     _ => {}
                 }
             }
@@ -86,14 +80,6 @@ impl MewsClient {
             }
             if let Some(error) = failure {
                 bail!("Run failed: {error}");
-            }
-            for request in permissions {
-                let rejected = request
-                    .options
-                    .iter()
-                    .find(|option| option.kind.starts_with("reject"))
-                    .map(|option| option.id.clone());
-                self.resolve_permission(request.id, rejected).await?;
             }
             if finished {
                 return Ok(answer);

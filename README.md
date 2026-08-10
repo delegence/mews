@@ -14,15 +14,20 @@ Install with stable Rust 1.88 or newer:
 cargo install --path crates/mews
 ```
 
-Use a temporary state directory while the schema is under active development:
+For development, [Mise](https://mise.jdx.dev/) keeps all MEWS state in the
+repository's ignored `.mews/` directory and runs the workspace binary:
 
 ```sh
-export MEWS_HOME="$PWD/.mews-dev"
-mews setup
-mews providers login
-mews providers models
-mews agents new coder
+mise run mews -- setup
+mise run mews -- providers login
+mise run mews -- providers models
+mise run mews -- agents new coder
 ```
+
+Every command run through this task uses `MEWS_HOME=$PWD/.mews`. Inspect that
+directory directly, or delete all local development state with
+`mise run mews:reset`. An installed `mews` binary continues to use its normal
+home unless `MEWS_HOME` is set separately.
 
 Running `mews setup` in a terminal opens an inline wizard. Use the arrow keys and Enter to create a new MEWS or join an existing one, and Escape to cancel. The suggested Host name comes from the current machine and the suggested relay address is shown before it is used. Existing flags remain available for scripts and unattended setup.
 
@@ -78,7 +83,9 @@ mews status
 
 `mews-client` provides the typed local-daemon API. `mews-channel` is an optional reusable runtime for external-conversation adapters: it persists mappings locally, starts asynchronous Runs through its machine's daemon, and consumes acknowledged durable Hub events. Concrete channel implementations remain outside the core workspace until one is needed.
 
-The development database schema is intentionally migration-free. Clear `~/.mews/` after updating before real testing. Native Sessions retain ordered rich provider responses and can always replay canonical history; OpenAI response IDs are optional same-provider/model/API optimization cursors. ACP continuation remains separately authoritative through its required ACP Session binding.
+The development database schema is intentionally migration-free. Run
+`mise run mews:reset` after a breaking schema change when using the project-local
+development environment. Native Sessions retain ordered rich provider responses and can always replay canonical history; OpenAI response IDs are optional same-provider/model/API optimization cursors. ACP continuation remains separately authoritative through its required ACP Session binding.
 
 For the built-in `mews` Harness, `/model <provider/model>` switches the model for subsequent turns in that Session; `/model default` clears the override and returns to the Agent's configured model or, when absent, the current installation default. The override is durable Session state and does not mutate `agent.toml`. ACP Harnesses currently ignore this override.
 
@@ -104,7 +111,9 @@ extensions in `<MEWS_HOME>/extensions/*.toml` can register tools and handle the
 native Harness lifecycle hooks; they hot-reload and run with the Host user's authority. ACP
 Harnesses receive run-scoped extension tools through MCP when they support it. ACP runs also
 receive only a snapshot of the selected Agent's skills through `mews_list_skills` and
-`mews_read_skill`; project/global skills are not exposed.
+`mews_read_skill`; project/global skills are not exposed. One private endpoint supports both
+legacy MCP through `2025-11-25` and stateless MCP `2026-07-28`, selected from the client's wire
+behavior rather than the Harness name.
 
 The local client protocol uses owner-only Unix sockets, so MEWS targets macOS and Linux. Hub setup automatically starts a relay on `0.0.0.0:8787` and advertises a `.local` address derived from the configured Host name. A second machine on the same LAN can join without configuring relay infrastructure:
 

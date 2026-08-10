@@ -52,57 +52,6 @@ impl AcpReasoningAggregate {
     }
 }
 
-pub(super) async fn resolve_remote_permission(
-    host: &dyn crate::host::HostControl,
-    handler: Option<&dyn mews_acp::AcpPermissionHandler>,
-    session_id: &crate::SessionId,
-    request: mews_protocol::PermissionRequest,
-    cancellation: &mews_agent::CancellationToken,
-) -> Result<()> {
-    let permission_id = request.id.clone();
-    let selected = if let Some(handler) = handler {
-        let options = request
-            .options
-            .into_iter()
-            .map(|option| {
-                let kind = match option.kind.as_str() {
-                    "allow_once" => mews_acp::AcpPermissionOptionKind::AllowOnce,
-                    "allow_always" => mews_acp::AcpPermissionOptionKind::AllowAlways,
-                    "reject_once" => mews_acp::AcpPermissionOptionKind::RejectOnce,
-                    "reject_always" => mews_acp::AcpPermissionOptionKind::RejectAlways,
-                    other => {
-                        bail!("remote Harness returned unknown permission option kind {other:?}")
-                    }
-                };
-                Ok(mews_acp::AcpPermissionOption {
-                    option_id: option.id,
-                    name: option.name,
-                    kind,
-                    metadata: None,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        match handler
-            .request_permission(
-                &mews_acp::AcpPermissionRequest {
-                    session_id: session_id.to_string(),
-                    tool_call: request.tool_call,
-                    options,
-                    metadata: None,
-                },
-                cancellation,
-            )
-            .await?
-        {
-            mews_acp::AcpPermissionDecision::Selected(option_id) => Some(option_id),
-            mews_acp::AcpPermissionDecision::Cancelled => None,
-        }
-    } else {
-        None
-    };
-    host.resolve_acp_permission(permission_id, selected).await
-}
-
 pub(super) fn checked_acp_binding(
     binding: Option<mews_protocol::AcpSessionBinding>,
     session: &crate::Session,

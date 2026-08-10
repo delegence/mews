@@ -643,14 +643,6 @@ pub enum SessionEntryPayload {
         visibility: ReasoningVisibility,
         provenance: ReasoningProvenance,
     },
-    PermissionRequested {
-        run_id: RunId,
-        request: PermissionRequest,
-    },
-    PermissionResolved {
-        run_id: RunId,
-        outcome: PermissionOutcome,
-    },
     RunCompleted {
         run_id: RunId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -842,8 +834,6 @@ pub fn portable_history(entries: &[SessionEntry]) -> Vec<PortableHistoryItem> {
             SessionEntryPayload::RunStarted { .. }
             | SessionEntryPayload::ToolStarted { .. }
             | SessionEntryPayload::Reasoning { .. }
-            | SessionEntryPayload::PermissionRequested { .. }
-            | SessionEntryPayload::PermissionResolved { .. }
             | SessionEntryPayload::RunCompleted { .. }
             | SessionEntryPayload::RunFailed { .. }
             | SessionEntryPayload::RunCancelled { .. }
@@ -885,13 +875,6 @@ pub enum AcpObservation {
     },
     ToolActivity {
         activity: ToolActivity,
-    },
-    PermissionRequested {
-        request: PermissionRequest,
-    },
-    PermissionResolved {
-        request_id: String,
-        outcome: PermissionOutcome,
     },
     HookOutcome {
         hook: String,
@@ -1015,15 +998,6 @@ pub enum ClientEventKind {
         run_id: RunId,
         message: Message,
     },
-    PermissionRequested {
-        run_id: RunId,
-        request: PermissionRequest,
-    },
-    PermissionResolved {
-        run_id: RunId,
-        request_id: String,
-        outcome: PermissionOutcome,
-    },
     RunCompleted {
         run_id: RunId,
     },
@@ -1053,20 +1027,11 @@ impl ClientEventKind {
             | Self::AssistantMessage { run_id, .. }
             | Self::ToolStarted { run_id, .. }
             | Self::ToolCompleted { run_id, .. }
-            | Self::PermissionRequested { run_id, .. }
-            | Self::PermissionResolved { run_id, .. }
             | Self::RunCompleted { run_id }
             | Self::RunFailed { run_id, .. }
             | Self::RunCancelled { run_id } => Some(run_id),
         }
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum PermissionOutcome {
-    Selected { option_id: String },
-    Cancelled,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1084,20 +1049,6 @@ pub struct ToolActivity {
     pub kind: Option<String>,
     pub status: Option<String>,
     pub input: Value,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct PermissionRequest {
-    pub id: String,
-    pub tool_call: Value,
-    pub options: Vec<PermissionOption>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PermissionOption {
-    pub id: String,
-    pub name: String,
-    pub kind: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

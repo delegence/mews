@@ -5,7 +5,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
 use crate::identity::{HostIdentity, NoiseIdentity};
@@ -25,69 +24,7 @@ fn acp_capacity() -> Arc<tokio::sync::Semaphore> {
     )
 }
 
-pub(crate) type AcpPermissionWaiters =
-    Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<Option<String>>>>>;
 pub(crate) type AcpBindingWaiters = Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<()>>>>;
-
-struct HostPermissionHandler {
-    request_id: RequestId,
-    events: tokio::sync::mpsc::Sender<HostToHub>,
-    waiters: AcpPermissionWaiters,
-}
-
-#[async_trait]
-impl mews_acp::AcpPermissionHandler for HostPermissionHandler {
-    async fn request_permission(
-        &self,
-        request: &mews_acp::AcpPermissionRequest,
-        cancellation: &mews_agent::CancellationToken,
-    ) -> Result<mews_acp::AcpPermissionDecision> {
-        let permission_id = uuid::Uuid::now_v7().to_string();
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        self.waiters
-            .lock()
-            .expect("ACP permission waiters poisoned")
-            .insert(permission_id.clone(), sender);
-        let request = mews_protocol::PermissionRequest {
-            id: permission_id.clone(),
-            tool_call: request.tool_call.clone(),
-            options: request
-                .options
-                .iter()
-                .map(|option| mews_protocol::PermissionOption {
-                    id: option.option_id.clone(),
-                    name: option.name.clone(),
-                    kind: match option.kind {
-                        mews_acp::AcpPermissionOptionKind::AllowOnce => "allow_once",
-                        mews_acp::AcpPermissionOptionKind::AllowAlways => "allow_always",
-                        mews_acp::AcpPermissionOptionKind::RejectOnce => "reject_once",
-                        mews_acp::AcpPermissionOptionKind::RejectAlways => "reject_always",
-                    }
-                    .into(),
-                })
-                .collect(),
-        };
-        self.events
-            .send(HostToHub::AcpPermissionRequested {
-                request_id: self.request_id.clone(),
-                request,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("Hub disconnected during ACP permission request"))?;
-        let selected = tokio::select! {
-            _ = cancellation.cancelled() => None,
-            result = receiver => result.ok().flatten(),
-        };
-        self.waiters
-            .lock()
-            .expect("ACP permission waiters poisoned")
-            .remove(&permission_id);
-        Ok(selected.map_or(
-            mews_acp::AcpPermissionDecision::Cancelled,
-            mews_acp::AcpPermissionDecision::Selected,
-        ))
-    }
-}
 
 #[cfg(test)]
 pub(crate) async fn handle_host_request(
@@ -100,16 +37,7 @@ pub(crate) async fn handle_host_request(
         HubToHost::ExecuteTool { .. } | HubToHost::ExecuteHook { .. }
     )
     .then(mews_agent::CancellationToken::new);
-    handle_host_request_streaming(
-        registry,
-        agent_root,
-        message,
-        None,
-        None,
-        None,
-        cancellation,
-    )
-    .await
+    handle_host_request_streaming(registry, agent_root, message, None, None, cancellation).await
 }
 
 pub(crate) async fn handle_host_request_streaming(
@@ -117,7 +45,6 @@ pub(crate) async fn handle_host_request_streaming(
     agent_root: Option<&Path>,
     message: HubToHost,
     events: Option<tokio::sync::mpsc::Sender<HostToHub>>,
-    permission_waiters: Option<AcpPermissionWaiters>,
     binding_waiters: Option<AcpBindingWaiters>,
     cancellation: Option<mews_agent::CancellationToken>,
 ) -> HostToHub {
@@ -135,23 +62,6 @@ pub(crate) async fn handle_host_request_streaming(
                     .remove(&acknowledgement_id)
             {
                 let _ = waiter.send(());
-            }
-            HostToHub::ConfigurationResult {
-                request_id: RequestId::new(),
-                error: None,
-            }
-        }
-        HubToHost::ResolveAcpPermission {
-            permission_id,
-            option_id,
-        } => {
-            if let Some(waiters) = permission_waiters
-                && let Some(waiter) = waiters
-                    .lock()
-                    .expect("ACP permission waiters poisoned")
-                    .remove(&permission_id)
-            {
-                let _ = waiter.send(option_id);
             }
             HostToHub::ConfigurationResult {
                 request_id: RequestId::new(),
@@ -326,14 +236,6 @@ pub(crate) async fn handle_host_request_streaming(
                 }).collect::<Vec<_>>();
                 let mut config = mews_acp::AcpHarnessConfig::new(launch.command)?;
                 config.environment = launch.environment;
-                if let (Some(events), Some(waiters)) = (events.clone(), permission_waiters.clone())
-                {
-                    config.permission_handler = Arc::new(HostPermissionHandler {
-                        request_id: request_id.clone(),
-                        events,
-                        waiters,
-                    });
-                }
                 // Host request handling itself is spawned on a multithreaded
                 // runtime. Run the capability bridge on its own current-thread
                 // runtime so Host extension implementations may retain their

@@ -10,6 +10,6 @@ pub(crate) use connection::{CancellationRegistryOwner, RemoteAcpRun};
 pub use connection::{ConnectedHost, HostControl, HostExecutor};
 pub(crate) use hub_link::serve_hub_host;
 pub use joined::serve_joined_host;
+pub(crate) use lifecycle::AcpBindingWaiters;
 pub use lifecycle::activate_hub_transfer;
 pub(crate) use lifecycle::handle_host_request_streaming;
-pub(crate) use lifecycle::{AcpBindingWaiters, AcpPermissionWaiters};

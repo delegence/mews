@@ -15,6 +15,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use base64::Engine;
 use mews_agent::{
     AgentCapabilities, CancellationToken, LifecycleHook, ProgressReporter, ToolCall, ToolCatalog,
     ToolDefinition, ToolResult,
@@ -26,6 +27,61 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 use uuid::Uuid;
+
+const STATELESS_MCP_VERSION: &str = "2026-07-28";
+const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
+const MAX_HEADER_BYTES: usize = 32 * 1024;
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+const TOOL_LIST_TTL_MS: u64 = 60_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum McpProtocol {
+    Legacy(LegacyMcpVersion),
+    Stateless,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyMcpVersion {
+    V2024_11_05,
+    V2025_03_26,
+    V2025_06_18,
+    V2025_11_25,
+}
+
+impl LegacyMcpVersion {
+    const LATEST: Self = Self::V2025_11_25;
+    const ALL: [Self; 4] = [
+        Self::V2024_11_05,
+        Self::V2025_03_26,
+        Self::V2025_06_18,
+        Self::V2025_11_25,
+    ];
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "2024-11-05" => Some(Self::V2024_11_05),
+            "2025-03-26" => Some(Self::V2025_03_26),
+            "2025-06-18" => Some(Self::V2025_06_18),
+            "2025-11-25" => Some(Self::V2025_11_25),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::V2024_11_05 => "2024-11-05",
+            Self::V2025_03_26 => "2025-03-26",
+            Self::V2025_06_18 => "2025-06-18",
+            Self::V2025_11_25 => "2025-11-25",
+        }
+    }
+}
+
+fn supported_versions() -> Vec<&'static str> {
+    std::iter::once(STATELESS_MCP_VERSION)
+        .chain(LegacyMcpVersion::ALL.into_iter().rev().map(|v| v.as_str()))
+        .collect()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcpSkill {
@@ -45,11 +101,6 @@ pub struct McpCorrelation {
     pub acp_session_id: std::sync::Arc<Mutex<Option<String>>>,
 }
 
-const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
-const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
-const MAX_HEADER_BYTES: usize = 32 * 1024;
-const MAX_BODY_BYTES: usize = 1024 * 1024;
-
 /// A least-authority MCP capability valid only while its owning Run keeps it
 /// alive. Catalog changes cannot add authority to an existing Run.
 pub struct RunMcpBridge<'a> {
@@ -63,6 +114,7 @@ pub struct RunMcpBridge<'a> {
     next_call_id: AtomicU64,
     hook_outcomes: Mutex<Vec<McpHookOutcome>>,
     correlation: Option<McpCorrelation>,
+    legacy_version: Mutex<Option<LegacyMcpVersion>>,
 }
 
 #[derive(Clone, Debug)]
@@ -145,6 +197,7 @@ impl<'a> RunMcpBridge<'a> {
             next_call_id: AtomicU64::new(1),
             hook_outcomes: Mutex::new(Vec::new()),
             correlation: None,
+            legacy_version: Mutex::new(None),
         })
     }
 
@@ -238,20 +291,49 @@ impl<'a> RunMcpBridge<'a> {
     }
 
     /// Handles one MCP JSON-RPC request. Notifications have no response.
+    #[cfg(test)]
     pub async fn handle(&self, request: Value) -> Option<Value> {
+        let protocol = self.protocol_for_request(&request);
+        self.handle_for(protocol, request).await
+    }
+
+    async fn handle_for(&self, protocol: McpProtocol, request: Value) -> Option<Value> {
         let id = request.get("id").cloned();
-        match self.handle_inner(&request).await {
+        match self.handle_inner(protocol, &request).await {
             Ok(result) => id.map(|id| json!({"jsonrpc":"2.0", "id": id, "result": result})),
             Err(error) => id.map(|id| {
-                json!({
+                let mut response = json!({
                     "jsonrpc": "2.0", "id": id,
                     "error": {"code": error.code, "message": error.message},
-                })
+                });
+                if let Some(data) = error.data {
+                    response["error"]["data"] = data;
+                }
+                response
             }),
         }
     }
 
-    async fn handle_inner(&self, request: &Value) -> std::result::Result<Value, McpError> {
+    fn protocol_for_request(&self, request: &Value) -> McpProtocol {
+        if request
+            .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+            .and_then(Value::as_str)
+            == Some(STATELESS_MCP_VERSION)
+        {
+            return McpProtocol::Stateless;
+        }
+        let negotiated = *self
+            .legacy_version
+            .lock()
+            .expect("MCP legacy version poisoned");
+        McpProtocol::Legacy(negotiated.unwrap_or(LegacyMcpVersion::LATEST))
+    }
+
+    async fn handle_inner(
+        &self,
+        protocol: McpProtocol,
+        request: &Value,
+    ) -> std::result::Result<Value, McpError> {
         if !self.is_available() {
             return Err(McpError::unavailable());
         }
@@ -260,28 +342,75 @@ impl<'a> RunMcpBridge<'a> {
             .and_then(Value::as_str)
             .ok_or_else(|| McpError::invalid("MCP request method is required"))?;
         match method {
-            "initialize" => Ok(json!({
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": {"tools": {"listChanged": false}},
-                "serverInfo": {"name": "mews-run-extensions", "version": env!("CARGO_PKG_VERSION")},
-            })),
+            "initialize" => self.initialize(request),
             "notifications/initialized" => Ok(Value::Null),
-            "tools/list" => Ok(json!({
-                "tools": self.tools.values().map(|tool| json!({
-                    "name": tool.name,
-                    "description": tool.description,
-                    "inputSchema": tool.schema,
-                })).collect::<Vec<_>>(),
-            })),
+            "server/discover" if protocol == McpProtocol::Stateless => Ok(self.complete_result(
+                protocol,
+                json!({
+                    "supportedVersions": supported_versions(),
+                    "capabilities": {"tools": {"listChanged": false}},
+                    "ttlMs": TOOL_LIST_TTL_MS,
+                    "cacheScope": "private",
+                }),
+            )),
+            "tools/list" => Ok(self.complete_result(
+                protocol,
+                json!({
+                    "tools": self.tools.values().map(|tool| json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "inputSchema": tool.schema,
+                    })).collect::<Vec<_>>(),
+                    "ttlMs": TOOL_LIST_TTL_MS,
+                    "cacheScope": "private",
+                }),
+            )),
             "tools/call" => {
-                self.call(request.get("params").unwrap_or(&Value::Null))
-                    .await
+                let result = self
+                    .call(request.get("params").unwrap_or(&Value::Null))
+                    .await?;
+                Ok(self.complete_result(protocol, result))
             }
             _ => Err(McpError {
                 code: -32601,
                 message: format!("MCP method {method:?} is not supported"),
+                data: None,
             }),
         }
+    }
+
+    fn initialize(&self, request: &Value) -> std::result::Result<Value, McpError> {
+        let requested = request
+            .pointer("/params/protocolVersion")
+            .and_then(Value::as_str)
+            .ok_or_else(|| McpError::invalid("initialize requires a protocol version"))?;
+        let version = LegacyMcpVersion::parse(requested).unwrap_or(LegacyMcpVersion::LATEST);
+        *self
+            .legacy_version
+            .lock()
+            .expect("MCP legacy version poisoned") = Some(version);
+        Ok(json!({
+            "protocolVersion": version.as_str(),
+            "capabilities": {"tools": {"listChanged": false}},
+            "serverInfo": server_info(),
+        }))
+    }
+
+    fn complete_result(&self, protocol: McpProtocol, mut result: Value) -> Value {
+        if protocol == McpProtocol::Stateless {
+            let object = result
+                .as_object_mut()
+                .expect("MCP operation results are objects");
+            object.insert("resultType".into(), Value::String("complete".into()));
+            object.insert(
+                "_meta".into(),
+                json!({"io.modelcontextprotocol/serverInfo": server_info()}),
+            );
+        } else if let Some(object) = result.as_object_mut() {
+            object.remove("ttlMs");
+            object.remove("cacheScope");
+        }
+        result
     }
 
     async fn call(&self, params: &Value) -> std::result::Result<Value, McpError> {
@@ -317,25 +446,25 @@ impl<'a> RunMcpBridge<'a> {
             Ok(value) => value,
             Err(error) => {
                 self.record_hook("before_tool", false, Some(error.to_string()), Some(&call));
-                return Err(McpError::invalid(format!(
+                return Ok(tool_result(ToolResult::error(format!(
                     "before_tool hook failed: {error:#}"
-                )));
+                ))));
             }
         };
         let before = match parse_before_tool(before) {
             Ok(before) => before,
             Err(detail) => {
                 self.record_hook("before_tool", false, Some(detail.clone()), Some(&call));
-                return Err(McpError::invalid(format!(
+                return Ok(tool_result(ToolResult::error(format!(
                     "invalid before_tool hook response: {detail}"
-                )));
+                ))));
             }
         };
         if let Some(reason) = before.block {
             self.record_hook("before_tool", false, Some(reason.to_owned()), Some(&call));
-            return Err(McpError::invalid(format!(
+            return Ok(tool_result(ToolResult::error(format!(
                 "before_tool hook blocked MCP call: {reason}"
-            )));
+            ))));
         }
         if let Some(tool) = before.name {
             call.name = tool;
@@ -343,10 +472,10 @@ impl<'a> RunMcpBridge<'a> {
         if let Some(arguments) = before.arguments {
             call.arguments = arguments;
         }
-        self.catalog.validate(&call).map_err(|error| {
+        if let Err(error) = self.catalog.validate(&call) {
             self.record_hook("before_tool", false, Some(error.to_string()), Some(&call));
-            McpError::invalid(error.to_string())
-        })?;
+            return Ok(tool_result(ToolResult::error(error)));
+        }
         self.record_hook("before_tool", true, None, Some(&call));
         let mut result = if call.name == "mews_list_skills" {
             let inventory = self.skills.values().map(|skill| json!({"name":skill.name,"description":skill.description,"hash":skill.hash})).collect::<Vec<_>>();
@@ -562,6 +691,7 @@ async fn handle_http_connection(
     let mut content_length = 0usize;
     let mut header_bytes = 0usize;
     let mut saw_content_length = false;
+    let mut headers = BTreeMap::new();
     loop {
         let remaining = MAX_HEADER_BYTES.saturating_sub(header_bytes);
         let header = read_bounded_line(&mut reader, remaining)
@@ -572,22 +702,36 @@ async fn handle_http_connection(
             break;
         }
         let header = std::str::from_utf8(&header).context("MCP header is not UTF-8")?;
-        if let Some(value) = header
-            .strip_prefix("Content-Length:")
-            .or_else(|| header.strip_prefix("content-length:"))
-        {
+        let Some((name, value)) = header.split_once(':') else {
+            return write_http_response(&mut writer, 400, None).await;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim().to_owned();
+        if name == "content-length" {
             if saw_content_length {
                 anyhow::bail!("duplicate MCP Content-Length header");
             }
             saw_content_length = true;
-            content_length = value.trim().parse().context("parse MCP content length")?;
+            content_length = value.parse().context("parse MCP content length")?;
+        }
+        if headers.insert(name, value).is_some() {
+            return write_http_response(&mut writer, 400, None).await;
         }
     }
-    if method != "POST" || path != expected_path {
-        return write_http_response(&mut writer, 404, Value::Null).await;
+    if path != expected_path {
+        return write_http_response(&mut writer, 404, None).await;
+    }
+    if method != "POST" {
+        return write_http_response(&mut writer, 405, None).await;
+    }
+    if headers
+        .get("origin")
+        .is_some_and(|origin| !allowed_origin(origin))
+    {
+        return write_http_response(&mut writer, 403, None).await;
     }
     if content_length > MAX_BODY_BYTES {
-        return write_http_response(&mut writer, 413, Value::Null).await;
+        return write_http_response(&mut writer, 413, None).await;
     }
     let mut body = vec![0; content_length];
     reader
@@ -596,29 +740,58 @@ async fn handle_http_connection(
         .context("read MCP HTTP body")?;
     let request = match serde_json::from_slice(&body) {
         Ok(request) => request,
-        Err(_) => return write_http_response(&mut writer, 400, Value::Null).await,
+        Err(_) => return write_http_response(&mut writer, 400, None).await,
     };
-    let response = bridge.handle(request).await.unwrap_or(Value::Null);
-    write_http_response(&mut writer, 200, response).await
+    let protocol = match protocol_for_http_request(bridge, &request, &headers) {
+        Ok(protocol) => protocol,
+        Err(error) => {
+            let id = request.get("id").cloned().unwrap_or(Value::Null);
+            return write_http_response(&mut writer, 400, Some(error_response(id, error))).await;
+        }
+    };
+    let response = bridge.handle_for(protocol, request).await;
+    let status = match response
+        .as_ref()
+        .and_then(|value| value.pointer("/error/code"))
+    {
+        Some(Value::Number(code))
+            if protocol == McpProtocol::Stateless && code.as_i64() == Some(-32601) =>
+        {
+            404
+        }
+        _ if response.is_none() => 202,
+        _ => 200,
+    };
+    write_http_response(&mut writer, status, response).await
 }
 
 async fn write_http_response<W: AsyncWrite + Unpin>(
     writer: &mut W,
     status: u16,
-    response: Value,
+    response: Option<Value>,
 ) -> Result<()> {
-    let body = serde_json::to_vec(&response)?;
+    let body = response.map_or_else(Vec::new, |response| {
+        serde_json::to_vec(&response).expect("MCP response serializes")
+    });
     let reason = match status {
         200 => "OK",
+        202 => "Accepted",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
+        405 => "Method Not Allowed",
         413 => "Payload Too Large",
         _ => "Error",
+    };
+    let content_type = if body.is_empty() {
+        String::new()
+    } else {
+        "Content-Type: application/json\r\n".into()
     };
     writer
         .write_all(
             format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nMcp-Session-Id: mews-run\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 {status} {reason}\r\n{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             )
             .as_bytes(),
@@ -627,6 +800,151 @@ async fn write_http_response<W: AsyncWrite + Unpin>(
     writer.write_all(&body).await?;
     writer.flush().await?;
     Ok(())
+}
+
+fn protocol_for_http_request(
+    bridge: &RunMcpBridge<'_>,
+    request: &Value,
+    headers: &BTreeMap<String, String>,
+) -> std::result::Result<McpProtocol, McpError> {
+    if request.get("method").and_then(Value::as_str) == Some("initialize") {
+        let requested = request
+            .pointer("/params/protocolVersion")
+            .and_then(Value::as_str)
+            .and_then(LegacyMcpVersion::parse)
+            .unwrap_or(LegacyMcpVersion::LATEST);
+        return Ok(McpProtocol::Legacy(requested));
+    }
+
+    let requested = request
+        .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+        .and_then(Value::as_str);
+    let Some(requested) = requested else {
+        if headers.contains_key("mcp-protocol-version") {
+            return Err(McpError::header_mismatch(
+                "missing MCP protocol version metadata",
+            ));
+        }
+        return Ok(bridge.protocol_for_request(request));
+    };
+    if requested != STATELESS_MCP_VERSION {
+        return Err(McpError::unsupported_version(requested));
+    }
+    validate_stateless_headers(request, headers)?;
+    Ok(McpProtocol::Stateless)
+}
+
+fn validate_stateless_headers(
+    request: &Value,
+    headers: &BTreeMap<String, String>,
+) -> std::result::Result<(), McpError> {
+    if headers
+        .get("content-type")
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        != Some("application/json")
+    {
+        return Err(McpError::header_mismatch(
+            "content-type must be application/json",
+        ));
+    }
+    let accept = headers
+        .get("accept")
+        .map(String::as_str)
+        .unwrap_or_default();
+    if !accept
+        .split(',')
+        .any(|value| value.trim() == "application/json")
+        || !accept
+            .split(',')
+            .any(|value| value.trim() == "text/event-stream")
+    {
+        return Err(McpError::header_mismatch(
+            "accept must include application/json and text/event-stream",
+        ));
+    }
+    if request
+        .pointer("/params/_meta/io.modelcontextprotocol~1clientCapabilities")
+        .and_then(Value::as_object)
+        .is_none()
+    {
+        return Err(McpError::invalid("missing MCP client capabilities"));
+    }
+    for (header, body) in [
+        (
+            "mcp-protocol-version",
+            request.pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion"),
+        ),
+        ("mcp-method", request.get("method")),
+    ] {
+        let body = body.and_then(Value::as_str).unwrap_or_default();
+        if headers.get(header).map(String::as_str) != Some(body) {
+            return Err(McpError::header_mismatch(format!(
+                "{header} header does not match the request body"
+            )));
+        }
+    }
+    if request.get("method").and_then(Value::as_str) == Some("tools/call") {
+        let body = request
+            .pointer("/params/name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let header = headers
+            .get("mcp-name")
+            .ok_or_else(|| McpError::header_mismatch("missing mcp-name header"))?;
+        if decode_header_value(header).as_deref() != Some(body) {
+            return Err(McpError::header_mismatch(
+                "mcp-name header does not match the request body",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn decode_header_value(value: &str) -> Option<String> {
+    let encoded = value
+        .strip_prefix("=?base64?")
+        .and_then(|value| value.strip_suffix("?="));
+    match encoded {
+        Some(encoded) => base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok()),
+        None => Some(value.to_owned()),
+    }
+}
+
+fn allowed_origin(origin: &str) -> bool {
+    [
+        "http://localhost",
+        "https://localhost",
+        "http://127.0.0.1",
+        "https://127.0.0.1",
+        "http://[::1]",
+        "https://[::1]",
+    ]
+    .into_iter()
+    .any(|allowed| {
+        origin == allowed
+            || origin
+                .strip_prefix(allowed)
+                .and_then(|suffix| suffix.strip_prefix(':'))
+                .is_some_and(|port| {
+                    !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
+                })
+    })
+}
+
+fn error_response(id: Value, error: McpError) -> Value {
+    let mut response = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": error.code, "message": error.message},
+    });
+    if let Some(data) = error.data {
+        response["error"]["data"] = data;
+    }
+    response
 }
 
 fn is_native_mews_tool(name: &str) -> bool {
@@ -641,6 +959,10 @@ fn tool_result(result: ToolResult) -> Value {
     json!({"content": [{"type": "text", "text": text}], "isError": result.is_error})
 }
 
+fn server_info() -> Value {
+    json!({"name": "mews-run-extensions", "version": env!("CARGO_PKG_VERSION")})
+}
+
 struct NoProgress;
 
 #[async_trait(?Send)]
@@ -653,6 +975,7 @@ impl ProgressReporter for NoProgress {
 struct McpError {
     code: i64,
     message: String,
+    data: Option<Value>,
 }
 
 impl McpError {
@@ -660,6 +983,7 @@ impl McpError {
         Self {
             code: -32602,
             message: message.into(),
+            data: None,
         }
     }
 
@@ -667,6 +991,26 @@ impl McpError {
         Self {
             code: -32000,
             message: "MCP capability is no longer available for this Run".into(),
+            data: None,
+        }
+    }
+
+    fn header_mismatch(message: impl Into<String>) -> Self {
+        Self {
+            code: -32020,
+            message: message.into(),
+            data: None,
+        }
+    }
+
+    fn unsupported_version(requested: &str) -> Self {
+        Self {
+            code: -32022,
+            message: "Unsupported protocol version".into(),
+            data: Some(json!({
+                "supported": supported_versions(),
+                "requested": requested,
+            })),
         }
     }
 }
@@ -740,6 +1084,110 @@ mod tests {
         .unwrap()
     }
 
+    fn stateless_request(id: u64, method: &str, mut params: Value) -> Value {
+        params["_meta"] = json!({
+            "io.modelcontextprotocol/protocolVersion": STATELESS_MCP_VERSION,
+            "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1"},
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params})
+    }
+
+    #[tokio::test]
+    async fn negotiates_each_supported_legacy_version_and_prefers_the_latest_fallback() {
+        let capabilities = Capabilities {
+            calls: Mutex::new(Vec::new()),
+            delay: std::time::Duration::ZERO,
+        };
+        let bridge = bridge(&capabilities);
+        for version in LegacyMcpVersion::ALL {
+            let response = bridge
+                .handle(json!({
+                    "jsonrpc":"2.0", "id":1, "method":"initialize",
+                    "params":{"protocolVersion":version.as_str(), "capabilities":{}, "clientInfo":{"name":"test","version":"1"}}
+                }))
+                .await
+                .unwrap();
+            assert_eq!(response["result"]["protocolVersion"], version.as_str());
+        }
+        let response = bridge
+            .handle(json!({
+                "jsonrpc":"2.0", "id":2, "method":"initialize",
+                "params":{"protocolVersion":"2099-01-01", "capabilities":{}, "clientInfo":{"name":"test","version":"1"}}
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            response["result"]["protocolVersion"],
+            LegacyMcpVersion::LATEST.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn stateless_discovery_and_tools_include_modern_envelopes() {
+        let capabilities = Capabilities {
+            calls: Mutex::new(Vec::new()),
+            delay: std::time::Duration::ZERO,
+        };
+        let bridge = bridge(&capabilities);
+        let discovered = bridge
+            .handle_for(
+                McpProtocol::Stateless,
+                stateless_request(1, "server/discover", json!({})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(discovered["result"]["resultType"], "complete");
+        assert_eq!(
+            discovered["result"]["supportedVersions"][0],
+            STATELESS_MCP_VERSION
+        );
+        assert_eq!(
+            discovered["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "mews-run-extensions"
+        );
+
+        let listed = bridge
+            .handle_for(
+                McpProtocol::Stateless,
+                stateless_request(2, "tools/list", json!({})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed["result"]["resultType"], "complete");
+        assert_eq!(listed["result"]["cacheScope"], "private");
+        assert_eq!(listed["result"]["ttlMs"], TOOL_LIST_TTL_MS);
+    }
+
+    #[test]
+    fn stateless_requests_reject_mismatched_headers_and_unsupported_versions() {
+        let capabilities = Capabilities {
+            calls: Mutex::new(Vec::new()),
+            delay: std::time::Duration::ZERO,
+        };
+        let bridge = bridge(&capabilities);
+        let request = stateless_request(1, "tools/call", json!({"name":"issue_lookup"}));
+        let headers = BTreeMap::from([
+            ("content-type".into(), "application/json".into()),
+            (
+                "accept".into(),
+                "application/json, text/event-stream".into(),
+            ),
+            ("mcp-protocol-version".into(), STATELESS_MCP_VERSION.into()),
+            ("mcp-method".into(), "tools/call".into()),
+            ("mcp-name".into(), "different_tool".into()),
+        ]);
+        let error = protocol_for_http_request(&bridge, &request, &headers).unwrap_err();
+        assert_eq!(error.code, -32020);
+
+        let mut unsupported = request;
+        unsupported["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
+            Value::String("2099-01-01".into());
+        let error = protocol_for_http_request(&bridge, &unsupported, &headers).unwrap_err();
+        assert_eq!(error.code, -32022);
+        assert_eq!(error.data.unwrap()["supported"][0], STATELESS_MCP_VERSION);
+    }
+
     #[tokio::test]
     async fn exposes_only_allowed_extensions_and_routes_calls_through_capabilities() {
         let capabilities = Capabilities {
@@ -798,7 +1246,48 @@ mod tests {
         let response = String::from_utf8(response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("issue_lookup"));
+        assert!(!response.to_ascii_lowercase().contains("mcp-session-id"));
         assert_eq!(capabilities.calls.lock().unwrap()[0].name, "issue_lookup");
+    }
+
+    #[tokio::test]
+    async fn stateless_http_validates_routing_headers() {
+        let capabilities = Capabilities {
+            calls: Mutex::new(Vec::new()),
+            delay: std::time::Duration::ZERO,
+        };
+        let bridge = bridge(&capabilities);
+        let endpoint = bridge.bind_http().await.unwrap();
+        let address = endpoint.listener.local_addr().unwrap();
+        let body = serde_json::to_vec(&stateless_request(7, "tools/list", json!({}))).unwrap();
+        let client = async {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "POST {} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nMCP-Protocol-Version: {}\r\nMcp-Method: tools/list\r\nContent-Length: {}\r\n\r\n",
+                        endpoint.path,
+                        STATELESS_MCP_VERSION,
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(&body).await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            String::from_utf8(response).unwrap()
+        };
+        let (served, response) = tokio::join!(
+            endpoint
+                .accept_and_handle(&bridge, Instant::now() + std::time::Duration::from_secs(2),),
+            client
+        );
+        served.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"resultType\":\"complete\""));
+        assert!(!response.to_ascii_lowercase().contains("mcp-session-id"));
     }
 
     #[tokio::test]
@@ -883,7 +1372,7 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert_eq!(response["error"]["code"], -32602);
+        assert_eq!(response["result"]["isError"], true);
     }
 
     #[tokio::test]
@@ -915,7 +1404,7 @@ mod tests {
             "---\nname: review\n---\nbody"
         );
         let invalid = bridge.handle(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"mews_read_skill","arguments":{}}})).await.unwrap();
-        assert_eq!(invalid["error"]["code"], -32602);
+        assert_eq!(invalid["result"]["isError"], true);
     }
 
     #[tokio::test]

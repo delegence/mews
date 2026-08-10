@@ -5,9 +5,8 @@ use serde_json::Value;
 
 use crate::{
     Agent, AuthCredential, AuthStatus, ConsumerId, ConsumerKind, EventBatch, HostHarnessStatus,
-    HostId, HostStatus, Installation, Message, MessageSource, ModelInfo, PermissionOutcome,
-    ProviderDefaults, ReasoningEffort, Run, RunId, Session, SessionEntry, SessionId,
-    SessionModelConfig,
+    HostId, HostStatus, Installation, Message, MessageSource, ModelInfo, ProviderDefaults,
+    ReasoningEffort, Run, RunId, Session, SessionEntry, SessionId, SessionModelConfig,
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -173,10 +172,6 @@ pub enum HubRequest {
     },
     CancelRun {
         id: RunId,
-    },
-    ResolvePermission {
-        request_id: String,
-        outcome: PermissionOutcome,
     },
     SubscribeSession {
         consumer_id: ConsumerId,

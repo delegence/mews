@@ -644,8 +644,6 @@ fn native_replay(entries: &[mews_protocol::SessionEntry], target: &str) -> Vec<M
             mews_protocol::SessionEntryPayload::RunStarted { .. }
             | mews_protocol::SessionEntryPayload::ToolStarted { .. }
             | mews_protocol::SessionEntryPayload::Reasoning { .. }
-            | mews_protocol::SessionEntryPayload::PermissionRequested { .. }
-            | mews_protocol::SessionEntryPayload::PermissionResolved { .. }
             | mews_protocol::SessionEntryPayload::RunCompleted { .. }
             | mews_protocol::SessionEntryPayload::RunFailed { .. }
             | mews_protocol::SessionEntryPayload::RunCancelled { .. }

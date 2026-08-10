@@ -3,7 +3,7 @@ use super::*;
 use super::{
     acp_execution::{
         AcpReasoningAggregate, checked_acp_binding, finish_acp_run, persist_local_acp_event,
-        persist_remote_acp_binding, persist_remote_acp_dispatch, resolve_remote_permission,
+        persist_remote_acp_binding, persist_remote_acp_dispatch,
     },
     sessions::expand_prompt,
 };
@@ -15,14 +15,12 @@ struct SendRequest<'a> {
     source: MessageSource,
     run_id: Option<crate::RunId>,
     event_notify: Option<Arc<tokio::sync::Notify>>,
-    permission_handler: Option<Arc<dyn mews_acp::AcpPermissionHandler>>,
     cancellation: mews_agent::CancellationToken,
 }
 
 pub(crate) struct StartedRun {
     pub id: crate::RunId,
     pub event_notify: Arc<tokio::sync::Notify>,
-    pub permission_handler: Arc<dyn mews_acp::AcpPermissionHandler>,
     pub cancellation: mews_agent::CancellationToken,
 }
 
@@ -73,55 +71,6 @@ impl Mews {
         Ok(self
             .store
             .finish_run(run_id, RunStatus::Failed, Some(error))?)
-    }
-
-    pub fn append_permission_request(
-        &self,
-        session_id: &crate::SessionId,
-        run_id: &crate::RunId,
-        request: mews_protocol::PermissionRequest,
-    ) -> Result<()> {
-        Ok(self.store.append_acp_observation_with_client_event(
-            session_id,
-            run_id.clone(),
-            self.store
-                .acp_session_binding(session_id)?
-                .map(|binding| binding.acp_session_id),
-            Some(format!("permission_requested:{}", request.id)),
-            mews_protocol::AcpObservation::PermissionRequested {
-                request: request.clone(),
-            },
-            crate::ClientEventKind::PermissionRequested {
-                run_id: run_id.clone(),
-                request,
-            },
-        )?)
-    }
-
-    pub fn append_permission_resolution(
-        &self,
-        session_id: &crate::SessionId,
-        run_id: &crate::RunId,
-        request_id: &str,
-        outcome: mews_protocol::PermissionOutcome,
-    ) -> Result<()> {
-        Ok(self.store.append_acp_observation_with_client_event(
-            session_id,
-            run_id.clone(),
-            self.store
-                .acp_session_binding(session_id)?
-                .map(|binding| binding.acp_session_id),
-            Some(format!("permission_resolved:{request_id}")),
-            mews_protocol::AcpObservation::PermissionResolved {
-                request_id: request_id.to_owned(),
-                outcome: outcome.clone(),
-            },
-            crate::ClientEventKind::PermissionResolved {
-                run_id: run_id.clone(),
-                request_id: request_id.to_owned(),
-                outcome,
-            },
-        )?)
     }
 
     pub fn subscribe_session(
@@ -190,7 +139,6 @@ impl Mews {
             source,
             run_id: None,
             event_notify: None,
-            permission_handler: None,
             cancellation: mews_agent::CancellationToken::new(),
         })
         .await
@@ -260,7 +208,6 @@ impl Mews {
                 source,
                 run_id: None,
                 event_notify: None,
-                permission_handler: None,
                 cancellation: mews_agent::CancellationToken::new(),
             },
             host.agent_capabilities(),
@@ -288,7 +235,6 @@ impl Mews {
                 source,
                 run_id: Some(run.id),
                 event_notify: Some(run.event_notify),
-                permission_handler: Some(run.permission_handler),
                 cancellation: run.cancellation,
             },
             host.agent_capabilities(),
@@ -314,7 +260,6 @@ impl Mews {
             source,
             run_id,
             event_notify,
-            permission_handler,
             cancellation,
         } = request;
         if session.host_id != *environment_host_id {
@@ -418,8 +363,7 @@ impl Mews {
                 &harness_descriptor,
             )?;
             let recovery_prompt = runtime_store::canonical_acp_prompt(&self.store, session, "")?;
-            let (mut acp, launch_channel) =
-                acp.context("local ACP Harness launch is unavailable")?;
+            let (acp, launch_channel) = acp.context("local ACP Harness launch is unavailable")?;
             let skills = mews_host::resources::snapshot_agent_skills(&self.root, &agent_slug)?;
             let context = mews_protocol::AcpContextSnapshot {
                 version: mews_protocol::ACP_CONTEXT_VERSION,
@@ -438,9 +382,6 @@ impl Mews {
             // this current Host snapshot. A successful Resume never sends it.
             let context_text = context.render().map_err(anyhow::Error::msg)?;
             let channel = launch_channel;
-            if let Some(handler) = permission_handler {
-                acp.permission_handler = handler;
-            }
             let mut reasoning = AcpReasoningAggregate::default();
             let outcome = mews_acp::run_acp_session_with_extensions_and_events(
                 acp,
@@ -665,9 +606,6 @@ impl Mews {
                     mews_protocol::AcpEvent::SessionBound { .. } => {
                         unreachable!("Session binding events are handled asynchronously")
                     }
-                    mews_protocol::AcpEvent::PermissionRequested { .. } => {
-                        unreachable!("permission events are handled asynchronously")
-                    }
                 }
                 if let Some(notify) = &event_notify {
                     notify.notify_waiters();
@@ -701,15 +639,6 @@ impl Mews {
                     event = event_rx.recv() => {
                         if let Some(event) = event {
                             match event {
-                                mews_protocol::AcpEvent::PermissionRequested { request, .. } => {
-                                    resolve_remote_permission(
-                                        host,
-                                        permission_handler.as_deref(),
-                                        &session.id,
-                                        request,
-                                        &cancellation,
-                                    ).await?;
-                                }
                                 mews_protocol::AcpEvent::SessionBound { acknowledgement_id, session_id: acp_session_id, transition, context, .. } => {
                                     persist_remote_acp_binding(
                                         &self.store, host, session, &run, &harness_descriptor,
@@ -730,16 +659,6 @@ impl Mews {
             };
             while let Ok(event) = event_rx.try_recv() {
                 match event {
-                    mews_protocol::AcpEvent::PermissionRequested { request, .. } => {
-                        resolve_remote_permission(
-                            host,
-                            permission_handler.as_deref(),
-                            &session.id,
-                            request,
-                            &cancellation,
-                        )
-                        .await?;
-                    }
                     mews_protocol::AcpEvent::SessionBound {
                         acknowledgement_id,
                         session_id: acp_session_id,

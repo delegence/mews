@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 libc = "0.2"
 mews-agent = { path = "../mews-agent" }
 mews-protocol = { path = "../mews-protocol" }

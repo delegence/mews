@@ -213,7 +213,6 @@ async fn send_interactive_subscribed(
         };
         let mut finished = false;
         let mut failure = None;
-        let mut permissions = Vec::new();
         let mut display_events = Vec::new();
         for event in &batch.events {
             match &event.kind {
@@ -302,11 +301,6 @@ async fn send_interactive_subscribed(
                         )));
                     }
                 }
-                mews_client::ClientEventKind::PermissionRequested { run_id, request }
-                    if *run_id == run.id =>
-                {
-                    permissions.push(request.clone());
-                }
                 mews_client::ClientEventKind::RunCompleted { run_id } if *run_id == run.id => {
                     finished = true;
                 }
@@ -366,13 +360,6 @@ async fn send_interactive_subscribed(
                     thinking = ThinkingIndicator::start();
                 }
             }
-        }
-        for request in permissions {
-            thinking.stop().await?;
-            commit_reasoning(&mut reasoning, &mut reasoning_visible, &colors)?;
-            let option = prompt_permission(&request)?;
-            client.resolve_permission(request.id, option).await?;
-            thinking = ThinkingIndicator::start();
         }
         if let Some(error) = failure {
             thinking.stop().await?;
@@ -637,32 +624,6 @@ fn completed_activity(activity: &str) -> String {
         }
     }
     activity.to_owned()
-}
-
-fn prompt_permission(request: &mews_client::PermissionRequest) -> Result<Option<String>> {
-    let tool = request
-        .tool_call
-        .get("title")
-        .or_else(|| request.tool_call.get("name"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("Harness tool");
-    println!("\n{tool} requests permission:");
-    for (index, option) in request.options.iter().enumerate() {
-        println!("  {}. {}", index + 1, option.name);
-    }
-    print!("Choose an option (Enter cancels): ");
-    io::stdout().flush()?;
-    let mut selected = String::new();
-    io::stdin().read_line(&mut selected)?;
-    let Some(index) = selected
-        .trim()
-        .parse::<usize>()
-        .ok()
-        .and_then(|index| index.checked_sub(1))
-    else {
-        return Ok(None);
-    };
-    Ok(request.options.get(index).map(|option| option.id.clone()))
 }
 
 fn reasoning_label(reasoning: mews_client::ReasoningEffort) -> &'static str {

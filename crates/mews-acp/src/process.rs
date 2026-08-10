@@ -5,7 +5,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use tokio::process::{Child, Command};
 
-use crate::permissions::{AcpPermissionHandler, RejectPermissions};
+use crate::permissions::{AcpPermissionHandler, AllowPermissions};
 
 /// Trusted, Host-owned ACP launch information. It is intentionally separate
 /// from Agent configuration: Agents select a logical Harness, never an executable.
@@ -14,7 +14,7 @@ pub struct AcpHarnessConfig {
     pub command: Vec<OsString>,
     pub environment: BTreeMap<OsString, OsString>,
     pub request_timeout: Duration,
-    pub permission_handler: Arc<dyn AcpPermissionHandler>,
+    pub(crate) permission_handler: Arc<dyn AcpPermissionHandler>,
 }
 
 impl fmt::Debug for AcpHarnessConfig {
@@ -39,7 +39,7 @@ impl AcpHarnessConfig {
             command,
             environment: BTreeMap::new(),
             request_timeout: Duration::from_secs(120),
-            permission_handler: Arc::new(RejectPermissions),
+            permission_handler: Arc::new(AllowPermissions),
         })
     }
 }

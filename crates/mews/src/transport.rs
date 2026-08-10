@@ -256,8 +256,6 @@ pub async fn run_host_rpc(mut peer: EncryptedRelayPeer, registry: ToolRegistry) 
         harnesses,
     })?)
     .await?;
-    let permission_waiters: crate::host::AcpPermissionWaiters =
-        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let binding_waiters: crate::host::AcpBindingWaiters =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let acp_cancellations =
@@ -280,12 +278,6 @@ pub async fn run_host_rpc(mut peer: EncryptedRelayPeer, registry: ToolRegistry) 
         tokio::select! {
             bytes = peer.receive_bytes() => {
                 let request: HubToHost = mews_protocol::decode(&bytes?)?;
-                if let HubToHost::ResolveAcpPermission { permission_id, option_id } = request {
-                    if let Some(waiter) = permission_waiters.lock().expect("ACP permission waiters poisoned").remove(&permission_id) {
-                        let _ = waiter.send(option_id);
-                    }
-                    continue;
-                }
                 if let HubToHost::AcknowledgeAcpSessionBinding { acknowledgement_id } = request {
                     if let Some(waiter) = binding_waiters.lock().expect("ACP binding waiters poisoned").remove(&acknowledgement_id) {
                         let _ = waiter.send(());
@@ -324,7 +316,6 @@ pub async fn run_host_rpc(mut peer: EncryptedRelayPeer, registry: ToolRegistry) 
                 }));
                 let registry = registry.clone();
                 let output = output_tx.clone();
-                let waiters = std::sync::Arc::clone(&permission_waiters);
                 let binding_waiters = std::sync::Arc::clone(&binding_waiters);
                 let cancellations = std::sync::Arc::clone(&acp_cancellations);
                 let tool_cancellations = std::sync::Arc::clone(&tool_cancellations);
@@ -332,7 +323,7 @@ pub async fn run_host_rpc(mut peer: EncryptedRelayPeer, registry: ToolRegistry) 
                     let (event_tx, mut event_rx) =
                         tokio::sync::mpsc::channel(crate::host::ACP_EVENT_CHANNEL_CAPACITY);
                     let response = crate::host::handle_host_request_streaming(
-                        &registry, None, request, Some(event_tx), Some(waiters), Some(binding_waiters), cancellation,
+                        &registry, None, request, Some(event_tx), Some(binding_waiters), cancellation,
                     );
                     tokio::pin!(response);
                     let response = loop {

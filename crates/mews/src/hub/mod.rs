@@ -38,20 +38,12 @@ pub(crate) struct HubControl {
     pub session_locks: Arc<Mutex<HashMap<crate::SessionId, Arc<Mutex<()>>>>>,
     pub run_tasks: Arc<Mutex<HashMap<crate::RunId, RunTask>>>,
     pub event_notify: Arc<tokio::sync::Notify>,
-    pub permission_waiters: Arc<Mutex<HashMap<String, PermissionWaiter>>>,
 }
 
 pub(crate) struct RunTask {
     pub cancellation: mews_agent::CancellationToken,
     pub abort: tokio::task::AbortHandle,
     pub finished: Arc<tokio::sync::Notify>,
-}
-
-pub(crate) struct PermissionWaiter {
-    pub request_id: String,
-    pub session_id: crate::SessionId,
-    pub run_id: crate::RunId,
-    pub sender: tokio::sync::oneshot::Sender<Option<String>>,
 }
 
 pub(crate) struct HubRuntime {
@@ -175,7 +167,6 @@ async fn serve_local(root: PathBuf, recovering_handoff: bool) -> Result<bool> {
         session_locks: Arc::new(Mutex::new(HashMap::new())),
         run_tasks: Arc::new(Mutex::new(HashMap::new())),
         event_notify: Arc::new(tokio::sync::Notify::new()),
-        permission_waiters: Arc::new(Mutex::new(HashMap::new())),
     };
     let runtime = Arc::new(HubRuntime {
         remote_hosts: Arc::clone(&remote_hosts),

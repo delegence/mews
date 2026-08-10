@@ -1,4 +1,4 @@
-use mews_protocol::{ACP_CONTEXT_VERSION, AcpReplacementReason, PermissionOutcome};
+use mews_protocol::{ACP_CONTEXT_VERSION, AcpReplacementReason};
 use serde_json::json;
 
 use super::*;
@@ -1398,27 +1398,10 @@ fn acp_semantics_normalize_into_typed_transcript_entries() {
             },
         )
         .unwrap();
-    store
-        .append_acp_observation(
-            &session.id,
-            run.id.clone(),
-            Some("external-session".into()),
-            Some("permission:1".into()),
-            AcpObservation::PermissionResolved {
-                request_id: "permission-1".into(),
-                outcome: PermissionOutcome::Cancelled,
-            },
-        )
-        .unwrap();
-
     let entries = store.session_entries(&session.id).unwrap();
     assert!(matches!(
         entries[0].payload,
         SessionEntryPayload::Reasoning { .. }
-    ));
-    assert!(matches!(
-        entries[1].payload,
-        SessionEntryPayload::PermissionResolved { .. }
     ));
     assert!(store.active_entries(&session.id).unwrap().is_empty());
 }

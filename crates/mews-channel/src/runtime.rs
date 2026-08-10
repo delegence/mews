@@ -273,15 +273,6 @@ impl<C: Channel> ChannelRuntime<C> {
                     text: delta.clone(),
                 })
             }
-            ClientEventKind::PermissionRequested { request, .. }
-                if self
-                    .subscriptions
-                    .contains(&ChannelSubscription::ApprovalRequests) =>
-            {
-                Some(OutboundEvent::ApprovalRequest {
-                    request: request.clone(),
-                })
-            }
             ClientEventKind::RunFailed { error, .. }
                 if self
                     .subscriptions
@@ -316,7 +307,7 @@ impl<C: Channel> ChannelRuntime<C> {
         self.handle_run_state(event, true).await
     }
 
-    async fn handle_run_state(&mut self, event: ClientEvent, is_origin: bool) -> Result<()> {
+    async fn handle_run_state(&mut self, event: ClientEvent, _is_origin: bool) -> Result<()> {
         match event.kind {
             ClientEventKind::RunCompleted { run_id } | ClientEventKind::RunCancelled { run_id } => {
                 if let Some(session) = self.mappings.finish_run(&run_id.to_string())? {
@@ -327,14 +318,6 @@ impl<C: Channel> ChannelRuntime<C> {
                 if let Some(session) = self.mappings.finish_run(&run_id.to_string())? {
                     self.launch_next(&session).await?;
                 }
-            }
-            ClientEventKind::PermissionRequested { request, .. } if is_origin => {
-                let rejected = request
-                    .options
-                    .iter()
-                    .find(|option| option.kind.starts_with("reject"))
-                    .map(|option| option.id.clone());
-                self.events.resolve_permission(request.id, rejected).await?;
             }
             _ => {}
         }

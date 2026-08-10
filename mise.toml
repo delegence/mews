@@ -1,0 +1,10 @@
+[env]
+MEWS_HOME = "{{config_root}}/.mews"
+
+[tasks.mews]
+description = "Run the development MEWS CLI with project-local state"
+run = "cargo run -p mews --"
+
+[tasks."mews:reset"]
+description = "Delete project-local MEWS development state"
+run = "rm -rf '{{config_root}}/.mews'"

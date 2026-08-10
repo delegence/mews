@@ -56,9 +56,6 @@ pub async fn accept_join(root: &Path, offer: JoinOffer) -> Result<()> {
                 std::collections::HashMap::new(),
             )),
             event_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
-            permission_waiters: std::sync::Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
         },
         local_host,
     )

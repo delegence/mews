@@ -956,8 +956,6 @@ pub(super) fn session_entry_kind(payload: &SessionEntryPayload) -> &'static str 
         SessionEntryPayload::ToolStarted { .. } => "tool_started",
         SessionEntryPayload::ToolResult { .. } => "tool_result",
         SessionEntryPayload::Reasoning { .. } => "reasoning",
-        SessionEntryPayload::PermissionRequested { .. } => "permission_requested",
-        SessionEntryPayload::PermissionResolved { .. } => "permission_resolved",
         SessionEntryPayload::RunCompleted { .. } => "run_completed",
         SessionEntryPayload::RunFailed { .. } => "run_failed",
         SessionEntryPayload::RunCancelled { .. } => "run_cancelled",
@@ -1271,12 +1269,6 @@ pub(super) fn harness_observation_payload(
                 message_id,
             },
         }),
-        AcpObservation::PermissionRequested { request } => {
-            Ok(SessionEntryPayload::PermissionRequested { run_id, request })
-        }
-        AcpObservation::PermissionResolved { outcome, .. } => {
-            Ok(SessionEntryPayload::PermissionResolved { run_id, outcome })
-        }
         AcpObservation::ToolActivity { activity }
             if matches!(activity.status.as_deref(), Some("started" | "in_progress")) =>
         {

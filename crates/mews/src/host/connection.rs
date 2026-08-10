@@ -86,11 +86,6 @@ pub trait HostControl: Send + Sync {
         events: mpsc::Sender<AcpEvent>,
         cancellation: &CancellationToken,
     ) -> Result<mews_acp::AcpSessionOutcome>;
-    async fn resolve_acp_permission(
-        &self,
-        permission_id: String,
-        option_id: Option<String>,
-    ) -> Result<()>;
     async fn acknowledge_acp_session_binding(&self, acknowledgement_id: String) -> Result<()>;
 }
 
@@ -428,25 +423,6 @@ impl ConnectedHost {
                             let _ = sender.send(event).await;
                         }
                     }
-                    HostToHub::AcpPermissionRequested {
-                        request_id,
-                        request,
-                    } => {
-                        let sender = response_pending
-                            .lock()
-                            .expect("Host pending requests poisoned")
-                            .get(&request_id)
-                            .and_then(|pending| pending.acp_events.as_ref())
-                            .cloned();
-                        if let Some(sender) = sender {
-                            let _ = sender
-                                .send(AcpEvent::PermissionRequested {
-                                    event_key: format!("permission:{}", request.id),
-                                    request,
-                                })
-                                .await;
-                        }
-                    }
                     HostToHub::DirectoryAttested {
                         request_id,
                         canonical_path,
@@ -779,20 +755,6 @@ impl HostControl for ConnectedHost {
         }
     }
 
-    async fn resolve_acp_permission(
-        &self,
-        permission_id: String,
-        option_id: Option<String>,
-    ) -> Result<()> {
-        self.sender
-            .send(HubToHost::ResolveAcpPermission {
-                permission_id,
-                option_id,
-            })
-            .await
-            .context("Host disconnected")
-    }
-
     async fn acknowledge_acp_session_binding(&self, acknowledgement_id: String) -> Result<()> {
         self.sender
             .send(HubToHost::AcknowledgeAcpSessionBinding { acknowledgement_id })
@@ -915,9 +877,6 @@ impl ConnectedHost {
             HubToHost::ConfigureRelay { request_id, .. }
             | HubToHost::UpdateRelayCandidates { request_id, .. } => request_id.clone(),
             HubToHost::Ping { .. } => bail!("Ping is not a correlated Host request"),
-            HubToHost::ResolveAcpPermission { .. } => {
-                bail!("permission decisions are not correlated Host requests")
-            }
             HubToHost::AcknowledgeAcpSessionBinding { .. } => {
                 bail!("ACP Session acknowledgements are not correlated Host requests")
             }
@@ -1033,8 +992,6 @@ async fn serve_host(
         return;
     }
     let mut catalog = registry.subscribe();
-    let permission_waiters: crate::host::AcpPermissionWaiters =
-        Arc::new(std::sync::Mutex::new(HashMap::new()));
     let binding_waiters: crate::host::AcpBindingWaiters =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
     let acp_cancellations = Arc::new(std::sync::Mutex::new(
@@ -1049,12 +1006,6 @@ async fn serve_host(
         tokio::select! {
             message = receiver.recv() => {
                 let Some(message) = message else { return; };
-                if let HubToHost::ResolveAcpPermission { permission_id, option_id } = message {
-                    if let Some(waiter) = permission_waiters.lock().expect("ACP permission waiters poisoned").remove(&permission_id) {
-                        let _ = waiter.send(option_id);
-                    }
-                    continue;
-                }
                 if let HubToHost::AcknowledgeAcpSessionBinding { acknowledgement_id } = message {
                     if let Some(waiter) = binding_waiters.lock().expect("ACP binding waiters poisoned").remove(&acknowledgement_id) {
                         let _ = waiter.send(());
@@ -1095,7 +1046,7 @@ async fn serve_host(
                     let cancellations = Arc::clone(&tool_cancellations);
                     tokio::spawn(async move {
                         let response = handle_host_request_streaming(
-                            &registry, registry.root(), message, None, None, None,
+                            &registry, registry.root(), message, None, None,
                             Some(cancellation),
                         ).await;
                         cancellations.lock().expect("tool cancellations poisoned")
@@ -1116,7 +1067,6 @@ async fn serve_host(
                         .insert(request_id.clone(), cancellation.clone());
                     let registry = registry.clone();
                     let sender = sender.clone();
-                    let waiters = Arc::clone(&permission_waiters);
                     let binding_waiters = Arc::clone(&binding_waiters);
                     let cancellations = Arc::clone(&acp_cancellations);
                     tokio::spawn(async move {
@@ -1127,7 +1077,6 @@ async fn serve_host(
                             registry.root(),
                             message,
                             Some(event_sender),
-                            Some(waiters),
                             Some(binding_waiters),
                             Some(cancellation),
                         );
@@ -1155,7 +1104,7 @@ async fn serve_host(
                 }
                 let (event_sender, mut event_receiver) =
                     mpsc::channel(super::ACP_EVENT_CHANNEL_CAPACITY);
-                let response = handle_host_request_streaming(&registry, registry.root(), message, Some(event_sender), Some(Arc::clone(&permission_waiters)), Some(Arc::clone(&binding_waiters)), None);
+                let response = handle_host_request_streaming(&registry, registry.root(), message, Some(event_sender), Some(Arc::clone(&binding_waiters)), None);
                 tokio::pin!(response);
                 let response = loop {
                     tokio::select! {

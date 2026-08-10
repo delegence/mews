@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::{
     Agent, AgentRevision, HarnessDescriptor, HostId, HubRequest, HubResponse, InstallationId,
-    PermissionRequest, RequestId, ToolDefinition,
+    RequestId, ToolDefinition,
 };
 
 pub const HOST_PROTOCOL_VERSION: u32 = 1;
@@ -134,11 +134,6 @@ pub enum HubToHost {
     },
     CancelAcp {
         request_id: RequestId,
-    },
-    ResolveAcpPermission {
-        permission_id: String,
-        #[serde(default)]
-        option_id: Option<String>,
     },
     AcknowledgeAcpSessionBinding {
         acknowledgement_id: String,
@@ -285,10 +280,6 @@ pub enum HostToHub {
         request_id: RequestId,
         event: AcpEvent,
     },
-    AcpPermissionRequested {
-        request_id: RequestId,
-        request: PermissionRequest,
-    },
     DirectoryAttested {
         request_id: RequestId,
         canonical_path: Option<PathBuf>,
@@ -378,10 +369,6 @@ pub enum AcpEvent {
         session_id: String,
         transition: crate::AcpBindingTransition,
         context: crate::AcpBindingContext,
-    },
-    PermissionRequested {
-        event_key: crate::AcpEventKey,
-        request: PermissionRequest,
     },
 }
 

@@ -126,8 +126,6 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
     let dispatch_peer = peer_out.clone();
     let dispatch_registry = Arc::clone(&registry);
     let agent_root = root.clone();
-    let permission_waiters: crate::host::lifecycle::AcpPermissionWaiters =
-        Arc::new(std::sync::Mutex::new(HashMap::new()));
     let binding_waiters: crate::host::AcpBindingWaiters =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
     let acp_cancellations = Arc::new(std::sync::Mutex::new(HashMap::<
@@ -147,20 +145,6 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
         while let Some(message) = peer_in.recv().await {
             match message {
                 PeerEnvelope::ToolRequest { body } => {
-                    if let mews_protocol::HubToHost::ResolveAcpPermission {
-                        permission_id,
-                        option_id,
-                    } = &body
-                    {
-                        if let Some(waiter) = permission_waiters
-                            .lock()
-                            .expect("ACP permission waiters poisoned")
-                            .remove(permission_id)
-                        {
-                            let _ = waiter.send(option_id.clone());
-                        }
-                        continue;
-                    }
                     if let mews_protocol::HubToHost::AcknowledgeAcpSessionBinding {
                         acknowledgement_id,
                     } = &body
@@ -211,7 +195,6 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
                         let registry = Arc::clone(&dispatch_registry);
                         let root = agent_root.clone();
                         let peer = dispatch_peer.clone();
-                        let waiters = Arc::clone(&permission_waiters);
                         let binding_waiters = Arc::clone(&binding_waiters);
                         let cancellations = Arc::clone(&acp_cancellations);
                         tokio::spawn(async move {
@@ -222,7 +205,6 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
                                 Some(&root),
                                 body,
                                 Some(event_tx),
-                                Some(waiters),
                                 Some(binding_waiters),
                                 Some(cancellation),
                             );
@@ -276,7 +258,6 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
                                 body,
                                 None,
                                 None,
-                                None,
                                 Some(cancellation),
                             )
                             .await;
@@ -297,7 +278,6 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
                         Some(&agent_root),
                         body,
                         Some(event_tx),
-                        Some(Arc::clone(&permission_waiters)),
                         Some(Arc::clone(&binding_waiters)),
                         None,
                     );

@@ -293,20 +293,6 @@ impl MewsClient {
         self.expect_ack(HubRequest::CancelRun { id }).await
     }
 
-    pub async fn resolve_permission(
-        &mut self,
-        request_id: String,
-        option_id: Option<String>,
-    ) -> Result<()> {
-        self.expect_ack(HubRequest::ResolvePermission {
-            request_id,
-            outcome: option_id.map_or(mews_protocol::PermissionOutcome::Cancelled, |option_id| {
-                mews_protocol::PermissionOutcome::Selected { option_id }
-            }),
-        })
-        .await
-    }
-
     pub async fn wait_for_run(&mut self, id: mews_protocol::RunId) -> Result<Run> {
         let mut delay = std::time::Duration::from_millis(100);
         loop {

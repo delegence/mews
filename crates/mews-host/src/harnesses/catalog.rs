@@ -18,13 +18,13 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
+    adapters::{
+        NAMES, adapter, adapter_command, apply_profile_environment, authenticate_profile,
+        command_on_path, inherited_launch_environment, install_adapter,
+    },
     cache::{
         ProbeCache, cache_path, load_cached_descriptor, mark_profile_authenticated,
         persist_cached_descriptor, profile_is_authenticated, remove_profile_auth_marker,
-    },
-    recipes::{
-        NAMES, apply_profile_environment, authenticate_profile, command_on_path,
-        inherited_launch_environment, install_recipe, recipe, recipe_command,
     },
 };
 
@@ -32,7 +32,7 @@ use super::{
 pub struct HarnessCatalog {
     descriptors: Vec<HarnessDescriptor>,
     commands: BTreeMap<String, Vec<std::ffi::OsString>>,
-    managed_recipes: std::collections::BTreeSet<String>,
+    managed_adapters: std::collections::BTreeSet<String>,
 }
 
 /// The result of the Host-local portion of Harness setup.
@@ -60,10 +60,10 @@ impl HarnessCatalog {
         let mut definitions = root.map(load_definitions).transpose()?.unwrap_or_default();
         let mut descriptors = vec![native_mews()];
         let mut commands = BTreeMap::new();
-        let mut managed_recipes = std::collections::BTreeSet::new();
+        let mut managed_adapters = std::collections::BTreeSet::new();
 
-        for recipe in NAMES {
-            if let Some(definition) = definitions.remove(recipe) {
+        for adapter_name in NAMES {
+            if let Some(definition) = definitions.remove(adapter_name) {
                 commands.insert(
                     definition.definition.name.clone(),
                     definition
@@ -75,10 +75,10 @@ impl HarnessCatalog {
                 );
                 descriptors.push(definition_descriptor(root, definition));
             } else {
-                let (descriptor, command) = detected_recipe(root, recipe);
+                let (descriptor, command) = detected_adapter(root, adapter_name);
                 if let Some(command) = command {
-                    commands.insert(recipe.into(), command);
-                    managed_recipes.insert(recipe.into());
+                    commands.insert(adapter_name.into(), command);
+                    managed_adapters.insert(adapter_name.into());
                 }
                 descriptors.push(descriptor);
             }
@@ -99,7 +99,7 @@ impl HarnessCatalog {
         Ok(Self {
             descriptors,
             commands,
-            managed_recipes,
+            managed_adapters,
         })
     }
 
@@ -148,17 +148,17 @@ impl HarnessCatalog {
         // execution context needed by native tools, then override only the
         // provider's profile location below.
         let mut environment = inherited_launch_environment();
-        if self.managed_recipes.contains(name) {
+        if self.managed_adapters.contains(name) {
             apply_profile_environment(name, profile, &mut environment);
         }
         Ok(HarnessLaunch {
             command,
             environment,
             instruction_channel: match name {
-                "codex" if self.managed_recipes.contains(name) => {
+                "codex" if self.managed_adapters.contains(name) => {
                     AcpInstructionChannel::CodexDeveloper
                 }
-                "claude" if self.managed_recipes.contains(name) => {
+                "claude" if self.managed_adapters.contains(name) => {
                     AcpInstructionChannel::ClaudeSystemAppend
                 }
                 _ => AcpInstructionChannel::FirstPrompt,
@@ -187,7 +187,7 @@ impl HarnessCatalog {
 
     /// Prepares the MEWS-owned state needed by a configured Harness.
     ///
-    /// This operation is idempotent. Built-in recipes install only into their
+    /// This operation is idempotent. Built-in adapters install only into their
     /// versioned MEWS-owned runtime directory; trusted custom definitions keep
     /// their explicitly supplied executable and receive just a clean profile.
     pub async fn setup(root: &Path, name: &str) -> Result<HarnessSetup> {
@@ -202,15 +202,15 @@ impl HarnessCatalog {
             bail!("invalid Harness name {name:?}");
         }
 
-        if let Some(recipe) = recipe(name) {
+        if let Some(adapter) = adapter(name) {
             let profile = root.join("harnesses").join(name).join("profile");
             let profile_created = create_managed_profile(&profile)?;
-            install_recipe(root, recipe)?;
+            install_adapter(root, adapter)?;
             let descriptor = HarnessCatalog::discover(Some(root))?
                 .descriptors()
                 .into_iter()
                 .find(|descriptor| descriptor.name == name)
-                .expect("built-in recipe is always discovered");
+                .expect("built-in adapter is always discovered");
             let descriptor = setup_probe(
                 root,
                 name,
@@ -411,22 +411,22 @@ fn native_mews() -> HarnessDescriptor {
     }
 }
 
-fn detected_recipe(
+fn detected_adapter(
     root: Option<&Path>,
     name: &str,
 ) -> (HarnessDescriptor, Option<Vec<std::ffi::OsString>>) {
-    let recipe = recipe(name).expect("only built-in recipes are detected");
-    let command = root.and_then(|root| recipe_command(root, recipe));
+    let adapter = adapter(name).expect("only built-in adapters are detected");
+    let command = root.and_then(|root| adapter_command(root, adapter));
     // Both managed ACP packages ship their compatible provider runtime. A
     // globally installed CLI is useful for discovery, but is not a dependency
     // once the managed adapter exists.
-    let global_runtime = command_on_path(recipe.runtime);
+    let global_runtime = command_on_path(adapter.runtime);
     let runtime = if command.is_some() || global_runtime {
         HarnessReadiness::Ready
     } else {
         HarnessReadiness::Missing
     };
-    let adapter = if command.is_some() {
+    let adapter_readiness = if command.is_some() {
         HarnessReadiness::Ready
     } else {
         HarnessReadiness::Missing
@@ -434,10 +434,10 @@ fn detected_recipe(
     let descriptor = HarnessDescriptor {
         name: name.into(),
         protocol: HarnessProtocol::Acp,
-        definition_hash: format!("builtin-{name}-{}", recipe.version),
+        definition_hash: format!("builtin-{name}-{}", adapter.version),
         availability: HarnessAvailability {
             runtime,
-            adapter,
+            adapter: adapter_readiness,
             authentication: HarnessReadiness::Required,
             catalog: HarnessReadiness::NotApplicable,
             detail: Some(if global_runtime {
@@ -446,7 +446,7 @@ fn detected_recipe(
                 "managed ACP adapter is available to install during setup".into()
             }),
         },
-        executable_version: command.as_ref().map(|_| recipe.version.into()),
+        executable_version: command.as_ref().map(|_| adapter.version.into()),
         native_tools: Vec::new(),
         modes: Vec::new(),
         supports_mcp: false,
@@ -510,7 +510,7 @@ async fn probe_descriptor(
         Err(error) => return probe_failure(descriptor, error.to_string()),
     };
     config.environment = launch.environment;
-    let built_in = recipe(&descriptor.name).is_some();
+    let built_in = adapter(&descriptor.name).is_some();
     let name = descriptor.name.clone();
     match mews_acp::probe_acp(config, root.to_path_buf()).await {
         Ok(probe) => {
@@ -685,10 +685,10 @@ fn models_from_options(options: &[Value]) -> Vec<HarnessModelCapability> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harnesses::recipes::{recipe_binary, recipe_node_path};
+    use crate::harnesses::adapters::{adapter_binary, adapter_node_path};
 
     #[test]
-    fn discovery_always_publishes_the_native_harness_and_external_recipes() {
+    fn discovery_always_publishes_the_native_harness_and_external_adapters() {
         let catalog = HarnessCatalog::discover(None).unwrap();
         let names: Vec<_> = catalog
             .descriptors()
@@ -739,12 +739,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let node = env::current_exe().unwrap();
         for name in ["codex", "claude"] {
-            let recipe = recipe(name).unwrap();
-            let binary = recipe_binary(root.path(), recipe);
+            let adapter = adapter(name).unwrap();
+            let binary = adapter_binary(root.path(), adapter);
             fs::create_dir_all(binary.parent().unwrap()).unwrap();
             fs::write(binary, b"").unwrap();
             fs::write(
-                recipe_node_path(root.path(), recipe),
+                adapter_node_path(root.path(), adapter),
                 node.as_os_str().as_encoded_bytes(),
             )
             .unwrap();
@@ -753,7 +753,7 @@ mod tests {
 
         let catalog = HarnessCatalog::discover(Some(root.path())).unwrap();
         for (name, profile_variable) in [("codex", "CODEX_HOME"), ("claude", "CLAUDE_CONFIG_DIR")] {
-            let recipe = recipe(name).unwrap();
+            let adapter = adapter(name).unwrap();
             let descriptor = catalog
                 .descriptors()
                 .into_iter()
@@ -767,7 +767,7 @@ mod tests {
                 launch.command,
                 vec![
                     node.clone().into_os_string(),
-                    recipe_binary(root.path(), recipe).into_os_string()
+                    adapter_binary(root.path(), adapter).into_os_string()
                 ]
             );
             let profile = root.path().join("harnesses").join(name).join("profile");
@@ -775,6 +775,19 @@ mod tests {
                 launch.environment.get(OsStr::new(profile_variable)),
                 Some(&profile.into_os_string())
             );
+            if name == "codex" {
+                let config: Value = serde_json::from_str(
+                    launch
+                        .environment
+                        .get(OsStr::new("CODEX_CONFIG"))
+                        .unwrap()
+                        .to_str()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(config["approval_policy"], "never");
+                assert_eq!(config["sandbox_mode"], "danger-full-access");
+            }
             for name in ["HOME", "USER", "SHELL", "TMPDIR", "SSH_AUTH_SOCK"] {
                 if let Some(expected) = env::var_os(name) {
                     assert_eq!(launch.environment.get(OsStr::new(name)), Some(&expected));
@@ -794,7 +807,7 @@ mod tests {
         let profile = root.path().join("harnesses/codex/profile");
         fs::create_dir_all(&profile).unwrap();
         mark_profile_authenticated(root.path(), "codex").unwrap();
-        let mut descriptor = detected_recipe(Some(root.path()), "codex").0;
+        let mut descriptor = detected_adapter(Some(root.path()), "codex").0;
         descriptor.availability.authentication = HarnessReadiness::Ready;
         descriptor.availability.catalog = HarnessReadiness::Ready;
         persist_cached_descriptor(root.path(), &descriptor).unwrap();

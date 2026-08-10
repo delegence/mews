@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use mews_protocol::PermissionRequest;
 use serde_json::Value;
 
 pub use runtime::{BroadcastMessage, ChannelConfig, ChannelHandle, ChannelRuntime};
@@ -24,7 +23,6 @@ pub struct InboundMessage {
 pub enum OutboundEvent {
     CompletedMessage { text: String },
     StreamingUpdate { text: String },
-    ApprovalRequest { request: PermissionRequest },
     Lifecycle { message: String },
 }
 
@@ -74,7 +72,6 @@ pub enum ChannelCapability {
 pub enum ChannelSubscription {
     CompletedMessages,
     StreamingUpdates,
-    ApprovalRequests,
     LifecycleEvents,
 }
 

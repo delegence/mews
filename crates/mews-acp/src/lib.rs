@@ -8,10 +8,6 @@ mod session;
 mod updates;
 
 pub use mcp::AcpSkill;
-pub use permissions::{
-    AcpPermissionDecision, AcpPermissionHandler, AcpPermissionOption, AcpPermissionOptionKind,
-    AcpPermissionRequest,
-};
 pub use process::AcpHarnessConfig;
 pub use rpc::{AcpErrorKind, classify_error, is_cancelled};
 pub use session::{

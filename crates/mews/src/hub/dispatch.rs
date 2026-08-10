@@ -71,33 +71,6 @@ pub(crate) async fn dispatch(
             .await?;
             return Ok((HubResponse::Run(run), false));
         }
-        HubRequest::ResolvePermission {
-            request_id,
-            outcome,
-        } => {
-            let waiter = runtime
-                .control
-                .permission_waiters
-                .lock()
-                .await
-                .remove(&request_id)
-                .with_context(|| {
-                    format!("permission request {request_id:?} is no longer pending")
-                })?;
-            let selected = match &outcome {
-                mews_protocol::PermissionOutcome::Selected { option_id } => Some(option_id.clone()),
-                mews_protocol::PermissionOutcome::Cancelled => None,
-            };
-            Mews::open_connection(root)?.append_permission_resolution(
-                &waiter.session_id,
-                &waiter.run_id,
-                &request_id,
-                outcome,
-            )?;
-            let _ = waiter.sender.send(selected);
-            runtime.control.event_notify.notify_waiters();
-            return Ok((HubResponse::Ack, false));
-        }
         request => request,
     };
 
@@ -230,9 +203,7 @@ pub(crate) async fn dispatch(
                 )
             }
         }
-        HubRequest::StartTurn { .. }
-        | HubRequest::PollEvents { .. }
-        | HubRequest::ResolvePermission { .. } => {
+        HubRequest::StartTurn { .. } | HubRequest::PollEvents { .. } => {
             unreachable!("handled before locking")
         }
         HubRequest::ListHosts => {

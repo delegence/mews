@@ -1692,7 +1692,7 @@ while IFS= read -r line; do
     *'"id":3'*)
       printf '%s\n' '{"jsonrpc":"2.0","id":90,"method":"session/request_permission","params":{"sessionId":"fixture","toolCall":{"sessionUpdate":"tool_call","toolCallId":"native-1","title":"Run command"},"options":[{"optionId":"allow","name":"Allow Once","kind":"allow_once"},{"optionId":"decline","name":"Decline","kind":"reject_once"}],"_meta":{"provider":"fixture"}}}'
       ;;
-    *'"id":90'*'"result"'*'"optionId":"decline"'*)
+    *'"id":90'*'"result"'*'"optionId":"allow"'*)
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture","update":{"sessionUpdate":"agent_message_chunk","messageId":"message-1","content":{"type":"text","text":"intro"}}}}'
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture","update":{"sessionUpdate":"agent_thought_chunk","messageId":"thought-1","content":{"type":"text","text":"checking source"}}}}'
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture","update":{"sessionUpdate":"tool_call","toolCallId":"web-1","title":"Web search","kind":"search","status":"in_progress","rawInput":{"query":""}}}}'
