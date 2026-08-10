@@ -7,13 +7,13 @@ use std::{
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
-use crate::identity::{HostIdentity, NoiseIdentity};
-use mews_host::ToolRegistry;
+use crate::ToolRegistry;
 use mews_protocol::{
     Agent, AgentReplica, AgentRevision, HarnessDescriptor, HostId, HostToHub, HubToHost,
     HubTransferStart, RequestId,
 };
 use mews_store::Store;
+use mews_transport::{HostIdentity, NoiseIdentity};
 
 const MAX_CONCURRENT_ACP_RUNS: usize = 8;
 
@@ -24,7 +24,7 @@ fn acp_capacity() -> Arc<tokio::sync::Semaphore> {
     )
 }
 
-pub(crate) type AcpBindingWaiters = Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<()>>>>;
+pub type AcpBindingWaiters = Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<()>>>>;
 
 #[cfg(test)]
 pub(crate) async fn handle_host_request(
@@ -40,7 +40,7 @@ pub(crate) async fn handle_host_request(
     handle_host_request_streaming(registry, agent_root, message, None, None, cancellation).await
 }
 
-pub(crate) async fn handle_host_request_streaming(
+pub async fn handle_host_request_streaming(
     registry: &ToolRegistry,
     agent_root: Option<&Path>,
     message: HubToHost,
@@ -49,7 +49,7 @@ pub(crate) async fn handle_host_request_streaming(
     cancellation: Option<mews_agent::CancellationToken>,
 ) -> HostToHub {
     if let Some(response) =
-        mews_host::handle_execution_request(registry, &message, cancellation.as_ref()).await
+        crate::handle_execution_request(registry, &message, cancellation.as_ref()).await
     {
         return response;
     }
@@ -85,9 +85,9 @@ pub(crate) async fn handle_host_request_streaming(
                 .context("relay candidates require a Host root")
                 .and_then(|root| {
                     let path = root.join("hub.json");
-                    let mut state: crate::enrollment::relay::JoinedHostState =
+                    let mut state: serde_json::Value =
                         serde_json::from_slice(&std::fs::read(&path)?)?;
-                    state.relay_urls = relay_urls;
+                    state["relay_urls"] = serde_json::to_value(relay_urls)?;
                     std::fs::write(path, serde_json::to_vec_pretty(&state)?)?;
                     Ok(())
                 }),
@@ -143,12 +143,10 @@ pub(crate) async fn handle_host_request_streaming(
         HubToHost::RefreshHarnessCatalog { request_id } => catalog_response(
             request_id,
             match agent_root {
-                Some(root) => mews_host::HarnessCatalog::refresh(root)
+                Some(root) => crate::HarnessCatalog::refresh(root)
                     .await
                     .map(|catalog| catalog.descriptors()),
-                None => {
-                    mews_host::HarnessCatalog::discover(None).map(|catalog| catalog.descriptors())
-                }
+                None => crate::HarnessCatalog::discover(None).map(|catalog| catalog.descriptors()),
             },
         ),
         HubToHost::ReadAgentReplica { request_id, slug } => {
@@ -191,7 +189,7 @@ pub(crate) async fn handle_host_request_streaming(
                     bail!("Session working directory no longer resolves to its attested path");
                 }
                 let launch = {
-                    let catalog = mews_host::HarnessCatalog::discover(Some(root))?;
+                    let catalog = crate::HarnessCatalog::discover(Some(root))?;
                     let descriptor = catalog
                         .descriptors()
                         .into_iter()
@@ -210,7 +208,7 @@ pub(crate) async fn handle_host_request_streaming(
                     }
                     catalog.launch(root, &harness)?
                 };
-                let skills = mews_host::resources::snapshot_agent_skills(root, &agent_slug)?;
+                let skills = crate::resources::snapshot_agent_skills(root, &agent_slug)?;
                 match (transition.clone(), context) {
                     (mews_protocol::AcpBindingTransition::Resume { .. }, Some(_)) => {}
                     (mews_protocol::AcpBindingTransition::Resume { .. }, None) => bail!("compatible ACP Resume requires its stored context"),
@@ -282,16 +280,16 @@ pub(crate) async fn handle_host_request_streaming(
                             .build()
                             .context("create ACP extension runtime")
                             .and_then(|runtime| {
-                                let environment = mews_host::LocalEnvironment::new(
+                                let environment = crate::LocalEnvironment::new(
                                     Some(host_root),
                                     Arc::new(registry),
                                 );
                                 runtime.block_on(
-                                    mews_acp::run_acp_session_with_extensions_and_events(
+                                    mews_acp::run_acp_session(mews_acp::AcpRunRequest {
                                         config,
-                                        canonical_cwd,
+                                        cwd: canonical_cwd,
                                         harness_options,
-                                        mews_acp::AcpSessionRequest {
+                                        session: mews_acp::AcpSessionRequest {
                                             transition,
                                             prompt,
                                             recovery_prompt,
@@ -307,10 +305,10 @@ pub(crate) async fn handle_host_request_streaming(
                                                 invoke_run_start: true,
                                             }),
                                         },
-                                        &environment,
-                                        &tools,
+                                        environment: &environment,
+                                        allowed_tools: &tools,
                                         cancellation,
-                                        &mut |event| {
+                                        events: &mut |event| {
                                             if let mews_acp::AcpStreamEvent::SessionBound {
                                                 event_key,
                                                 session_id,
@@ -446,7 +444,7 @@ pub(crate) async fn handle_host_request_streaming(
                                             }
                                             Ok(())
                                         },
-                                    ),
+                                    }),
                                 )
                             });
                         drop(callback_events);
@@ -472,7 +470,7 @@ pub(crate) async fn handle_host_request_streaming(
                         == Some(mews_acp::AcpErrorKind::AuthenticationRequired)
                 {
                     let _ =
-                        mews_host::HarnessCatalog::invalidate_authentication(root, &failed_harness);
+                        crate::HarnessCatalog::invalidate_authentication(root, &failed_harness);
                 }
                 outcome
             }
@@ -483,25 +481,8 @@ pub(crate) async fn handle_host_request_streaming(
                     answer: Some(outcome.answer),
                     acp_session_id: Some(outcome.session_id),
                     session_replaced: outcome.session_replaced,
-                    timings: Some(mews_protocol::AcpTimings {
-                        spawn_ms: outcome.timings.spawn.as_millis() as u64,
-                        initialize_ms: outcome.timings.initialize.as_millis() as u64,
-                        continuation_ms: outcome.timings.continuation.as_millis() as u64,
-                    }),
-                    stop_reason: Some(match outcome.stop_reason {
-                        mews_acp::AcpStopReason::EndTurn => mews_protocol::AcpStopReason::EndTurn,
-                        mews_acp::AcpStopReason::MaxTokens => {
-                            mews_protocol::AcpStopReason::MaxTokens
-                        }
-                        mews_acp::AcpStopReason::MaxTurnRequests => {
-                            mews_protocol::AcpStopReason::MaxTurnRequests
-                        }
-                        mews_acp::AcpStopReason::Refusal => mews_protocol::AcpStopReason::Refusal,
-                        mews_acp::AcpStopReason::Cancelled => {
-                            mews_protocol::AcpStopReason::Cancelled
-                        }
-                        mews_acp::AcpStopReason::Other => mews_protocol::AcpStopReason::Other,
-                    }),
+                    timings: Some(outcome.timings),
+                    stop_reason: Some(outcome.stop_reason),
                     error: None,
                 },
                 Err(error) => HostToHub::AcpResult {
@@ -568,7 +549,7 @@ fn split_stream_delta(text: &str) -> Vec<String> {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct HubTransferManifest {
     move_nonce: String,
-    installation_id: crate::InstallationId,
+    installation_id: mews_protocol::InstallationId,
     generation: u64,
     target_host_id: HostId,
     database_size: u64,
@@ -1023,5 +1004,5 @@ fn retain_previous_agent_directories(agents: &Path, slug: &str) -> Result<()> {
 }
 
 #[cfg(test)]
-#[path = "tests.rs"]
+#[path = "connection_tests.rs"]
 mod tests;

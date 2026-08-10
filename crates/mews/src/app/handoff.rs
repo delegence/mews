@@ -72,7 +72,7 @@ impl Mews {
     pub fn demoted_host_state(
         &self,
         target_id: &crate::HostId,
-    ) -> Result<crate::enrollment::relay::JoinedHostState> {
+    ) -> Result<crate::enrollment::join::JoinedHostState> {
         let installation = self.installation()?;
         let old_host = self.store.host(&installation.hub_host_id)?;
         let target = self.store.host(target_id)?;
@@ -89,12 +89,12 @@ impl Mews {
             authority.public_key(),
             expires_at,
         );
-        Ok(crate::enrollment::relay::JoinedHostState {
+        Ok(crate::enrollment::join::JoinedHostState {
             installation_id: installation.id,
             installation_public_key: authority.public_key(),
             hub_noise_public_key,
             relay_urls: vec![relay_url.clone()],
-            accepted: crate::enrollment::relay::EnrollmentAccepted {
+            accepted: crate::enrollment::join::EnrollmentAccepted {
                 host: old_host,
                 relay_urls: vec![relay_url],
                 relay_admission,
@@ -133,7 +133,7 @@ impl Mews {
 
     pub fn remote_host_acceptances(
         &self,
-    ) -> Result<Vec<(Vec<String>, crate::enrollment::relay::EnrollmentAccepted)>> {
+    ) -> Result<Vec<(Vec<String>, crate::enrollment::join::EnrollmentAccepted)>> {
         let installation = self.installation()?;
         let authority = HostIdentity::load(&self.root.join("secrets/installation.key"))?;
         self.hosts()?
@@ -151,7 +151,7 @@ impl Mews {
                 );
                 Ok((
                     relay_urls.clone(),
-                    crate::enrollment::relay::EnrollmentAccepted {
+                    crate::enrollment::join::EnrollmentAccepted {
                         host,
                         relay_urls,
                         relay_admission,
@@ -165,14 +165,14 @@ impl Mews {
     pub(crate) fn remote_host_acceptance(
         &self,
         host_id: &crate::HostId,
-    ) -> Result<(Vec<String>, crate::enrollment::relay::EnrollmentAccepted)> {
+    ) -> Result<(Vec<String>, crate::enrollment::join::EnrollmentAccepted)> {
         let installation = self.installation()?;
         let authority = HostIdentity::load(&self.root.join("secrets/installation.key"))?;
         let host = self.store.host(host_id)?;
         let relay_urls = self.relay_candidates()?;
         Ok((
             relay_urls.clone(),
-            crate::enrollment::relay::EnrollmentAccepted {
+            crate::enrollment::join::EnrollmentAccepted {
                 relay_urls,
                 relay_admission: self.relay_admission_for_host(&host)?,
                 hub_relay_admission: RelayAdmission::create(

@@ -1,15 +1,14 @@
-//! Small, durable primitives for building MEWS clients, adapters, harnesses,
-//! Hosts, and relays.
+//! MEWS application and Hub composition root.
 
-pub(crate) mod crypto;
-pub mod daemon;
+pub mod app;
+pub mod cli;
 pub mod enrollment;
 pub mod host;
-pub mod hub;
-pub mod identity;
+mod machine;
 pub mod paths;
-pub mod relay_supervisor;
-pub mod runtime_store;
-pub mod service;
-pub mod transport;
-pub(crate) use mews_protocol::*;
+pub mod server;
+
+pub use mews_host::relay_supervisor;
+pub use mews_protocol::*;
+pub use mews_transport as identity;
+pub use mews_transport as transport;

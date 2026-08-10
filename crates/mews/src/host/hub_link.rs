@@ -12,11 +12,11 @@ use mews_relay::{NetworkRelay, RelayIdentity};
 use tokio::sync::mpsc;
 
 use crate::{
-    enrollment::relay::EnrollmentAccepted,
+    app::Mews,
+    enrollment::join::EnrollmentAccepted,
     host::ConnectedHost,
-    hub::{HubRuntime, RequestOrigin, dispatch, protocol_error, resolve_request_location},
     identity::{HostIdentity, NoiseIdentity},
-    service::Mews,
+    server::{HubRuntime, RequestOrigin, dispatch, protocol_error, resolve_request_location},
     transport::{PeerAuthentication, connect_responder, run_peer_bridge},
 };
 use mews_protocol::{HubRequest, HubResponse, PeerEnvelope, ProtocolError};
@@ -25,8 +25,8 @@ pub(crate) async fn serve_hub_host(
     root: PathBuf,
     relay_urls: Vec<String>,
     accepted: EnrollmentAccepted,
-    remote_hosts: crate::hub::RemoteHosts,
-    control: crate::hub::HubControl,
+    remote_hosts: crate::server::RemoteHosts,
+    control: crate::server::HubControl,
     local_host: Arc<ConnectedHost>,
 ) -> Result<()> {
     loop {
@@ -50,8 +50,8 @@ async fn serve_hub_host_once(
     root: &Path,
     relay_urls: &[String],
     accepted: &EnrollmentAccepted,
-    remote_hosts: &crate::hub::RemoteHosts,
-    control: &crate::hub::HubControl,
+    remote_hosts: &crate::server::RemoteHosts,
+    control: &crate::server::HubControl,
     local_host: &Arc<ConnectedHost>,
 ) -> Result<()> {
     Mews::open_connection(root.to_path_buf())?.ensure_host(&accepted.host.id)?;

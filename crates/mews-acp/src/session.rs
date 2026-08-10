@@ -3,14 +3,16 @@
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncWriteExt, BufReader},
     process::Child,
 };
 
-use mews_protocol::{AcpBindingTransition, AcpInstructionChannel, AcpReplacementReason};
+use mews_protocol::{
+    AcpBindingTransition, AcpInstructionChannel, AcpReplacementReason, AcpStopReason, AcpTimings,
+};
 
 use crate::{
     mcp::{RunMcpBridge, RunMcpHttp},
@@ -127,31 +129,12 @@ pub struct AcpSessionOutcome {
     pub timings: AcpTimings,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct AcpTimings {
-    pub spawn: Duration,
-    pub initialize: Duration,
-    pub continuation: Duration,
-}
-
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct InitializeResult {
     protocol_version: u16,
     #[serde(default)]
     agent_capabilities: Value,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AcpStopReason {
-    EndTurn,
-    MaxTokens,
-    MaxTurnRequests,
-    Refusal,
-    Cancelled,
-    #[serde(other)]
-    Other,
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,8 +149,57 @@ enum ContinuationMethod {
     Load,
 }
 
-#[allow(clippy::too_many_arguments)] // This is the public composition boundary for one Run.
-pub async fn run_acp_session_with_extensions_and_events(
+pub trait AcpEventSink {
+    fn emit(&mut self, event: AcpStreamEvent) -> Result<()>;
+}
+
+impl<F> AcpEventSink for F
+where
+    F: FnMut(AcpStreamEvent) -> Result<()>,
+{
+    fn emit(&mut self, event: AcpStreamEvent) -> Result<()> {
+        self(event)
+    }
+}
+
+pub struct AcpRunRequest<'a> {
+    pub config: AcpHarnessConfig,
+    pub cwd: PathBuf,
+    pub harness_options: BTreeMap<String, String>,
+    pub session: AcpSessionRequest,
+    pub environment: &'a dyn mews_agent::AgentCapabilities,
+    pub allowed_tools: &'a [String],
+    pub cancellation: mews_agent::CancellationToken,
+    pub events: &'a mut dyn AcpEventSink,
+}
+
+pub async fn run_acp_session(request: AcpRunRequest<'_>) -> Result<AcpSessionOutcome> {
+    let AcpRunRequest {
+        config,
+        cwd,
+        harness_options,
+        session,
+        environment,
+        allowed_tools,
+        cancellation,
+        events,
+    } = request;
+    let mut emit = |event| events.emit(event);
+    run_acp_session_inner(
+        config,
+        cwd,
+        harness_options,
+        session,
+        environment,
+        allowed_tools,
+        cancellation,
+        &mut emit,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_acp_session_inner(
     mut config: AcpHarnessConfig,
     cwd: PathBuf,
     harness_options: BTreeMap<String, String>,
@@ -307,7 +339,7 @@ pub async fn run_acp_session_with_extensions_and_events(
         if let Some(metadata) = &mut replacement.hook_metadata {
             metadata.invoke_run_start = false;
         }
-        return Box::pin(run_acp_session_with_extensions_and_events(
+        return Box::pin(run_acp_session_inner(
             replacement_config,
             cwd,
             harness_options,
@@ -366,7 +398,7 @@ pub async fn run_acp_session_with_extensions_and_events(
         process_guard.disarm();
     }
     let mut result = result.context("ACP Harness failed")?;
-    result.timings.spawn = spawn;
+    result.timings.spawn_ms = spawn.as_millis() as u64;
     let status = child.wait().await.context("wait for ACP Harness")?;
     process_guard.disarm();
     if !status.success() {
@@ -722,9 +754,9 @@ impl AcpProcess {
             session_replaced,
             stop_reason: prompt_result.stop_reason,
             timings: AcpTimings {
-                spawn: Duration::ZERO,
-                initialize: initialize_elapsed,
-                continuation: continuation_elapsed,
+                spawn_ms: 0,
+                initialize_ms: initialize_elapsed.as_millis() as u64,
+                continuation_ms: continuation_elapsed.as_millis() as u64,
             },
         })
         }.await;
@@ -966,8 +998,7 @@ where
 mod tests {
     use super::{
         AcpHarnessConfig, AcpSessionRequest, AcpStopReason, AcpStreamEvent,
-        prepare_instruction_channel, probe_acp, run_acp_session_with_extensions_and_events,
-        session_new_params,
+        prepare_instruction_channel, probe_acp, run_acp_session_inner, session_new_params,
     };
     use crate::rpc::{AcpErrorKind, acp_rpc_error, classify_error, is_resource_not_found};
     use crate::updates::update_text;
@@ -1113,7 +1144,7 @@ sleep 30
         .unwrap();
         fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let error = run_acp_session_with_extensions_and_events(
+        let error = run_acp_session_inner(
             AcpHarnessConfig::new([fixture.into_os_string()]).unwrap(),
             directory.path().to_owned(),
             BTreeMap::new(),
@@ -1161,7 +1192,7 @@ done
 
         let error = tokio::time::timeout(
             Duration::from_secs(2),
-            run_acp_session_with_extensions_and_events(
+            run_acp_session_inner(
                 config,
                 directory.path().to_owned(),
                 BTreeMap::new(),
@@ -1208,7 +1239,7 @@ done
         fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
         let mut events = Vec::new();
 
-        run_acp_session_with_extensions_and_events(
+        run_acp_session_inner(
             AcpHarnessConfig::new([fixture.into_os_string()]).unwrap(),
             directory.path().to_owned(),
             BTreeMap::new(),
@@ -1263,7 +1294,7 @@ done
         fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
         let cancellation = CancellationToken::new();
         let mut events = |_| Ok(());
-        let execution = run_acp_session_with_extensions_and_events(
+        let execution = run_acp_session_inner(
             AcpHarnessConfig::new([fixture.into_os_string()]).unwrap(),
             directory.path().to_owned(),
             BTreeMap::new(),
@@ -1326,7 +1357,7 @@ done
         )
         .unwrap();
         fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
-        let outcome = run_acp_session_with_extensions_and_events(
+        let outcome = run_acp_session_inner(
             AcpHarnessConfig::new(vec![fixture.to_string_lossy().into_owned()]).unwrap(),
             directory.path().to_path_buf(),
             BTreeMap::new(),
@@ -1351,8 +1382,8 @@ done
         assert_eq!(outcome.answer, "resumed");
         assert_eq!(outcome.session_id, "native-1");
         assert!(!outcome.session_replaced);
-        assert!(outcome.timings.initialize >= Duration::from_millis(10));
-        assert!(outcome.timings.continuation >= Duration::from_millis(10));
+        assert!(outcome.timings.initialize_ms >= 10);
+        assert!(outcome.timings.continuation_ms >= 10);
     }
 
     #[cfg(unix)]
@@ -1372,7 +1403,7 @@ while IFS= read -r line; do
 done
 "#).unwrap();
         fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
-        run_acp_session_with_extensions_and_events(
+        run_acp_session_inner(
             AcpHarnessConfig::new(vec![fixture.to_string_lossy().into_owned()]).unwrap(),
             directory.path().to_path_buf(),
             BTreeMap::new(),
@@ -1419,7 +1450,7 @@ done
         .unwrap();
         fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
         let mut bound = Vec::new();
-        let outcome = run_acp_session_with_extensions_and_events(
+        let outcome = run_acp_session_inner(
             AcpHarnessConfig::new(vec![fixture.to_string_lossy().into_owned()]).unwrap(),
             directory.path().to_path_buf(),
             BTreeMap::new(),
@@ -1517,7 +1548,7 @@ done
         fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
 
         let mut events = Vec::new();
-        let error = run_acp_session_with_extensions_and_events(
+        let error = run_acp_session_inner(
             AcpHarnessConfig::new([fixture.into_os_string()]).unwrap(),
             directory.path().to_owned(),
             BTreeMap::new(),
@@ -1574,7 +1605,7 @@ done
             "CODEX_CONFIG".into(),
             r#"{"approval_policy":"never","unrelated":true}"#.into(),
         );
-        run_acp_session_with_extensions_and_events(
+        run_acp_session_inner(
             config,
             directory.path().to_owned(),
             BTreeMap::new(),
@@ -1641,7 +1672,7 @@ done
             fs::write(&fixture, script).unwrap();
             fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
 
-            run_acp_session_with_extensions_and_events(
+            run_acp_session_inner(
                 AcpHarnessConfig::new([fixture.into_os_string()]).unwrap(),
                 directory.path().to_owned(),
                 BTreeMap::new(),
@@ -1709,7 +1740,7 @@ done
         fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
 
         let mut events = Vec::new();
-        let outcome = run_acp_session_with_extensions_and_events(
+        let outcome = run_acp_session_inner(
             AcpHarnessConfig::new([fixture.into_os_string()]).unwrap(),
             directory.path().to_owned(),
             BTreeMap::new(),

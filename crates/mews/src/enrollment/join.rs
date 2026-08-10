@@ -6,10 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Host,
+    app::Mews,
     enrollment::{JoinOffer, JoinRequest},
     host::HostControl,
     identity::{HostIdentity, NoiseIdentity},
-    service::Mews,
     transport::{PeerAuthentication, connect_initiator, connect_responder},
 };
 
@@ -46,7 +46,7 @@ pub async fn accept_join(root: &Path, offer: JoinOffer) -> Result<()> {
         offer,
         None,
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        crate::hub::HubControl {
+        crate::server::HubControl {
             moving: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             handoff_gate: std::sync::Arc::new(tokio::sync::RwLock::new(())),
             session_locks: std::sync::Arc::new(tokio::sync::Mutex::new(
@@ -66,8 +66,8 @@ pub(crate) async fn accept_join_ready(
     root: &Path,
     offer: JoinOffer,
     ready: tokio::sync::oneshot::Sender<Result<()>>,
-    remote_hosts: crate::hub::RemoteHosts,
-    control: crate::hub::HubControl,
+    remote_hosts: crate::server::RemoteHosts,
+    control: crate::server::HubControl,
     local_host: std::sync::Arc<crate::host::ConnectedHost>,
 ) -> Result<()> {
     accept_join_inner(root, offer, Some(ready), remote_hosts, control, local_host).await
@@ -77,8 +77,8 @@ async fn accept_join_inner(
     root: &Path,
     offer: JoinOffer,
     ready: Option<tokio::sync::oneshot::Sender<Result<()>>>,
-    remote_hosts: crate::hub::RemoteHosts,
-    control: crate::hub::HubControl,
+    remote_hosts: crate::server::RemoteHosts,
+    control: crate::server::HubControl,
     local_host: std::sync::Arc<crate::host::ConnectedHost>,
 ) -> Result<()> {
     let authority = HostIdentity::load(&root.join("secrets/installation.key"))?;

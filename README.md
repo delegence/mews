@@ -46,7 +46,7 @@ Start work from any directory:
 
 ```sh
 cd /path/to/project
-mews agents coder ask "Summarize README.md"
+mews agents coder -p "Summarize README.md"
 ```
 
 The Session captures the invoking Host and the canonical current working directory. Tools start there with the Host OS user's authority. There is no managed or synchronized Agent workspace.
@@ -59,7 +59,7 @@ mews agents list
 mews agents new <slug> [--harness <name>] [--option <key=value>]...
 mews agents rename <slug> <new-slug>
 mews agents delete <slug>
-mews agents <slug> ask <message>
+mews agents <slug> -p <message>
 mews sessions list
 mews sessions <id> ask <message>
 mews hosts list

@@ -9,17 +9,17 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
+use crate::ToolRegistry;
 use mews_agent::{
     AgentCapabilities, CancellationToken, ContextDocument, ContextSnapshot, LifecycleHook,
     ProgressReporter, ToolCall, ToolResult,
 };
-use mews_host::ToolRegistry;
 use mews_protocol::{
     AcpEvent, Agent, AgentReplica, AgentRevision, HarnessDescriptor, HostId, HostToHub, HubToHost,
     HubTransferStart, RequestId, ToolDefinition,
 };
 
-use super::lifecycle::handle_host_request_streaming;
+use crate::lifecycle::handle_host_request_streaming;
 
 enum HostReply {
     Tool(Value),
@@ -122,7 +122,7 @@ impl ConnectedHost {
 
     /// The most recently published Host-local Harness catalog. This is live
     /// connection state, not durable Hub configuration.
-    pub(crate) fn harness_catalog(&self) -> Vec<HarnessDescriptor> {
+    pub fn harness_catalog(&self) -> Vec<HarnessDescriptor> {
         self.harnesses
             .read()
             .expect("Host Harness catalog poisoned")
@@ -131,7 +131,7 @@ impl ConnectedHost {
 
     /// Refreshing the Hub's own Host must update the same live catalog used
     /// for dispatch, not only the catalog returned to a client.
-    pub(crate) fn replace_harness_catalog(&self, harnesses: Vec<HarnessDescriptor>) {
+    pub fn replace_harness_catalog(&self, harnesses: Vec<HarnessDescriptor>) {
         *self
             .harnesses
             .write()
@@ -226,7 +226,7 @@ impl ConnectedHost {
 
     pub async fn in_process(id: HostId, registry: ToolRegistry) -> Result<Self> {
         let tools = registry.definitions();
-        let harnesses = mews_host::HarnessCatalog::discover(registry.root())?.descriptors();
+        let harnesses = crate::HarnessCatalog::discover(registry.root())?.descriptors();
         if let Some(root) = registry.root().map(Path::to_path_buf) {
             tokio::spawn({
                 let registry = registry.clone();
@@ -376,35 +376,8 @@ impl ConnectedHost {
                                     answer,
                                     session_id,
                                     session_replaced,
-                                    timings: mews_acp::AcpTimings {
-                                        spawn: std::time::Duration::from_millis(timings.spawn_ms),
-                                        initialize: std::time::Duration::from_millis(
-                                            timings.initialize_ms,
-                                        ),
-                                        continuation: std::time::Duration::from_millis(
-                                            timings.continuation_ms,
-                                        ),
-                                    },
-                                    stop_reason: match stop_reason {
-                                        mews_protocol::AcpStopReason::EndTurn => {
-                                            mews_acp::AcpStopReason::EndTurn
-                                        }
-                                        mews_protocol::AcpStopReason::MaxTokens => {
-                                            mews_acp::AcpStopReason::MaxTokens
-                                        }
-                                        mews_protocol::AcpStopReason::MaxTurnRequests => {
-                                            mews_acp::AcpStopReason::MaxTurnRequests
-                                        }
-                                        mews_protocol::AcpStopReason::Refusal => {
-                                            mews_acp::AcpStopReason::Refusal
-                                        }
-                                        mews_protocol::AcpStopReason::Cancelled => {
-                                            mews_acp::AcpStopReason::Cancelled
-                                        }
-                                        mews_protocol::AcpStopReason::Other => {
-                                            mews_acp::AcpStopReason::Other
-                                        }
-                                    },
+                                    timings,
+                                    stop_reason,
                                 })),
                                 (_, _, _, _, Some(error)) => Err(error),
                                 _ => Err("Host returned an empty ACP result".into()),
@@ -924,12 +897,12 @@ struct ToolCancellationGuard {
     armed: bool,
 }
 
-pub(crate) struct CancellationRegistryOwner {
+pub struct CancellationRegistryOwner {
     cancellations: Arc<std::sync::Mutex<HashMap<RequestId, CancellationToken>>>,
 }
 
 impl CancellationRegistryOwner {
-    pub(crate) fn new(
+    pub fn new(
         cancellations: Arc<std::sync::Mutex<HashMap<RequestId, CancellationToken>>>,
     ) -> Self {
         Self { cancellations }
@@ -992,8 +965,7 @@ async fn serve_host(
         return;
     }
     let mut catalog = registry.subscribe();
-    let binding_waiters: crate::host::AcpBindingWaiters =
-        Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let binding_waiters: crate::AcpBindingWaiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let acp_cancellations = Arc::new(std::sync::Mutex::new(
         HashMap::<RequestId, CancellationToken>::new(),
     ));
@@ -1127,6 +1099,29 @@ async fn serve_host(
                 if sender.send(HostToHub::ToolCatalogChanged {
                     tools,
                 }).await.is_err() { return; }
+            }
+        }
+    }
+}
+
+/// Runs the Host half of the authenticated serialized Host protocol.
+pub async fn run_host_rpc(
+    mut peer: mews_transport::EncryptedRelayPeer,
+    registry: ToolRegistry,
+) -> Result<()> {
+    let harnesses = crate::HarnessCatalog::discover(registry.root())?.descriptors();
+    let (requests, receiver) = mpsc::channel(32);
+    let (sender, mut responses) = mpsc::channel(32);
+    tokio::spawn(serve_host(registry, harnesses, receiver, sender));
+    loop {
+        tokio::select! {
+            request = peer.receive_bytes() => {
+                let request = mews_protocol::decode(&request?)?;
+                requests.send(request).await.context("Host request loop closed")?;
+            }
+            response = responses.recv() => {
+                let Some(response) = response else { return Ok(()); };
+                peer.send_bytes(&mews_protocol::encode(response)?).await?;
             }
         }
     }

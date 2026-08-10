@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::activate_hub_transfer;
 use crate::{
-    enrollment::relay::JoinedHostState,
+    enrollment::join::JoinedHostState,
     identity::{HostIdentity, NoiseIdentity},
     transport::{PeerAuthentication, connect_initiator, run_peer_bridge},
 };
@@ -27,11 +27,11 @@ pub async fn serve_joined_host(root: PathBuf) -> Result<()> {
             activate_hub_transfer(&root)?;
         }
         if root.join("hub-promote").exists() {
-            return Box::pin(crate::hub::serve(root)).await;
+            return Box::pin(crate::server::serve(root)).await;
         }
         match serve_joined_host_once(&root).await {
             Ok(true) => {
-                return Box::pin(crate::hub::serve(root)).await;
+                return Box::pin(crate::server::serve(root)).await;
             }
             Ok(false) => return Ok(()),
             Err(error) => eprintln!("Host connection lost: {error:#}"),
@@ -126,7 +126,7 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
     let dispatch_peer = peer_out.clone();
     let dispatch_registry = Arc::clone(&registry);
     let agent_root = root.clone();
-    let binding_waiters: crate::host::AcpBindingWaiters =
+    let binding_waiters: mews_host::AcpBindingWaiters =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
     let acp_cancellations = Arc::new(std::sync::Mutex::new(HashMap::<
         RequestId,
@@ -137,9 +137,9 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
         mews_agent::CancellationToken,
     >::new()));
     let _acp_cancellation_owner =
-        super::connection::CancellationRegistryOwner::new(Arc::clone(&acp_cancellations));
+        mews_host::CancellationRegistryOwner::new(Arc::clone(&acp_cancellations));
     let _tool_cancellation_owner =
-        super::connection::CancellationRegistryOwner::new(Arc::clone(&tool_cancellations));
+        mews_host::CancellationRegistryOwner::new(Arc::clone(&tool_cancellations));
     let (promotion_tx, mut promotion_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         while let Some(message) = peer_in.recv().await {
@@ -200,7 +200,7 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
                         tokio::spawn(async move {
                             let (event_tx, mut event_rx) =
                                 tokio::sync::mpsc::channel(super::ACP_EVENT_CHANNEL_CAPACITY);
-                            let response = crate::host::handle_host_request_streaming(
+                            let response = mews_host::handle_host_request_streaming(
                                 &registry,
                                 Some(&root),
                                 body,
@@ -252,7 +252,7 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
                         let peer = dispatch_peer.clone();
                         let cancellations = Arc::clone(&tool_cancellations);
                         tokio::spawn(async move {
-                            let response = crate::host::handle_host_request_streaming(
+                            let response = mews_host::handle_host_request_streaming(
                                 &registry,
                                 Some(&root),
                                 body,
@@ -273,7 +273,7 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
                     }
                     let (event_tx, mut event_rx) =
                         tokio::sync::mpsc::channel(super::ACP_EVENT_CHANNEL_CAPACITY);
-                    let response = crate::host::handle_host_request_streaming(
+                    let response = mews_host::handle_host_request_streaming(
                         &dispatch_registry,
                         Some(&agent_root),
                         body,

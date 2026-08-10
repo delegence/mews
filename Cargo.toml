@@ -11,6 +11,8 @@ members = [
     "crates/mews-router",
     "crates/mews-runtime",
     "crates/mews-store",
+    "crates/mews-transport",
+    "crates/mews-tui",
 ]
 resolver = "2"
 

@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use inquire::Select;
 use mews_client::MewsClient;
 use mews_protocol::ModelInfo;
+use mews_router::RouterClient;
 
 use super::{
     command::{ProviderCommand, ProviderModelsCommand},
@@ -158,10 +159,9 @@ async fn login(root: &Path, client: &mut MewsClient, id: Option<String>) -> Resu
                 .context("provider choice disappeared")?
         }
     };
-    let router = mews_router::RouterClient::new(root);
     let credential = match provider.auth.as_str() {
         "oauth" if provider.id == "openai-codex" => {
-            router
+            RouterClient::new(root)
                 .login_openai(|device| {
                     println!(
                         "Open {} and enter code {}",
@@ -171,7 +171,7 @@ async fn login(root: &Path, client: &mut MewsClient, id: Option<String>) -> Resu
                 .await?
         }
         "oauth_or_api_key" if provider.id == "anthropic" => {
-            router
+            RouterClient::new(root)
                 .login_anthropic(|authorization| {
                     println!("Open {}", authorization.authorization_uri);
                     open_browser(&authorization.authorization_uri);

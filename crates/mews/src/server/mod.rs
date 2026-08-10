@@ -1,9 +1,11 @@
+//! Hub protocol server and transient request/run coordination.
+
 #[cfg(not(unix))]
 compile_error!("the MEWS Hub transport requires Unix sockets");
 
+mod active_runs;
 mod dispatch;
 mod handoff;
-pub(crate) mod runs;
 
 use std::{
     collections::HashMap,
@@ -21,8 +23,8 @@ use tokio::{
 };
 
 use crate::{
+    app::Mews,
     host::{ConnectedHost, HostControl},
-    service::Mews,
 };
 use mews_protocol::{
     Frame, HubRequest, HubResponse, PROTOCOL_VERSION, ProtocolError, decode_hub_envelope,

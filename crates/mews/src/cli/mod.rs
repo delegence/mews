@@ -3,9 +3,7 @@ mod command;
 mod defaults;
 mod harnesses;
 mod hosts;
-mod interactive;
 mod providers;
-mod runtime;
 mod setup;
 
 use anyhow::Result;
@@ -14,7 +12,7 @@ use inquire::InquireError;
 use mews_client::MewsClient;
 
 use command::{Cli, Command, HubCommand, RelayCommand};
-pub(crate) use setup::RestartFailure;
+pub use setup::RestartFailure;
 
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
@@ -33,7 +31,7 @@ pub async fn run() -> Result<()> {
         } => setup::run(&cli.root, name, join, relay, relay_listen, no_daemon).await?,
         Command::Hub {
             command: HubCommand::Serve,
-        } => runtime::serve_machine(cli.root, false).await?,
+        } => crate::machine::runtime::serve_machine(cli.root, false).await?,
         Command::Hub {
             command: HubCommand::Stop,
         } => {
@@ -49,16 +47,13 @@ pub async fn run() -> Result<()> {
         }
         Command::Hub {
             command: HubCommand::Recover,
-        } => {
-            mews::host::activate_hub_transfer(&cli.root)?;
-            mews::hub::serve(cli.root).await?;
-        }
+        } => crate::machine::runtime::recover_hub(cli.root).await?,
         Command::Relay {
             command: RelayCommand::Serve { listen },
-        } => mews_relay::serve(listen).await?,
+        } => crate::machine::runtime::serve_relay(listen).await?,
         Command::Providers { command } => providers::run(&cli.root, command).await?,
-        Command::Daemon => runtime::serve_machine(cli.root, true).await?,
-        Command::Router => mews_router::serve(cli.root).await?,
+        Command::Daemon => crate::machine::runtime::serve_machine(cli.root, true).await?,
+        Command::Router => crate::machine::runtime::serve_router(cli.root).await?,
         Command::Restart => {
             setup::restart(&cli.root).await?;
         }

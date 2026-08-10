@@ -9,6 +9,18 @@ use super::{
     setup,
 };
 
+pub(super) fn discover(root: &Path) -> Result<Vec<mews_protocol::HarnessDescriptor>> {
+    Ok(mews_host::HarnessCatalog::discover(Some(root))?.descriptors())
+}
+
+pub(super) async fn setup(root: &Path, name: &str) -> Result<mews_host::HarnessSetup> {
+    let setup = mews_host::HarnessCatalog::setup(root, name).await?;
+    if let Ok(mut client) = MewsClient::connect(root).await {
+        let _ = client.refresh_harnesses().await;
+    }
+    Ok(setup)
+}
+
 pub async fn run(root: &Path, command: Option<HarnessesCommand>) -> Result<()> {
     let Some(command) = command else {
         let mut cli = Cli::command();
@@ -30,7 +42,7 @@ pub async fn run(root: &Path, command: Option<HarnessesCommand>) -> Result<()> {
         return Ok(());
     }
     if let HarnessesCommand::Setup { name: Some(name) } = command {
-        let setup = mews_host::HarnessCatalog::setup(root, &name).await?;
+        let setup = setup(root, &name).await?;
         if let Some(profile) = setup.managed_profile {
             let action = if setup.profile_created {
                 "created"
@@ -47,9 +59,6 @@ pub async fn run(root: &Path, command: Option<HarnessesCommand>) -> Result<()> {
                 "{} is ready; no managed profile is needed",
                 setup.descriptor.name
             );
-        }
-        if let Ok(mut client) = MewsClient::connect(root).await {
-            let _ = client.refresh_harnesses().await;
         }
         if setup.descriptor.availability.authentication == mews_protocol::HarnessReadiness::Required
             && !std::io::stdin().is_terminal()

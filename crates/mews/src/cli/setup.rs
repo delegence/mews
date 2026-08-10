@@ -1,10 +1,7 @@
 use std::{
-    env,
-    fs::{self, OpenOptions},
     io::IsTerminal,
     net::SocketAddr,
     path::Path,
-    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
@@ -12,13 +9,6 @@ use anyhow::{Context, Result, bail};
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
 use inquire::{MultiSelect, Password, Select, Text};
-use mews::{
-    enrollment::JoinOffer,
-    enrollment::relay::{JoinedHostState, join_host},
-    identity::{HostIdentity, NoiseIdentity},
-    relay_supervisor::{RelayConfig, RelayRole},
-    service::Mews,
-};
 use mews_client::MewsClient;
 
 use super::{
@@ -31,7 +21,7 @@ use super::{
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
-pub(crate) struct RestartFailure(String);
+pub struct RestartFailure(String);
 
 pub async fn run(
     root: &Path,
@@ -62,25 +52,34 @@ pub async fn run(
     let local_host_name = options.name.clone();
     match options.mode {
         SetupMode::Create => {
-            create(
-                root,
-                &options.name,
-                options.relay,
-                options.relay_listen,
-                options.no_daemon,
-            )
-            .await?
+            let relay_url = options.relay.unwrap_or_else(default_relay_url);
+            let listen = concrete_relay_listen(
+                options
+                    .relay_listen
+                    .or(derive_relay_listen(&relay_url)?)
+                    .context("an external relay requires --relay-listen to be hosted locally")?,
+            )?;
+            crate::machine::setup::create(root, &options.name, relay_url, listen, options.no_daemon)
+                .await?
         }
         SetupMode::Join { offer } => {
-            join_existing(
+            let relay_url = options.relay.unwrap_or_else(default_relay_url);
+            let listen = concrete_relay_listen(
+                options
+                    .relay_listen
+                    .or(derive_relay_listen(&relay_url)?)
+                    .context("a Host relay requires --relay-listen")?,
+            )?;
+            let host = crate::machine::setup::join(
                 root,
                 &options.name,
                 &offer,
-                options.relay,
-                options.relay_listen,
+                relay_url,
+                listen,
                 options.no_daemon,
             )
-            .await?
+            .await?;
+            println!("MEWS Host enrolled: {}", host.id);
         }
     }
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
@@ -90,8 +89,7 @@ pub async fn run(
 }
 
 pub(crate) async fn offer_harness_setup(root: &Path, host_name: &str) -> Result<()> {
-    let choices = mews_host::HarnessCatalog::discover(Some(root))?
-        .descriptors()
+    let choices = super::harnesses::discover(root)?
         .into_iter()
         .filter(|descriptor| descriptor.protocol == mews_protocol::HarnessProtocol::Acp)
         .map(|descriptor| {
@@ -133,7 +131,7 @@ pub(crate) async fn offer_harness_setup(root: &Path, host_name: &str) -> Result<
             .map(|(_, name)| name)
             .expect("selected Harness exists");
         println!("  setting up {name} ...");
-        match mews_host::HarnessCatalog::setup(root, name).await {
+        match super::harnesses::setup(root, name).await {
             Ok(setup) if setup.descriptor.availability.ready() => {
                 println!("  {} {name} is ready.", style("✓").green());
                 changed_catalog = true;
@@ -167,7 +165,7 @@ struct SetupOptions {
 }
 
 fn prompt_options(root: &Path) -> Result<Option<SetupOptions>> {
-    ensure_empty(root)?;
+    crate::machine::setup::ensure_available(root)?;
     println!("---------\n M E W S\n---------\n\nSet up MEWS\n");
     let Some(action) = prompt(
         Select::new(
@@ -192,7 +190,7 @@ fn prompt_options(root: &Path) -> Result<Option<SetupOptions>> {
         else {
             return Ok(None);
         };
-        JoinOffer::decode(encoded.trim()).context("invalid invitation")?;
+        crate::machine::setup::validate_invitation(encoded.trim()).context("invalid invitation")?;
         Some(encoded.trim().to_owned())
     } else {
         None
@@ -236,141 +234,12 @@ fn prompt_options(root: &Path) -> Result<Option<SetupOptions>> {
     }))
 }
 
-async fn create(
-    root: &Path,
-    name: &str,
-    relay_url: Option<String>,
-    relay_listen: Option<SocketAddr>,
-    no_daemon: bool,
-) -> Result<()> {
-    let relay_url = relay_url.unwrap_or_else(default_relay_url);
-    let listen = concrete_relay_listen(
-        relay_listen
-            .or(derive_relay_listen(&relay_url)?)
-            .context("an external relay requires --relay-listen to be hosted locally")?,
-    )?;
-    let config = RelayConfig {
-        listen,
-        url: relay_url,
-        role: RelayRole::Active,
-    };
-    let mews = Mews::setup(root, name)?;
-    mews.set_relay_url(&config.url)?;
-    mews::relay_supervisor::write(root, &config)?;
-    drop(mews);
-    if !no_daemon {
-        mews::daemon::install(root, &env::current_exe()?)?;
-        return wait_for_hub_ready(root, false).await;
-    }
-    spawn_and_wait(root, "hub.log", &["hub", "serve"], "Hub").await
-}
-
-async fn join_existing(
-    root: &Path,
-    name: &str,
-    encoded: &str,
-    relay_url: Option<String>,
-    relay_listen: Option<SocketAddr>,
-    no_daemon: bool,
-) -> Result<()> {
-    let offer = JoinOffer::decode(encoded)?;
-    ensure_empty(root)?;
-    std::fs::create_dir_all(root)?;
-    secure(root, 0o700)?;
-    mews::paths::ensure_directories(root)?;
-    let identity = HostIdentity::load_or_create(&root.join("secrets/host.key"))?;
-    let noise = NoiseIdentity::load_or_create(&root.join("secrets/host-noise.key"))?;
-    let relay_url = relay_url.unwrap_or_else(default_relay_url);
-    let listen = concrete_relay_listen(
-        relay_listen
-            .or(derive_relay_listen(&relay_url)?)
-            .context("a Host relay requires --relay-listen")?,
-    )?;
-    mews::relay_supervisor::write(
-        root,
-        &RelayConfig {
-            url: relay_url.clone(),
-            listen,
-            role: RelayRole::Disabled,
-        },
-    )?;
-    let accepted = join_host(&offer, name, &identity, &noise, &relay_url).await?;
-    let state_path = root.join("hub.json");
-    std::fs::write(
-        &state_path,
-        serde_json::to_vec_pretty(&JoinedHostState {
-            installation_id: offer.installation_id,
-            installation_public_key: offer.installation_public_key,
-            hub_noise_public_key: offer.hub_noise_public_key,
-            relay_urls: accepted.relay_urls.clone(),
-            accepted: accepted.clone(),
-        })?,
-    )?;
-    secure(&state_path, 0o600)?;
-    println!("MEWS Host enrolled: {}", accepted.host.id);
-    if no_daemon {
-        spawn_and_wait(root, "host.log", &["daemon"], "Host").await
-    } else {
-        mews::daemon::install(root, &env::current_exe()?)?;
-        wait_for_hub_ready(root, false).await
-    }
-}
-
-fn ensure_empty(root: &Path) -> Result<()> {
-    if root.join("mews.db").exists() || root.join("hub.json").exists() {
-        bail!("MEWS state already exists at {}", root.display());
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn secure(path: &Path, mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
-    Ok(())
-}
-#[cfg(not(unix))]
-fn secure(_: &Path, _: u32) -> Result<()> {
-    Ok(())
-}
-
-async fn spawn_and_wait(root: &Path, log_name: &str, args: &[&str], name: &str) -> Result<()> {
-    mews::paths::ensure_directories(root)?;
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(mews::paths::log(root, log_name))?;
-    let mut child = Command::new(env::current_exe()?)
-        .arg("--root")
-        .arg(root)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log.try_clone()?))
-        .stderr(Stdio::from(log))
-        .spawn()
-        .with_context(|| format!("start {name}"))?;
-    for _ in 0..200 {
-        if let Ok(mut client) = MewsClient::connect(root).await
-            && client.status().await.is_ok()
-        {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    bail!(
-        "{name} did not become ready; inspect {}",
-        mews::paths::log(root, log_name).display()
-    )
-}
-
 pub(super) async fn restart(root: &Path) -> Result<()> {
     let started = Instant::now();
     println!("Restarting MEWS...\n");
 
     let progress = spinner("Restarting daemon");
-    mews::daemon::restart()?;
+    crate::machine::daemon::restart()?;
     finish_progress(progress, "\u{2713} Daemon ready");
 
     let progress = spinner("Waiting for Hub");
@@ -474,80 +343,11 @@ async fn connect_to_hub(
 }
 
 fn restart_failure(root: &Path, last_error: &str) -> String {
-    let socket = mews::hub::socket_path(root);
-    let log = mews::paths::log(root, "daemon.log");
-    let logged_error = fs::read_to_string(&log)
-        .ok()
-        .and_then(|contents| {
-            contents
-                .lines()
-                .rev()
-                .find(|line| !line.trim().is_empty())
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| last_error.to_owned());
+    let context = crate::machine::runtime::restart_failure_context(root, last_error);
     format!(
         "MEWS failed to restart\n\nDaemon restarted\nHub unavailable after 5s\nSocket: {}\nLog: {}\n\nLast error:\n{}",
-        socket.display(),
-        log.display(),
-        logged_error
+        context.socket.display(),
+        context.log.display(),
+        context.last_error
     )
-}
-
-async fn wait_for_hub_ready(root: &Path, announce: bool) -> Result<()> {
-    for _ in 0..200 {
-        if let Ok(mut client) = MewsClient::connect(root).await
-            && let Ok(installation) = client.status().await
-        {
-            if announce {
-                print_hub_ready(&mut client, &installation).await;
-            }
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    bail!(
-        "MEWS daemon did not become ready; inspect {}",
-        mews::paths::log(root, "daemon.log").display()
-    )
-}
-
-async fn print_hub_ready(client: &mut MewsClient, installation: &mews_protocol::Installation) {
-    let hosts = client.hosts().await.unwrap_or_default();
-    let hub = hosts
-        .iter()
-        .find(|status| status.host.id == installation.hub_host_id)
-        .map(|status| status.host.name.clone())
-        .unwrap_or_else(|| installation.hub_host_id.to_string());
-    let connected_hosts = hosts.iter().filter(|status| status.connected).count();
-    let agents = client
-        .agents()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|agent| !agent.archived)
-        .count();
-    let mut harnesses = client
-        .harnesses()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|status| status.descriptor.availability.ready())
-        .map(|status| status.descriptor.name)
-        .collect::<Vec<_>>();
-    harnesses.sort();
-    harnesses.dedup();
-
-    println!("\nMEWS is ready.");
-    println!("Hub: {hub}");
-    println!("Hosts: {connected_hosts}/{} available", hosts.len());
-    println!("Agents: {agents} available");
-    println!(
-        "Harnesses: {}",
-        if harnesses.is_empty() {
-            "none ready".into()
-        } else {
-            harnesses.join(", ")
-        }
-    );
 }

@@ -1,6 +1,6 @@
+use super::handle_host_request;
 use super::*;
-use crate::host::connection::*;
-use crate::host::lifecycle::handle_host_request;
+use crate::connection::*;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
@@ -53,7 +53,7 @@ done
         ),
     )
     .unwrap();
-    mews_host::HarnessCatalog::setup(host_root.path(), "fixture")
+    crate::HarnessCatalog::setup(host_root.path(), "fixture")
         .await
         .unwrap();
     let cwd = project.path().canonicalize().unwrap();
@@ -65,8 +65,7 @@ done
     .await
     .unwrap();
 
-    let (event_tx, mut event_rx) =
-        tokio::sync::mpsc::channel(crate::host::ACP_EVENT_CHANNEL_CAPACITY);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(crate::ACP_EVENT_CHANNEL_CAPACITY);
     let cancellation = mews_agent::CancellationToken::new();
     let run = connected.run_acp(
         RemoteAcpRun {
@@ -298,7 +297,7 @@ async fn host_reads_context_and_refuses_to_overwrite_a_changed_replica() {
     );
 
     let agent = Agent {
-        id: crate::AgentId::new(),
+        id: mews_protocol::AgentId::new(),
         slug: "coder".into(),
         current_revision: 1,
         archived: false,
@@ -308,7 +307,7 @@ async fn host_reads_context_and_refuses_to_overwrite_a_changed_replica() {
         agent_id: agent.id.clone(),
         revision: 1,
         soul: "canonical".into(),
-        config_toml: crate::service::DEFAULT_CONFIG.into(),
+        config_toml: "harness = \"mews\"\ntools = [\"*\"]\n".into(),
         content_hash: "unused".into(),
         author_host_id: HostId::new(),
         created_at: Utc::now(),
@@ -327,7 +326,7 @@ async fn host_reads_context_and_refuses_to_overwrite_a_changed_replica() {
 fn host_renames_a_clean_agent_replica_and_retains_one_backup() {
     let root = tempfile::tempdir().unwrap();
     let agent = Agent {
-        id: crate::AgentId::new(),
+        id: mews_protocol::AgentId::new(),
         slug: "coder".into(),
         current_revision: 1,
         archived: false,
@@ -337,7 +336,7 @@ fn host_renames_a_clean_agent_replica_and_retains_one_backup() {
         agent_id: agent.id.clone(),
         revision: 1,
         soul: "canonical".into(),
-        config_toml: crate::service::DEFAULT_CONFIG.into(),
+        config_toml: "harness = \"mews\"\ntools = [\"*\"]\n".into(),
         content_hash: "unused".into(),
         author_host_id: HostId::new(),
         created_at: Utc::now(),
@@ -390,7 +389,7 @@ fn host_renames_a_clean_agent_replica_and_retains_one_backup() {
 fn host_rejects_rename_when_the_old_replica_changed_after_preflight() {
     let root = tempfile::tempdir().unwrap();
     let agent = Agent {
-        id: crate::AgentId::new(),
+        id: mews_protocol::AgentId::new(),
         slug: "coder".into(),
         current_revision: 1,
         archived: false,
@@ -400,7 +399,7 @@ fn host_rejects_rename_when_the_old_replica_changed_after_preflight() {
         agent_id: agent.id.clone(),
         revision: 1,
         soul: "canonical".into(),
-        config_toml: crate::service::DEFAULT_CONFIG.into(),
+        config_toml: "harness = \"mews\"\ntools = [\"*\"]\n".into(),
         content_hash: "unused".into(),
         author_host_id: HostId::new(),
         created_at: Utc::now(),
@@ -435,17 +434,17 @@ fn host_rejects_rename_when_the_old_replica_changed_after_preflight() {
 fn prepared_hub_requires_the_source_activation_nonce() {
     let hub_root = tempfile::tempdir().unwrap();
     let target_root = tempfile::tempdir().unwrap();
-    let mut mews = crate::service::Mews::setup(hub_root.path(), "laptop").unwrap();
+    let mut mews = mews::app::Mews::setup(hub_root.path(), "laptop").unwrap();
     std::fs::write(hub_root.path().join("auth.json"), "{}").unwrap();
     let offer = mews.create_invitation(Some("ws://127.0.0.1:9000")).unwrap();
     let identity =
-        crate::identity::HostIdentity::load_or_create(&target_root.path().join("secrets/host.key"))
+        mews_transport::HostIdentity::load_or_create(&target_root.path().join("secrets/host.key"))
             .unwrap();
-    let noise = crate::identity::NoiseIdentity::load_or_create(
+    let noise = mews_transport::NoiseIdentity::load_or_create(
         &target_root.path().join("secrets/host-noise.key"),
     )
     .unwrap();
-    let request = crate::enrollment::JoinRequest::create(
+    let request = mews::enrollment::JoinRequest::create(
         &offer,
         "mini-pc".into(),
         &identity,
@@ -514,17 +513,17 @@ fn prepared_hub_requires_the_source_activation_nonce() {
 fn prepared_hub_with_previous_database() -> (tempfile::TempDir, String) {
     let hub_root = tempfile::tempdir().unwrap();
     let target_root = tempfile::tempdir().unwrap();
-    let mut mews = crate::service::Mews::setup(hub_root.path(), "laptop").unwrap();
+    let mut mews = mews::app::Mews::setup(hub_root.path(), "laptop").unwrap();
     std::fs::write(hub_root.path().join("auth.json"), "{}").unwrap();
     let offer = mews.create_invitation(Some("ws://127.0.0.1:9000")).unwrap();
     let identity =
-        crate::identity::HostIdentity::load_or_create(&target_root.path().join("secrets/host.key"))
+        mews_transport::HostIdentity::load_or_create(&target_root.path().join("secrets/host.key"))
             .unwrap();
-    let noise = crate::identity::NoiseIdentity::load_or_create(
+    let noise = mews_transport::NoiseIdentity::load_or_create(
         &target_root.path().join("secrets/host-noise.key"),
     )
     .unwrap();
-    let request = crate::enrollment::JoinRequest::create(
+    let request = mews::enrollment::JoinRequest::create(
         &offer,
         "mini-pc".into(),
         &identity,

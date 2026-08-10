@@ -25,7 +25,7 @@ pub(super) async fn serve_local_clients(
     peer: mpsc::Sender<PeerEnvelope>,
     pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<HubResponse>>>>,
 ) -> Result<()> {
-    let path = crate::hub::socket_path(root);
+    let path = crate::server::socket_path(root);
     if path.exists() {
         fs::remove_file(&path)?;
     }

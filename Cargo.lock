@@ -1262,6 +1262,8 @@ dependencies = [
  "mews-router",
  "mews-runtime",
  "mews-store",
+ "mews-transport",
+ "mews-tui",
  "rand_core 0.6.4",
  "regex",
  "reqwest",
@@ -1270,14 +1272,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "snow",
  "tempfile",
  "thiserror",
  "tokio",
- "tokio-tungstenite",
  "toml",
  "uuid",
- "zeroize",
 ]
 
 [[package]]
@@ -1347,16 +1346,23 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
+ "chrono",
  "libc",
+ "mews",
  "mews-acp",
  "mews-agent",
  "mews-protocol",
+ "mews-relay",
+ "mews-store",
+ "mews-transport",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "tokio",
  "toml",
+ "uuid",
 ]
 
 [[package]]
@@ -1443,6 +1449,37 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "mews-transport"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "chrono",
+ "ed25519-dalek",
+ "mews-protocol",
+ "mews-relay",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "snow",
+ "tempfile",
+ "tokio",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "mews-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mews-client",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

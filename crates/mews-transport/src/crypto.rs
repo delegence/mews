@@ -8,10 +8,8 @@ use anyhow::{Result, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    InstallationId,
-    identity::{HostIdentity, NoiseIdentity},
-};
+use crate::identity::{HostIdentity, NoiseIdentity};
+use mews_protocol::InstallationId;
 
 const PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 pub const MAX_ENCRYPTED_RECORD_PLAINTEXT: usize = 48 * 1024;

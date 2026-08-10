@@ -1,4 +1,4 @@
-//! Interactive terminal UI for MEWS sessions.
+//! WIP interactive terminal UI for MEWS sessions with agents.
 
 use std::{
     collections::HashMap,

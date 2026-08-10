@@ -1,3 +1,5 @@
+//! Durable Hub application state and product use cases.
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -13,7 +15,6 @@ use crate::{
     Agent, MessageContent, MessageRole, MessageSource, RunStatus, Session, SourceKind,
     host::{ConnectedHost, HostExecutor},
     identity::{HostIdentity, NoiseIdentity},
-    runtime_store,
 };
 use mews_host::ToolRegistry;
 use mews_store::Store;
@@ -44,10 +45,11 @@ pub struct HubSnapshot {
     pub target_hub: crate::HostId,
 }
 
-mod acp_execution;
+mod acp;
 mod agents;
 mod core;
 mod handoff;
+mod native;
 mod providers;
 mod runs;
 mod sessions;
@@ -503,7 +505,7 @@ mod tests {
             .unwrap()
             .insert("offer".into(), serde_json::to_value(offer).unwrap());
         assert!(
-            serde_json::from_value::<crate::enrollment::relay::JoinedHostState>(persisted).is_err()
+            serde_json::from_value::<crate::enrollment::join::JoinedHostState>(persisted).is_err()
         );
     }
 

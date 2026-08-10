@@ -1,4 +1,4 @@
-pub mod relay;
+pub mod join;
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};

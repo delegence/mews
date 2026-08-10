@@ -41,7 +41,7 @@ The public Rust interfaces are deliberately small:
 - `mews-acp` owns the generic external-Harness boundary: isolated process launch, ACP JSON-RPC, persistent session resume/recovery, permissions, and the Run-scoped MCP extension bridge. It has no provider-specific installation or profile policy.
 - `mews-store` owns the concrete SQLite schema, queries, and transactional persistence invariants. It has no knowledge of Hub process lifecycle, MEWS home-directory layout, networking, or runtime execution.
 - `mews-host` owns concrete full-authority hands: project context and resource discovery, built-in and executable tools, extensions, hooks, process limits, and catalog hot reload.
-- `mews::runtime_store` implements `ConversationStore` for the current SQLite Store and binds Session identity. `mews-runtime` drives Run begin/completion/failure through that contract.
+- `mews` is the application and Hub composition root. Its native execution adapter implements `ConversationStore` for the SQLite Store and binds Session identity; `mews-runtime` drives Run begin/completion/failure through that contract.
 - `Tool` is a named schema plus an asynchronous Host-side execution function.
 - `ToolRegistry` supports live registration/replacement/removal and publishes catalog changes to connected Hub handles.
 - `HostControl` owns remote Host coordination: attestation, Agent synchronization, relay configuration, Hub transfer, Harness catalog inspection, and ACP execution/session coordination. `AgentCapabilities` independently contains native Harness context, prompts, tools, and hooks. `HostExecutor` is only the composition marker for a connected endpoint implementing both interfaces.
@@ -175,6 +175,7 @@ mews agents new <slug> [--harness <name>] [--option <key=value>]...  Create an A
 mews agents rename <old> <new> Rename an Agent
 mews agents delete <slug>    Archive an Agent
 mews agents <slug>           Start a fresh interactive Session
+mews agents <slug> -p …      Start a fresh Session with an initial prompt
 mews sessions list           List Sessions
 mews sessions <id>           Explicitly resume a Session
 mews sessions <id> ask …     Resume from any machine on the bound Host

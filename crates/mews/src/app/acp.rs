@@ -306,9 +306,7 @@ pub(super) fn finish_acp_run(
     };
     eprintln!(
         "ACP timings: spawn={}ms initialize={}ms continuation={}ms",
-        outcome.timings.spawn.as_millis(),
-        outcome.timings.initialize.as_millis(),
-        outcome.timings.continuation.as_millis()
+        outcome.timings.spawn_ms, outcome.timings.initialize_ms, outcome.timings.continuation_ms
     );
     if outcome.stop_reason == mews_acp::AcpStopReason::Cancelled {
         store.finish_run(run, RunStatus::Cancelled, None)?;

@@ -1,11 +1,9 @@
-mod cli;
-
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    match cli::run().await {
+    match mews::cli::run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
-            if let Some(error) = error.downcast_ref::<cli::RestartFailure>() {
+            if let Some(error) = error.downcast_ref::<mews::cli::RestartFailure>() {
                 eprintln!("{error}");
             } else {
                 eprintln!("Error: {error:#}");

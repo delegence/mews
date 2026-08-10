@@ -8,10 +8,10 @@ mod session;
 mod updates;
 
 pub use mcp::AcpSkill;
+pub use mews_protocol::{AcpStopReason, AcpTimings};
 pub use process::AcpHarnessConfig;
 pub use rpc::{AcpErrorKind, classify_error, is_cancelled};
 pub use session::{
-    AcpHookMetadata, AcpProbe, AcpProbeTimings, AcpSessionOutcome, AcpSessionRequest,
-    AcpStopReason, AcpStreamEvent, AcpTimings, probe_acp,
-    run_acp_session_with_extensions_and_events,
+    AcpEventSink, AcpHookMetadata, AcpProbe, AcpProbeTimings, AcpRunRequest, AcpSessionOutcome,
+    AcpSessionRequest, AcpStreamEvent, probe_acp, run_acp_session,
 };

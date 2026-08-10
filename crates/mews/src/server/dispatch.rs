@@ -7,12 +7,12 @@ use std::{
 use anyhow::{Context, Result, bail};
 
 use crate::{
+    app::Mews,
     host::{ConnectedHost, HostControl},
-    service::Mews,
 };
 use mews_protocol::{HubRequest, HubResponse, ProtocolError};
 
-use super::{HubRuntime, handoff::*, runs};
+use super::{HubRuntime, active_runs, handoff::*};
 
 #[derive(Clone, Copy)]
 pub(crate) enum RequestOrigin<'a> {
@@ -33,7 +33,7 @@ pub(crate) async fn dispatch(
     } = &request
     {
         let events =
-            runs::poll_events(runtime, root, consumer_id.clone(), *limit, *wait_ms).await?;
+            active_runs::poll_events(runtime, root, consumer_id.clone(), *limit, *wait_ms).await?;
         return Ok((HubResponse::Events(events), false));
     }
     let is_move = matches!(&request, HubRequest::MoveHub { .. });
@@ -59,7 +59,7 @@ pub(crate) async fn dispatch(
             metadata,
             source,
         } => {
-            let run = runs::start_turn(
+            let run = active_runs::start_turn(
                 runtime,
                 root,
                 idempotency_key,
@@ -148,7 +148,7 @@ pub(crate) async fn dispatch(
         }
         HubRequest::GetRun { id } => HubResponse::Run(mews.run(&id)?),
         HubRequest::CancelRun { id } => {
-            runs::cancel_run(&runtime.control, root, &id).await;
+            active_runs::cancel_run(&runtime.control, root, &id).await;
             mews.cancel_run(&id)?;
             runtime.control.event_notify.notify_waiters();
             HubResponse::Ack
@@ -318,7 +318,7 @@ pub(crate) async fn dispatch(
             let local_host = Arc::clone(&runtime.local_host);
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             tokio::task::spawn_local(async move {
-                if let Err(error) = crate::enrollment::relay::accept_join_ready(
+                if let Err(error) = crate::enrollment::join::accept_join_ready(
                     &root,
                     offer,
                     ready_tx,

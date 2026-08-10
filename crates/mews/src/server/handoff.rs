@@ -8,7 +8,7 @@ use super::HubMoveRecovery;
 
 pub(super) fn write_demoted_state(
     root: &Path,
-    state: &crate::enrollment::relay::JoinedHostState,
+    state: &crate::enrollment::join::JoinedHostState,
 ) -> Result<()> {
     let path = root.join("hub.json");
     fs::write(&path, serde_json::to_vec_pretty(state)?)?;
@@ -27,10 +27,7 @@ pub(super) fn write_move_phase(root: &Path, phase: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn write_move_recovery(
-    root: &Path,
-    snapshot: &crate::service::HubSnapshot,
-) -> Result<()> {
+pub(super) fn write_move_recovery(root: &Path, snapshot: &crate::app::HubSnapshot) -> Result<()> {
     let path = root.join("hub-move-recovery.json");
     fs::write(
         &path,
@@ -47,7 +44,7 @@ pub(super) fn write_move_recovery(
 
 pub(super) async fn transfer_hub_snapshot(
     host: &ConnectedHost,
-    snapshot: &crate::service::HubSnapshot,
+    snapshot: &crate::app::HubSnapshot,
 ) -> Result<()> {
     use sha2::{Digest, Sha256};
     host.begin_hub_transfer(mews_protocol::HubTransferStart {

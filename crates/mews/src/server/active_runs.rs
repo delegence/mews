@@ -5,8 +5,8 @@ use mews_protocol::{MessageSource, SessionId, SourceKind};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::service::Mews;
-use crate::service::StartedRun;
+use crate::app::Mews;
+use crate::app::StartedRun;
 
 use super::HubRuntime;
 

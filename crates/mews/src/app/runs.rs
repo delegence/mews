@@ -1,7 +1,7 @@
 use super::*;
 
 use super::{
-    acp_execution::{
+    acp::{
         AcpReasoningAggregate, checked_acp_binding, finish_acp_run, persist_local_acp_event,
         persist_remote_acp_binding, persist_remote_acp_dispatch,
     },
@@ -362,7 +362,7 @@ impl Mews {
                 session,
                 &harness_descriptor,
             )?;
-            let recovery_prompt = runtime_store::canonical_acp_prompt(&self.store, session, "")?;
+            let recovery_prompt = super::native::canonical_acp_prompt(&self.store, session, "")?;
             let (acp, launch_channel) = acp.context("local ACP Harness launch is unavailable")?;
             let skills = mews_host::resources::snapshot_agent_skills(&self.root, &agent_slug)?;
             let context = mews_protocol::AcpContextSnapshot {
@@ -383,11 +383,11 @@ impl Mews {
             let context_text = context.render().map_err(anyhow::Error::msg)?;
             let channel = launch_channel;
             let mut reasoning = AcpReasoningAggregate::default();
-            let outcome = mews_acp::run_acp_session_with_extensions_and_events(
-                acp,
-                session.working_directory.clone(),
-                config.harness_options.clone(),
-                mews_acp::AcpSessionRequest {
+            let outcome = mews_acp::run_acp_session(mews_acp::AcpRunRequest {
+                config: acp,
+                cwd: session.working_directory.clone(),
+                harness_options: config.harness_options.clone(),
+                session: mews_acp::AcpSessionRequest {
                     transition: transition.clone(),
                     prompt: prompt.clone(),
                     recovery_prompt,
@@ -414,9 +414,9 @@ impl Mews {
                     }),
                 },
                 environment,
-                &config.tools,
-                cancellation.clone(),
-                &mut |event| {
+                allowed_tools: &config.tools,
+                cancellation: cancellation.clone(),
+                events: &mut |event| {
                     if let mews_acp::AcpStreamEvent::SessionBound {
                         session_id,
                         transition,
@@ -447,7 +447,7 @@ impl Mews {
                         &mut reasoning,
                     )
                 },
-            )
+            })
             .await;
             reasoning.persist(&self.store, session, &run)?;
             return finish_acp_run(
@@ -472,7 +472,7 @@ impl Mews {
                 session,
                 &harness_descriptor,
             )?;
-            let recovery_prompt = runtime_store::canonical_acp_prompt(&self.store, session, "")?;
+            let recovery_prompt = super::native::canonical_acp_prompt(&self.store, session, "")?;
             let resume_context = match &binding {
                 mews_protocol::AcpBindingTransition::Resume { .. } => self
                     .store
@@ -731,13 +731,13 @@ impl Mews {
         let provider = mews_router::RouterClient::new(&self.root);
         match run_id {
             Some(run_id) => {
-                runtime_store::run_started(
+                super::native::run_started(
                     &self.store,
                     &provider,
                     environment,
                     session,
                     system,
-                    runtime_store::StartedRun {
+                    super::native::StartedRun {
                         id: run_id,
                         event_notify: event_notify
                             .context("started Run requires an event notifier")?,
@@ -748,7 +748,7 @@ impl Mews {
                 .await
             }
             None => {
-                runtime_store::run(
+                super::native::run(
                     &self.store,
                     &provider,
                     environment,

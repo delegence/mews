@@ -431,8 +431,10 @@ schema = { type = "object" }
             tokio::select! {
                 result = &mut execution => panic!("shell exited before cancellation: {result:?}"),
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                    if let Ok(pid) = std::fs::read_to_string(&pid_path) {
-                        break pid.parse::<i32>().unwrap();
+                    if let Ok(pid) = std::fs::read_to_string(&pid_path)
+                        && let Ok(pid) = pid.parse::<i32>()
+                    {
+                        break pid;
                     }
                 }
             }
@@ -493,8 +495,10 @@ hooks = ["before_model"]
             tokio::select! {
                 result = &mut execution => panic!("hook exited before cancellation: {result:?}"),
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                    if let Ok(pid) = std::fs::read_to_string(&pid_path) {
-                        break pid.parse::<i32>().unwrap();
+                    if let Ok(pid) = std::fs::read_to_string(&pid_path)
+                        && let Ok(pid) = pid.parse::<i32>()
+                    {
+                        break pid;
                     }
                 }
             }

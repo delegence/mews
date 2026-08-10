@@ -56,17 +56,17 @@ pub async fn agents(root: &Path, args: Vec<String>) -> Result<()> {
             client.archive_agent(slug.clone()).await?;
             println!("Deleted Agent {slug}.");
         }
-        [slug, command, prompt @ ..] if command == "ask" && !prompt.is_empty() => {
+        [slug, option, prompt @ ..] if option == "-p" && !prompt.is_empty() => {
             let session = start_session(&mut client, slug).await?;
             let answer = send(&mut client, &session, prompt.join(" ")).await?;
             println!("{answer}\n\nsession: {}", session.id);
         }
         [slug] => {
             let session = start_session(&mut client, slug).await?;
-            super::interactive::chat(&mut client, session).await?;
+            mews_tui::chat(&mut client, session).await?;
         }
         _ => bail!(
-            "usage: mews agents list | mews agents new [name] [--harness <name>] [--option <key=value>]... | mews agents rename <slug> <new-slug> | mews agents delete <slug> | mews agents <slug> [ask <message>]"
+            "usage: mews agents list | mews agents new [name] [--harness <name>] [--option <key=value>]... | mews agents rename <slug> <new-slug> | mews agents delete <slug> | mews agents <slug> [-p <message>]"
         ),
     }
     Ok(())
@@ -151,7 +151,7 @@ async fn complete_creation_wizard(
         )?
         .unwrap_or(false)
     {
-        mews_host::HarnessCatalog::setup(root, harness).await?;
+        super::harnesses::setup(root, harness).await?;
         harnesses = client.refresh_harnesses().await?;
         descriptors = ready_descriptors(&harnesses, harness);
     }
@@ -436,7 +436,7 @@ pub async fn sessions(root: &Path, id: Option<String>, args: Vec<String>) -> Res
     {
         println!("{}", send(&mut client, &session, prompt.join(" ")).await?);
     } else if args.is_empty() {
-        super::interactive::chat(&mut client, session).await?;
+        mews_tui::chat(&mut client, session).await?;
     } else {
         bail!("usage: mews sessions list | mews sessions <id> [ask <message>]");
     }

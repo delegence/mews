@@ -9,7 +9,7 @@ use anyhow::Context;
 #[test]
 fn hub_exits_when_its_router_stops() {
     let state = tempfile::tempdir().unwrap();
-    mews::service::Mews::setup(state.path(), "laptop").unwrap();
+    mews::app::Mews::setup(state.path(), "laptop").unwrap();
     let binary = env!("CARGO_BIN_EXE_mews");
     let mut hub = Command::new(binary)
         .arg("--root")
@@ -395,7 +395,7 @@ fn setup_agent_and_cwd_bound_tool_turn_work_end_to_end() {
         binary,
         state.path(),
         project.path(),
-        &["agents", "coder", "ask", "/greet", "world"],
+        &["agents", "coder", "-p", "/greet", "world"],
     );
     assert!(prompted.contains("hello world [test]"));
     assert!(hook_marker.exists());
@@ -523,7 +523,7 @@ fn setup_agent_and_cwd_bound_tool_turn_work_end_to_end() {
         binary,
         joined_state.path(),
         project.path(),
-        &["agents", "coder", "ask", "test:read", "note.txt"],
+        &["agents", "coder", "-p", "test:read", "note.txt"],
     );
     assert!(remote_output.contains("from the selected directory"));
     let database = rusqlite::Connection::open(state.path().join("mews.db")).unwrap();
@@ -543,7 +543,7 @@ fn setup_agent_and_cwd_bound_tool_turn_work_end_to_end() {
     assert!(resumed_from_hub.contains("from the selected directory"));
     assert_eq!(
         fs::read_to_string(joined_state.path().join("agents/coder/SOUL.md")).unwrap(),
-        mews::service::DEFAULT_SOUL
+        mews::app::DEFAULT_SOUL
     );
     assert!(
         joined_state
@@ -560,14 +560,14 @@ fn setup_agent_and_cwd_bound_tool_turn_work_end_to_end() {
         binary,
         joined_state.path(),
         project.path(),
-        &["agents", "coder", "ask", "test:echo", "synced"],
+        &["agents", "coder", "-p", "test:echo", "synced"],
     );
     assert!(second_remote.contains("synced"));
     let output = run(
         binary,
         state.path(),
         project.path(),
-        &["agents", "coder", "ask", "test:read", "note.txt"],
+        &["agents", "coder", "-p", "test:read", "note.txt"],
     );
     assert!(output.contains("from the selected directory"));
 
@@ -645,7 +645,7 @@ fn setup_agent_and_cwd_bound_tool_turn_work_end_to_end() {
         binary,
         state.path(),
         project.path(),
-        &["agents", "coder", "ask", "test:read", "note.txt"],
+        &["agents", "coder", "-p", "test:read", "note.txt"],
     );
     assert!(demoted_output.contains("from the selected directory"));
 
@@ -661,7 +661,7 @@ fn setup_agent_and_cwd_bound_tool_turn_work_end_to_end() {
         binary,
         joined_state.path(),
         project.path(),
-        &["agents", "coder", "ask", "test:read", "note.txt"],
+        &["agents", "coder", "-p", "test:read", "note.txt"],
     );
     assert!(twice_demoted_output.contains("from the selected directory"));
 
