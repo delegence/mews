@@ -1,6 +1,6 @@
 use super::*;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 5;
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
@@ -8,6 +8,7 @@ impl Store {
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
         let store = Self {
             connection,
             _hub_lock: None,
@@ -23,6 +24,7 @@ impl Store {
         let connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
         Ok(Self {
             connection,
             _hub_lock: None,
@@ -47,12 +49,12 @@ impl Store {
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
         let store = Self {
             connection,
             _hub_lock: Some(lock),
         };
         store.initialize_schema()?;
-        store.recover_interrupted_work()?;
         Ok(store)
     }
 
@@ -126,14 +128,11 @@ impl Store {
              CREATE TABLE IF NOT EXISTS sessions (
                  id TEXT PRIMARY KEY,
                  agent_id TEXT NOT NULL REFERENCES agents(id),
-                 agent_revision INTEGER NOT NULL,
                  host_id TEXT NOT NULL REFERENCES hosts(id),
                  working_directory TEXT NOT NULL,
                  model_override TEXT,
                  leaf_entry_id TEXT,
-                 created_at TEXT NOT NULL,
-                 FOREIGN KEY (agent_id, agent_revision)
-                     REFERENCES agent_revisions(agent_id, revision)
+                 created_at TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS acp_session_bindings (
                  session_id TEXT PRIMARY KEY REFERENCES sessions(id),
@@ -166,9 +165,10 @@ impl Store {
                  FOREIGN KEY (session_id, parent_id)
                      REFERENCES session_entries(session_id, id)
              );
-             CREATE TABLE IF NOT EXISTS runs (
+             CREATE TABLE IF NOT EXISTS turns (
                  id TEXT PRIMARY KEY,
                  session_id TEXT NOT NULL REFERENCES sessions(id),
+                 agent_revision INTEGER NOT NULL,
                  idempotency_key TEXT,
                  harness TEXT,
                  harness_definition_hash TEXT,
@@ -180,8 +180,8 @@ impl Store {
                  completed_at TEXT,
                  UNIQUE (session_id, idempotency_key)
              );
-             CREATE UNIQUE INDEX IF NOT EXISTS one_active_run_per_session
-                 ON runs(session_id) WHERE completed_at IS NULL;
+             CREATE UNIQUE INDEX IF NOT EXISTS one_active_turn_per_session
+                 ON turns(session_id) WHERE completed_at IS NULL;
              CREATE UNIQUE INDEX IF NOT EXISTS acp_observation_idempotency
                  ON session_entries(session_id, observation_key)
                  WHERE observation_key IS NOT NULL;
@@ -196,13 +196,21 @@ impl Store {
                  id TEXT NOT NULL UNIQUE,
                  session_id TEXT NOT NULL REFERENCES sessions(id),
                  entry_id TEXT,
+                 journal_entry_id TEXT,
+                 journal_position INTEGER,
                  idempotency_key TEXT,
                  kind_json TEXT NOT NULL,
                  channel_origin_json TEXT,
                  transient INTEGER NOT NULL,
                  created_at TEXT NOT NULL,
                  FOREIGN KEY (session_id, entry_id)
-                     REFERENCES session_entries(session_id, id)
+                     REFERENCES session_entries(session_id, id),
+                 FOREIGN KEY (journal_entry_id)
+                     REFERENCES journal_entries(id),
+                 CHECK (
+                     transient = 1
+                     OR (journal_entry_id IS NOT NULL AND journal_position IS NOT NULL)
+                 )
              );
              CREATE UNIQUE INDEX IF NOT EXISTS client_event_idempotency
                  ON client_events(session_id, idempotency_key)
@@ -213,7 +221,8 @@ impl Store {
                  id TEXT PRIMARY KEY,
                  cursor INTEGER NOT NULL,
                  kind TEXT NOT NULL,
-                 created_at TEXT NOT NULL
+                 created_at TEXT NOT NULL,
+                 last_seen_at TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS client_subscriptions (
                  consumer_id TEXT NOT NULL REFERENCES client_consumers(id) ON DELETE CASCADE,
@@ -222,119 +231,94 @@ impl Store {
              );
              CREATE INDEX IF NOT EXISTS client_subscriptions_session
                  ON client_subscriptions(session_id, consumer_id);
-             PRAGMA user_version = 1;
+             CREATE TABLE IF NOT EXISTS command_receipts (
+                 command_id TEXT PRIMARY KEY,
+                 request_hash TEXT NOT NULL,
+                 result_json TEXT NOT NULL,
+                 first_position INTEGER,
+                 last_position INTEGER,
+                 completed_at TEXT NOT NULL,
+                 CHECK (
+                     (first_position IS NULL AND last_position IS NULL)
+                     OR (
+                         first_position > 0
+                         AND last_position >= first_position
+                     )
+                 )
+             );
+             CREATE TABLE IF NOT EXISTS journal_entries (
+                 position INTEGER PRIMARY KEY AUTOINCREMENT,
+                 id TEXT NOT NULL UNIQUE,
+                 subject_type TEXT NOT NULL,
+                 subject_id TEXT NOT NULL,
+                 event_type TEXT NOT NULL,
+                 recorded_at TEXT NOT NULL,
+                 actor_kind TEXT NOT NULL,
+                 actor_id TEXT,
+                 command_id TEXT,
+                 correlation_id TEXT,
+                 payload_json TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS journal_entries_subject
+                 ON journal_entries(subject_type, subject_id, position);
+             CREATE INDEX IF NOT EXISTS journal_entries_type_position
+                 ON journal_entries(event_type, position);
+             CREATE TABLE IF NOT EXISTS effects (
+                 operation_id TEXT PRIMARY KEY,
+                 session_id TEXT NOT NULL REFERENCES sessions(id),
+                 turn_id TEXT NOT NULL REFERENCES turns(id),
+                 call_id TEXT,
+                 tool TEXT,
+                 request_json TEXT NOT NULL,
+                 status TEXT NOT NULL CHECK (status IN ('scheduled', 'started', 'succeeded', 'failed', 'uncertain')),
+                 raw_result_json TEXT,
+                 scheduled_journal_entry_id TEXT NOT NULL REFERENCES journal_entries(id),
+                 terminal_journal_entry_id TEXT REFERENCES journal_entries(id),
+                 scheduled_at TEXT NOT NULL,
+                 started_at TEXT,
+                 completed_at TEXT,
+                 UNIQUE (turn_id, call_id)
+             );
+             CREATE INDEX IF NOT EXISTS effects_status_turn
+                 ON effects(status, turn_id);
+             PRAGMA user_version = 5;
              COMMIT;",
         )?;
         Ok(())
     }
 
-    fn recover_interrupted_work(&self) -> Result<(), StoreError> {
+    /// Recovers work only after the application has verified that this process
+    /// owns the current Hub generation and installation authority.
+    pub fn recover_interrupted_work(&self) -> Result<(), StoreError> {
         let transaction = self.connection.unchecked_transaction()?;
+        // Live streaming fragments never survive a Hub lifecycle boundary.
+        transaction.execute("DELETE FROM client_events WHERE transient = 1", [])?;
         let interrupted = {
             let mut statement = transaction
-                .prepare("SELECT id, session_id FROM runs WHERE completed_at IS NULL")?;
+                .prepare("SELECT id, session_id FROM turns WHERE completed_at IS NULL")?;
             statement
                 .query_map([], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        let failed = json(&RunStatus::Failed)?;
-        let recovered_at = timestamp(Utc::now());
-        transaction.execute(
-            "UPDATE runs SET status_json = ?1, error = ?2, completed_at = ?3
-             WHERE completed_at IS NULL",
-            params![failed, "Hub stopped before the Run completed", recovered_at],
-        )?;
-        for (run_id, session_id) in interrupted {
-            let run_id: RunId = parse_id(run_id)?;
+        for (turn_id, session_id) in interrupted {
+            let turn_id: TurnId = parse_id(turn_id)?;
             let session_id: SessionId = parse_id(session_id)?;
-            let kind = ClientEventKind::RunFailed {
-                run_id: run_id.clone(),
-                error: "Hub stopped before the Run completed".into(),
-            };
-            let leaf: Option<String> = transaction.query_row(
-                "SELECT leaf_entry_id FROM sessions WHERE id = ?1",
-                [session_id.as_str()],
-                |row| row.get(0),
-            )?;
-            let sequence: u64 = transaction.query_row(
-                "SELECT COALESCE(MAX(sequence) + 1, 1) FROM session_entries WHERE session_id = ?1",
-                [session_id.as_str()],
-                |row| row.get(0),
-            )?;
-            let payload = SessionEntryPayload::RunFailed {
-                run_id: run_id.clone(),
-                error: "Hub stopped before the Run completed".into(),
-            };
-            transaction.execute(
-                "INSERT INTO session_entries
-                 (id, session_id, sequence, parent_id, kind, contextual, payload_json, created_at)
-                 VALUES (?1, ?2, ?3, ?4, 'run_failed', 0, ?5, ?6)",
-                params![
-                    MessageId::new().as_str(),
-                    session_id.as_str(),
-                    sequence,
-                    leaf,
-                    json(&payload)?,
-                    recovered_at
-                ],
-            )?;
-            transaction.execute(
-                "INSERT INTO client_events (id, session_id, kind_json, channel_origin_json, transient, created_at) VALUES (?1, ?2, ?3, ?4, 0, ?5)",
-                params![EventId::new().as_str(), session_id.as_str(), json(&kind)?, crate::events::channel_origin_json(&transaction, &kind)?, recovered_at],
-            )?;
-        }
-        transaction.commit()?;
-
-        let session_ids = {
-            let mut statement = self
-                .connection
-                .prepare("SELECT DISTINCT session_id FROM session_entries")?;
-            statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        let mut missing = Vec::new();
-        for value in session_ids {
-            let session_id: SessionId = value
-                .parse()
-                .map_err(|error: &str| StoreError::InvalidData(error.into()))?;
-            let entries = self.session_entries(&session_id)?;
-            let completed = entries
-                .iter()
-                .filter_map(|entry| match &entry.payload {
-                    SessionEntryPayload::ToolResult { result, .. } => Some(result.call_id.as_str()),
-                    _ => None,
-                })
-                .collect::<std::collections::HashSet<_>>();
-            for entry in &entries {
-                if let SessionEntryPayload::ToolStarted { run_id, call } = &entry.payload
-                    && !completed.contains(call.call_id.as_str())
-                {
-                    missing.push((
-                        session_id.clone(),
-                        run_id.clone(),
-                        call.call_id.clone(),
-                        call.tool.clone(),
-                    ));
-                }
-            }
-        }
-        for (session_id, run_id, call_id, tool) in missing {
-            self.append_tool_result(
+            crate::turns::close_open_effects(&transaction, &session_id, &turn_id)?;
+            crate::turns::close_orphan_tool_calls(&transaction, &session_id, &turn_id)?;
+            let interrupted = crate::sessions::record_session_event(
+                &transaction,
                 &session_id,
-                &run_id,
-                ToolResult {
-                    call_id,
-                    tool,
-                    result: Value::String(
-                        "outcome unknown because Hub stopped during tool execution".into(),
-                    ),
-                    is_error: true,
+                mews_protocol::EventActor::system(),
+                mews_protocol::JournalEvent::TurnInterrupted {
+                    turn_id: turn_id.clone(),
+                    reason: "Hub stopped before the Turn completed".into(),
                 },
             )?;
+            crate::sessions::apply_session_journal_entry(&transaction, &interrupted)?;
         }
+        transaction.commit()?;
         Ok(())
     }
 }

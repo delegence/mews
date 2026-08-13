@@ -68,24 +68,27 @@ impl AgentCapabilities for LocalEnvironment {
                 name: tool.name,
                 description: tool.description,
                 schema: tool.schema,
+                agent_id: tool.agent_id,
             })
             .collect()
     }
 
-    fn extension_tools(&self) -> Vec<ToolDefinition> {
+    fn extension_tools(&self, agent_id: &mews_protocol::AgentId) -> Vec<ToolDefinition> {
         self.registry
-            .extension_definitions()
+            .extension_definitions(agent_id)
             .into_iter()
             .map(|tool| ToolDefinition {
                 name: tool.name,
                 description: tool.description,
                 schema: tool.schema,
+                agent_id: None,
             })
             .collect()
     }
 
     async fn execute(
         &self,
+        agent_id: &mews_protocol::AgentId,
         call: &ToolCall,
         cwd: &Path,
         cancellation: &CancellationToken,
@@ -94,28 +97,35 @@ impl AgentCapabilities for LocalEnvironment {
         cancellation.check()?;
         let value = self
             .registry
-            .execute(&call.name, call.arguments.clone(), cwd, cancellation)
+            .execute(
+                agent_id,
+                &call.name,
+                call.arguments.clone(),
+                cwd,
+                cancellation,
+            )
             .await?;
         Ok(ToolResult::success(value))
     }
 
     async fn hook(
         &self,
+        agent_id: &mews_protocol::AgentId,
         hook: LifecycleHook,
         payload: Value,
         cwd: &Path,
         cancellation: &CancellationToken,
     ) -> Result<Value> {
         let name = match hook {
-            LifecycleHook::RunStart => "run_start",
+            LifecycleHook::TurnStart => "turn_start",
             LifecycleHook::BeforeModel => "before_model",
             LifecycleHook::BeforeTool => "before_tool",
             LifecycleHook::AfterTool => "after_tool",
-            LifecycleHook::AfterTurn => "after_turn",
-            LifecycleHook::RunEnd => "run_end",
+            LifecycleHook::AfterStep => "after_step",
+            LifecycleHook::TurnEnd => "turn_end",
         };
         self.registry
-            .execute_hooks(name, payload, cwd, cancellation)
+            .execute_hooks(agent_id, name, payload, cwd, cancellation)
             .await
     }
 }

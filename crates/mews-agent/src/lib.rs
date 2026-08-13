@@ -14,7 +14,7 @@ mod types;
 
 pub use capabilities::*;
 pub use context_budget::{apply_context_budget, context_budget_bytes};
-pub use r#loop::{run, run_with_config};
+pub use r#loop::{execute_turn, execute_turn_with_config};
 pub use mews_protocol::{ReasoningEffort, ToolDefinition};
 pub use model::*;
 pub use queue::MessageQueue;

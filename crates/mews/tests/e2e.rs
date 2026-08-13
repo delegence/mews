@@ -44,7 +44,7 @@ fn hub_exits_when_its_router_stops() {
 }
 
 #[test]
-fn locationless_channel_runs_and_delivers_through_durable_events() {
+fn locationless_channel_turns_deliver_through_durable_events() {
     let state = tempfile::tempdir().unwrap();
     fs::write(state.path().join(".test-provider"), []).unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -335,16 +335,7 @@ fn setup_agent_and_cwd_bound_tool_turn_work_end_to_end() {
         "---\ndescription: Greet someone\n---\nhello $1",
     )
     .unwrap();
-    fs::create_dir_all(state.path().join("extensions")).unwrap();
     let hook_marker = project.path().join("hook-ran");
-    fs::write(
-        state.path().join("extensions/observe.toml"),
-        format!(
-            "name = \"observe\"\ncommand = [\"sh\", \"-c\", {:?}]\nhooks = [\"run_start\"]\n",
-            format!("cat >/dev/null; : > {}; printf null", hook_marker.display())
-        ),
-    )
-    .unwrap();
     let binary = env!("CARGO_BIN_EXE_mews");
     let port = free_port();
     let relay_address = format!("127.0.0.1:{port}");
@@ -391,6 +382,36 @@ fn setup_agent_and_cwd_bound_tool_turn_work_end_to_end() {
         project.path(),
         &["agents", "new", "coder"],
     );
+    let extensions = state.path().join("agents/coder/extensions");
+    fs::create_dir(&extensions).unwrap();
+    fs::write(
+        extensions.join("observe.toml"),
+        format!(
+            "name = \"observe\"\ncommand = [\"sh\", \"-c\", {:?}]\nhooks = [\"turn_start\"]\n",
+            format!("cat >/dev/null; : > {}; printf null", hook_marker.display())
+        ),
+    )
+    .unwrap();
+    // Restarting performs a synchronous initial extension scan, avoiding a
+    // timing assumption about the live catalog watcher's polling interval.
+    run(binary, state.path(), project.path(), &["hub", "stop"]);
+    for _ in 0..100 {
+        if !state.path().join("hub.sock").exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let restarted_hub = Command::new(binary)
+        .arg("--root")
+        .arg(state.path())
+        .args(["hub", "serve"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _restarted_hub = ChildGuard(Some(restarted_hub));
+    wait_for_status(binary, state.path(), project.path());
     let prompted = run(
         binary,
         state.path(),
@@ -431,7 +452,7 @@ fn setup_agent_and_cwd_bound_tool_turn_work_end_to_end() {
             let batch = events.poll_events(consumer.clone(), 2_000).await.unwrap();
             for event in &batch.events {
                 saw_message |= matches!(event.kind, ClientEventKind::AssistantMessage { .. });
-                saw_completion |= matches!(event.kind, ClientEventKind::RunCompleted { .. });
+                saw_completion |= matches!(event.kind, ClientEventKind::TurnCompleted { .. });
             }
             if batch.advanced {
                 events
@@ -538,7 +559,7 @@ fn setup_agent_and_cwd_bound_tool_turn_work_end_to_end() {
         binary,
         state.path(),
         project.path(),
-        &["sessions", &remote_session, "ask", "test:read", "note.txt"],
+        &["sessions", &remote_session, "-p", "test:read", "note.txt"],
     );
     assert!(resumed_from_hub.contains("from the selected directory"));
     assert_eq!(
@@ -678,7 +699,7 @@ fn setup_agent_and_cwd_bound_tool_turn_work_end_to_end() {
         .unwrap();
     let completed: u64 = database
         .query_row(
-            "SELECT COUNT(*) FROM runs WHERE status_json = '\"completed\"' AND completed_at IS NOT NULL",
+            "SELECT COUNT(*) FROM turns WHERE status_json = '\"completed\"' AND completed_at IS NOT NULL",
             [],
             |row| row.get(0),
         )
@@ -696,6 +717,29 @@ fn setup_agent_and_cwd_bound_tool_turn_work_end_to_end() {
         "prompt and asynchronous turns remain durable"
     );
     assert_eq!(completed, 8);
+
+    let detached = run(
+        binary,
+        state.path(),
+        project.path(),
+        &["agents", "coder", "-p", "test:echo", "detached", "--detach"],
+    );
+    assert!(detached.contains("session: ses_"));
+    assert!(detached.contains("turn: turn_"));
+    for _ in 0..100 {
+        let completed: u64 = database
+            .query_row(
+                "SELECT COUNT(*) FROM turns WHERE status_json = '\"completed\"' AND completed_at IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if completed == 9 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("detached Turn did not complete in the daemon");
 }
 
 struct HubGuard<'a> {

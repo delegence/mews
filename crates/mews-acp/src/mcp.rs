@@ -1,6 +1,6 @@
-//! A deliberately small MCP server for one external Harness Run.
+//! A deliberately small MCP server for one external Harness Turn.
 //!
-//! The bridge snapshots only Host extension definitions at Run start. It never
+//! The bridge snapshots only Host extension definitions at Turn start. It never
 //! manufactures filesystem or shell tools, and it delegates actual execution
 //! to the Host capability boundary.
 
@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use mews_agent::{
     AgentCapabilities, CancellationToken, LifecycleHook, ProgressReporter, ToolCall, ToolCatalog,
-    ToolDefinition, ToolResult,
+    ToolDefinition, ToolResult, UNCERTAIN_EFFECT_INSTRUCTION, effect_uncertainty,
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -96,15 +96,16 @@ pub struct AcpSkill {
 #[derive(Clone, Debug)]
 pub struct McpCorrelation {
     pub mews_session_id: String,
-    pub run_id: String,
+    pub turn_id: String,
     pub harness: String,
     pub acp_session_id: std::sync::Arc<Mutex<Option<String>>>,
 }
 
-/// A least-authority MCP capability valid only while its owning Run keeps it
-/// alive. Catalog changes cannot add authority to an existing Run.
-pub struct RunMcpBridge<'a> {
+/// A least-authority MCP capability valid only while its owning Turn keeps it
+/// alive. Catalog changes cannot add authority to an existing Turn.
+pub struct TurnMcpBridge<'a> {
     environment: &'a dyn AgentCapabilities,
+    agent_id: mews_protocol::AgentId,
     cwd: PathBuf,
     cancellation: CancellationToken,
     tools: BTreeMap<String, ToolDefinition>,
@@ -113,6 +114,7 @@ pub struct RunMcpBridge<'a> {
     active: AtomicBool,
     next_call_id: AtomicU64,
     hook_outcomes: Mutex<Vec<McpHookOutcome>>,
+    uncertain_effect: Mutex<Option<String>>,
     correlation: Option<McpCorrelation>,
     legacy_version: Mutex<Option<LegacyMcpVersion>>,
 }
@@ -126,7 +128,7 @@ pub struct McpHookOutcome {
     pub call_id: Option<String>,
 }
 
-impl<'a> RunMcpBridge<'a> {
+impl<'a> TurnMcpBridge<'a> {
     #[cfg(test)]
     pub fn for_extensions(
         environment: &'a dyn AgentCapabilities,
@@ -134,18 +136,26 @@ impl<'a> RunMcpBridge<'a> {
         cancellation: CancellationToken,
         allowed_tools: &[String],
     ) -> Result<Self> {
-        Self::for_extensions_and_skills(environment, cwd, cancellation, allowed_tools, Vec::new())
+        Self::for_extensions_and_skills(
+            environment,
+            &mews_protocol::AgentId::new(),
+            cwd,
+            cancellation,
+            allowed_tools,
+            Vec::new(),
+        )
     }
 
     pub fn for_extensions_and_skills(
         environment: &'a dyn AgentCapabilities,
+        agent_id: &mews_protocol::AgentId,
         cwd: PathBuf,
         cancellation: CancellationToken,
         allowed_tools: &[String],
         skills: Vec<AcpSkill>,
     ) -> Result<Self> {
         let mut definitions = environment
-            .extension_tools()
+            .extension_tools(agent_id)
             .into_iter()
             // Defense in depth: native MEWS tools cannot be exposed over MCP
             // even if a Host implementation incorrectly includes one here.
@@ -179,6 +189,7 @@ impl<'a> RunMcpBridge<'a> {
                 name: name.into(),
                 description: description.into(),
                 schema,
+                agent_id: None,
             });
         }
         let catalog = ToolCatalog::compile(definitions.clone())?;
@@ -188,6 +199,7 @@ impl<'a> RunMcpBridge<'a> {
             .collect();
         Ok(Self {
             environment,
+            agent_id: agent_id.clone(),
             cwd,
             cancellation,
             tools,
@@ -196,6 +208,7 @@ impl<'a> RunMcpBridge<'a> {
             active: AtomicBool::new(true),
             next_call_id: AtomicU64::new(1),
             hook_outcomes: Mutex::new(Vec::new()),
+            uncertain_effect: Mutex::new(None),
             correlation: None,
             legacy_version: Mutex::new(None),
         })
@@ -214,7 +227,7 @@ impl<'a> RunMcpBridge<'a> {
         }
     }
 
-    /// Invalidates the capability before the owning Run is dropped.
+    /// Invalidates the capability before the owning Turn is dropped.
     pub fn revoke(&self) {
         self.active.store(false, Ordering::SeqCst);
     }
@@ -234,6 +247,22 @@ impl<'a> RunMcpBridge<'a> {
                 .lock()
                 .expect("MCP hook outcomes poisoned"),
         )
+    }
+
+    pub fn take_effect_uncertainty(&self) -> Option<String> {
+        self.uncertain_effect
+            .lock()
+            .expect("MCP effect uncertainty poisoned")
+            .take()
+    }
+
+    fn preserve_effect_uncertainty(&self, error: &anyhow::Error) {
+        if let Some(uncertain) = effect_uncertainty(error) {
+            *self
+                .uncertain_effect
+                .lock()
+                .expect("MCP effect uncertainty poisoned") = Some(uncertain.reason().to_owned());
+        }
     }
 
     fn record_hook(&self, hook: &str, ok: bool, detail: Option<String>, call: Option<&ToolCall>) {
@@ -260,7 +289,7 @@ impl<'a> RunMcpBridge<'a> {
                 "session_id".into(),
                 Value::String(correlation.mews_session_id.clone()),
             );
-            payload.insert("run_id".into(), Value::String(correlation.run_id.clone()));
+            payload.insert("turn_id".into(), Value::String(correlation.turn_id.clone()));
             payload.insert("harness".into(), Value::String(correlation.harness.clone()));
             if let Some(session_id) = correlation
                 .acp_session_id
@@ -277,14 +306,14 @@ impl<'a> RunMcpBridge<'a> {
         Value::Object(payload)
     }
 
-    /// Creates a local, unguessable HTTP endpoint for this Run. Both managed
+    /// Creates a local, unguessable HTTP endpoint for this Turn. Both managed
     /// ACP recipes support this MCP transport; the endpoint is never written
-    /// to a profile or reused by another Run.
-    pub async fn bind_http(&self) -> Result<RunMcpHttp> {
+    /// to a profile or reused by another Turn.
+    pub async fn bind_http(&self) -> Result<TurnMcpHttp> {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
-            .context("bind MEWS run-scoped MCP endpoint")?;
-        Ok(RunMcpHttp {
+            .context("bind MEWS Turn-scoped MCP endpoint")?;
+        Ok(TurnMcpHttp {
             listener,
             path: format!("/mcp/{}", Uuid::now_v7()),
         })
@@ -420,7 +449,7 @@ impl<'a> RunMcpBridge<'a> {
             .ok_or_else(|| McpError::invalid("tools/call requires a tool name"))?;
         if !self.tools.contains_key(name) {
             return Err(McpError::invalid(format!(
-                "MCP tool {name:?} is unavailable or not allowed for this Run"
+                "MCP tool {name:?} is unavailable or not allowed for this Turn"
             )));
         }
         let arguments = params
@@ -436,6 +465,7 @@ impl<'a> RunMcpBridge<'a> {
         let before = self
             .environment
             .hook(
+                &self.agent_id,
                 LifecycleHook::BeforeTool,
                 self.hook_payload(&call, Value::Null),
                 &self.cwd,
@@ -445,6 +475,7 @@ impl<'a> RunMcpBridge<'a> {
         let before = match before {
             Ok(value) => value,
             Err(error) => {
+                self.preserve_effect_uncertainty(&error);
                 self.record_hook("before_tool", false, Some(error.to_string()), Some(&call));
                 return Ok(tool_result(ToolResult::error(format!(
                     "before_tool hook failed: {error:#}"
@@ -498,17 +529,34 @@ impl<'a> RunMcpBridge<'a> {
             let progress = NoProgress;
             match self
                 .environment
-                .execute(&call, &self.cwd, &self.cancellation, &progress)
+                .execute(
+                    &self.agent_id,
+                    &call,
+                    &self.cwd,
+                    &self.cancellation,
+                    &progress,
+                )
                 .await
             {
                 Ok(result) => result,
-                Err(error) => mews_agent::ToolResult::error(error),
+                Err(error) => match effect_uncertainty(&error) {
+                    Some(uncertain) => {
+                        let reason = uncertain.reason().to_owned();
+                        *self
+                            .uncertain_effect
+                            .lock()
+                            .expect("MCP effect uncertainty poisoned") = Some(reason.clone());
+                        mews_agent::ToolResult::uncertain(reason)
+                    }
+                    None => mews_agent::ToolResult::error(error),
+                },
             }
         };
         // A failed after hook cannot undo a provider-visible extension action.
         match self
             .environment
             .hook(
+                &self.agent_id,
                 LifecycleHook::AfterTool,
                 self.hook_payload(
                     &call,
@@ -532,6 +580,7 @@ impl<'a> RunMcpBridge<'a> {
                 Err(detail) => self.record_hook("after_tool", false, Some(detail), Some(&call)),
             },
             Err(error) => {
+                self.preserve_effect_uncertainty(&error);
                 self.record_hook("after_tool", false, Some(error.to_string()), Some(&call))
             }
         }
@@ -624,13 +673,13 @@ fn tool_allowed(pattern: &str, name: &str) -> bool {
 
 /// A minimal Streamable HTTP MCP transport. It deliberately supports only
 /// request/response JSON-RPC because MEWS extension calls do not need server
-/// initiated streaming. The listener and its capability path die with a Run.
-pub struct RunMcpHttp {
+/// initiated streaming. The listener and its capability path die with a Turn.
+pub struct TurnMcpHttp {
     listener: TcpListener,
     path: String,
 }
 
-impl RunMcpHttp {
+impl TurnMcpHttp {
     pub fn url(&self) -> String {
         format!(
             "http://{}{}",
@@ -641,7 +690,7 @@ impl RunMcpHttp {
 
     pub async fn accept_and_handle(
         &self,
-        bridge: &RunMcpBridge<'_>,
+        bridge: &TurnMcpBridge<'_>,
         deadline: Instant,
     ) -> Result<()> {
         let (stream, _) = timeout_at(deadline, self.listener.accept())
@@ -675,7 +724,7 @@ async fn read_bounded_line<R: AsyncRead + Unpin>(
 async fn handle_http_connection(
     stream: TcpStream,
     expected_path: &str,
-    bridge: &RunMcpBridge<'_>,
+    bridge: &TurnMcpBridge<'_>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -803,7 +852,7 @@ async fn write_http_response<W: AsyncWrite + Unpin>(
 }
 
 fn protocol_for_http_request(
-    bridge: &RunMcpBridge<'_>,
+    bridge: &TurnMcpBridge<'_>,
     request: &Value,
     headers: &BTreeMap<String, String>,
 ) -> std::result::Result<McpProtocol, McpError> {
@@ -952,15 +1001,18 @@ fn is_native_mews_tool(name: &str) -> bool {
 }
 
 fn tool_result(result: ToolResult) -> Value {
-    let text = match &result.value {
+    let mut text = match &result.value {
         Value::String(value) => value.clone(),
         value => value.to_string(),
     };
+    if result.uncertain {
+        text = format!("Effect outcome is uncertain: {text}. {UNCERTAIN_EFFECT_INSTRUCTION}");
+    }
     json!({"content": [{"type": "text", "text": text}], "isError": result.is_error})
 }
 
 fn server_info() -> Value {
-    json!({"name": "mews-run-extensions", "version": env!("CARGO_PKG_VERSION")})
+    json!({"name": "mews-turn-extensions", "version": env!("CARGO_PKG_VERSION")})
 }
 
 struct NoProgress;
@@ -990,7 +1042,7 @@ impl McpError {
     fn unavailable() -> Self {
         Self {
             code: -32000,
-            message: "MCP capability is no longer available for this Run".into(),
+            message: "MCP capability is no longer available for this Turn".into(),
             data: None,
         }
     }
@@ -1039,18 +1091,20 @@ mod tests {
         fn tools(&self) -> Vec<ToolDefinition> {
             Vec::new()
         }
-        fn extension_tools(&self) -> Vec<ToolDefinition> {
+        fn extension_tools(&self, _: &mews_protocol::AgentId) -> Vec<ToolDefinition> {
             ["issue_lookup", "deploy_preview", "read"]
                 .into_iter()
                 .map(|name| ToolDefinition {
                     name: name.into(),
                     description: format!("{name} description"),
                     schema: json!({"type":"object"}),
+                    agent_id: None,
                 })
                 .collect()
         }
         async fn execute(
             &self,
+            _: &mews_protocol::AgentId,
             call: &ToolCall,
             _: &Path,
             _: &CancellationToken,
@@ -1059,12 +1113,16 @@ mod tests {
             if call.name == "read" {
                 bail!("native tool must not be called")
             }
+            if call.name == "deploy_preview" {
+                return Err(mews_agent::EffectUncertain::new("deployment reply was lost").into());
+            }
             tokio::time::sleep(self.delay).await;
             self.calls.lock().unwrap().push(call.clone());
             Ok(ToolResult::success(json!({"called": call.name})))
         }
         async fn hook(
             &self,
+            _: &mews_protocol::AgentId,
             _: LifecycleHook,
             _: Value,
             _: &Path,
@@ -1074,8 +1132,8 @@ mod tests {
         }
     }
 
-    fn bridge(capabilities: &Capabilities) -> RunMcpBridge<'_> {
-        RunMcpBridge::for_extensions(
+    fn bridge(capabilities: &Capabilities) -> TurnMcpBridge<'_> {
+        TurnMcpBridge::for_extensions(
             capabilities,
             Path::new("/tmp").to_owned(),
             CancellationToken::new(),
@@ -1144,7 +1202,7 @@ mod tests {
         );
         assert_eq!(
             discovered["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
-            "mews-run-extensions"
+            "mews-turn-extensions"
         );
 
         let listed = bridge
@@ -1206,7 +1264,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_transport_keeps_the_run_scoped_extension_boundary() {
+    async fn http_transport_keeps_the_turn_scoped_extension_boundary() {
         let capabilities = Capabilities {
             calls: Mutex::new(Vec::new()),
             delay: std::time::Duration::ZERO,
@@ -1326,10 +1384,11 @@ mod tests {
             fn tools(&self) -> Vec<ToolDefinition> {
                 Vec::new()
             }
-            fn extension_tools(&self) -> Vec<ToolDefinition> {
+            fn extension_tools(&self, _: &mews_protocol::AgentId) -> Vec<ToolDefinition> {
                 vec![ToolDefinition {
                     name: "lookup".into(),
                     description: "Lookup".into(),
+                    agent_id: None,
                     schema: json!({
                         "type":"object",
                         "properties":{"id":{"type":"string"}},
@@ -1340,6 +1399,7 @@ mod tests {
             }
             async fn execute(
                 &self,
+                _: &mews_protocol::AgentId,
                 _: &ToolCall,
                 _: &Path,
                 _: &CancellationToken,
@@ -1349,6 +1409,7 @@ mod tests {
             }
             async fn hook(
                 &self,
+                _: &mews_protocol::AgentId,
                 _: LifecycleHook,
                 _: Value,
                 _: &Path,
@@ -1357,7 +1418,7 @@ mod tests {
                 Ok(Value::Null)
             }
         }
-        let bridge = RunMcpBridge::for_extensions(
+        let bridge = TurnMcpBridge::for_extensions(
             &StrictCapabilities,
             PathBuf::from("/tmp"),
             CancellationToken::new(),
@@ -1376,13 +1437,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uncertain_extension_effect_is_visible_and_propagated_to_the_turn() {
+        let capabilities = Capabilities {
+            calls: Mutex::new(Vec::new()),
+            delay: std::time::Duration::ZERO,
+        };
+        let bridge = TurnMcpBridge::for_extensions(
+            &capabilities,
+            PathBuf::from("/tmp"),
+            CancellationToken::new(),
+            &["deploy_preview".into()],
+        )
+        .unwrap();
+
+        let response = bridge
+            .handle(json!({
+                "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                "params":{"name":"deploy_preview", "arguments":{}}
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(response["result"]["isError"], true);
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Do not retry automatically")
+        );
+        assert_eq!(
+            bridge.take_effect_uncertainty().as_deref(),
+            Some("deployment reply was lost")
+        );
+    }
+
+    #[tokio::test]
     async fn skill_tools_return_one_direct_mcp_content_envelope() {
         let capabilities = Capabilities {
             calls: Mutex::new(Vec::new()),
             delay: std::time::Duration::ZERO,
         };
-        let bridge = RunMcpBridge::for_extensions_and_skills(
+        let bridge = TurnMcpBridge::for_extensions_and_skills(
             &capabilities,
+            &mews_protocol::AgentId::new(),
             PathBuf::from("/tmp"),
             CancellationToken::new(),
             &[],
@@ -1413,8 +1510,9 @@ mod tests {
             calls: Mutex::new(Vec::new()),
             delay: std::time::Duration::ZERO,
         };
-        let empty = RunMcpBridge::for_extensions_and_skills(
+        let empty = TurnMcpBridge::for_extensions_and_skills(
             &capabilities,
+            &mews_protocol::AgentId::new(),
             PathBuf::from("/tmp"),
             CancellationToken::new(),
             &[],
@@ -1423,8 +1521,9 @@ mod tests {
         .unwrap();
         assert!(!empty.needs_transport());
 
-        let with_extension = RunMcpBridge::for_extensions_and_skills(
+        let with_extension = TurnMcpBridge::for_extensions_and_skills(
             &capabilities,
+            &mews_protocol::AgentId::new(),
             PathBuf::from("/tmp"),
             CancellationToken::new(),
             &["issue_lookup".into()],

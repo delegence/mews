@@ -28,12 +28,14 @@ pub fn canonical_prompt(history: Vec<ModelMessage>, soul: &str) -> String {
                     tool,
                     result,
                     is_error,
+                    uncertain,
                 } => json!({
                     "type": "tool_result",
                     "call_id": call_id,
                     "tool": tool,
                     "result": result,
                     "is_error": is_error,
+                    "uncertain": uncertain,
                 }),
                 MessageContent::ProviderState { .. } => return None,
             };

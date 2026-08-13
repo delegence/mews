@@ -3,6 +3,7 @@ mod command;
 mod defaults;
 mod harnesses;
 mod hosts;
+mod journal;
 mod providers;
 mod setup;
 
@@ -52,6 +53,7 @@ pub async fn run() -> Result<()> {
             command: RelayCommand::Serve { listen },
         } => crate::machine::runtime::serve_relay(listen).await?,
         Command::Providers { command } => providers::run(&cli.root, command).await?,
+        Command::Journal { command } => journal::run(&cli.root, command).await?,
         Command::Daemon => crate::machine::runtime::serve_machine(cli.root, true).await?,
         Command::Router => crate::machine::runtime::serve_router(cli.root).await?,
         Command::Restart => {

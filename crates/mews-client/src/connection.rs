@@ -41,7 +41,8 @@ impl LocalConnection {
 
     pub(crate) async fn request(&mut self, request: HubRequest) -> Result<HubResponse> {
         let safe = retry_safe(&request);
-        match self.request_once(&request).await {
+        let request_id = RequestId::new();
+        match self.request_once(&request_id, &request).await {
             Ok(response) => Ok(response),
             Err(first) if safe => {
                 let mut delay = 25;
@@ -49,7 +50,7 @@ impl LocalConnection {
                     match Self::connect_transport(&self.root).await {
                         Ok(transport) => {
                             self.transport = transport;
-                            match self.request_once(&request).await {
+                            match self.request_once(&request_id, &request).await {
                                 Ok(response) => return Ok(response),
                                 Err(error) if attempt == 5 => {
                                     return Err(error).with_context(|| {
@@ -78,8 +79,11 @@ impl LocalConnection {
         }
     }
 
-    async fn request_once(&mut self, request: &HubRequest) -> Result<HubResponse> {
-        let request_id = RequestId::new();
+    async fn request_once(
+        &mut self,
+        request_id: &RequestId,
+        request: &HubRequest,
+    ) -> Result<HubResponse> {
         let encoded = encode_hub_frame(&Frame::with_request_id(request, request_id.clone()))?;
         self.transport.writer.write_all(&encoded).await?;
         self.transport.writer.write_all(b"\n").await?;
@@ -99,7 +103,7 @@ impl LocalConnection {
         let frame = decode_hub_envelope(&encoded)?;
         validate_hub_version(&frame)?;
         let frame: Frame<HubResponse> = decode_hub_body(frame)?;
-        if frame.request_id != request_id {
+        if &frame.request_id != request_id {
             bail!("daemon response request ID does not match request");
         }
         match frame.body {
@@ -123,12 +127,19 @@ fn retry_safe(request: &HubRequest) -> bool {
             | HubRequest::ListAuth
             | HubRequest::ListModels
             | HubRequest::GetProviderDefaults
-            | HubRequest::GetRun { .. }
+            | HubRequest::GetTurn { .. }
             | HubRequest::PollEvents { .. }
+            | HubRequest::QueryJournalEntries { .. }
+            | HubRequest::PollJournalEntries { .. }
             | HubRequest::SubscribeSession { .. }
             | HubRequest::UnsubscribeSession { .. }
+            | HubRequest::DeleteConsumer { .. }
             | HubRequest::AcknowledgeEvents { .. }
             | HubRequest::StartTurn { .. }
+            | HubRequest::CreateAgent { .. }
+            | HubRequest::RenameAgent { .. }
+            | HubRequest::ArchiveAgent { .. }
+            | HubRequest::RemoveHost { .. }
     )
 }
 
@@ -140,6 +151,16 @@ mod tests {
     #[test]
     fn only_idempotent_requests_are_automatically_retried() {
         assert!(retry_safe(&HubRequest::Status));
+        assert!(retry_safe(&HubRequest::QueryJournalEntries {
+            query: mews_protocol::JournalQuery::default(),
+        }));
+        assert!(retry_safe(&HubRequest::PollJournalEntries {
+            query: mews_protocol::JournalQuery::default(),
+            wait_ms: 30_000,
+        }));
+        assert!(retry_safe(&HubRequest::DeleteConsumer {
+            consumer_id: mews_protocol::ConsumerId::new(),
+        }));
         assert!(retry_safe(&HubRequest::StartTurn {
             idempotency_key: "turn-1".into(),
             session_id: mews_protocol::SessionId::new(),
@@ -147,10 +168,13 @@ mod tests {
             metadata: serde_json::Value::Null,
             source: None,
         }));
-        assert!(!retry_safe(&HubRequest::CreateAgent {
+        assert!(retry_safe(&HubRequest::CreateAgent {
             slug: "coder".into(),
             harness: None,
             harness_options: Default::default(),
+        }));
+        assert!(!retry_safe(&HubRequest::CreateHostInvitation {
+            relay_url: None,
         }));
     }
 
@@ -173,13 +197,45 @@ mod tests {
 
         let mut connection = LocalConnection::connect(root.path()).await.unwrap();
         let error = connection
-            .request(HubRequest::ArchiveAgent {
-                slug: "coder".into(),
-            })
+            .request(HubRequest::CreateHostInvitation { relay_url: None })
             .await
             .unwrap_err();
         assert!(error.to_string().contains("outcome may be unknown"));
         assert!(format!("{error:#}").contains("request ID does not match"));
+    }
+
+    #[tokio::test]
+    async fn reconnect_reuses_the_original_request_id() {
+        let root = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(root.path().join("hub.sock")).unwrap();
+        let server = tokio::spawn(async move {
+            let (first, _) = listener.accept().await.unwrap();
+            let (reader, _) = first.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let first: Frame<serde_json::Value> =
+                decode_hub_envelope(lines.next_line().await.unwrap().unwrap().as_bytes()).unwrap();
+
+            let (second, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = second.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let second: Frame<serde_json::Value> =
+                decode_hub_envelope(lines.next_line().await.unwrap().unwrap().as_bytes()).unwrap();
+            let response = Frame::with_request_id(HubResponse::Ack, second.request_id.clone());
+            writer
+                .write_all(&encode_hub_frame(&response).unwrap())
+                .await
+                .unwrap();
+            writer.write_all(b"\n").await.unwrap();
+            (first.request_id, second.request_id)
+        });
+
+        let mut connection = LocalConnection::connect(root.path()).await.unwrap();
+        assert!(matches!(
+            connection.request(HubRequest::Status).await.unwrap(),
+            HubResponse::Ack
+        ));
+        let (first, second) = server.await.unwrap();
+        assert_eq!(first, second);
     }
 
     #[tokio::test]

@@ -75,7 +75,7 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
                     trusted_remote_signing_key: &state.installation_public_key,
                     local_noise: &noise,
                     expected_remote_noise_key: Some(&state.hub_noise_public_key),
-                    stream_id: &stream,
+                    subject_id: &stream,
                 },
             ),
         )
@@ -89,12 +89,12 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
     let (peer_out, peer_out_rx) = mpsc::channel(64);
     let (peer_in_tx, mut peer_in) = mpsc::channel(64);
     let bridge = tokio::spawn(run_peer_bridge(peer, peer_out_rx, peer_in_tx));
-    let registry = Arc::new(ToolRegistry::with_host_extensions(&root)?);
+    let registry = Arc::new(ToolRegistry::with_agent_extensions(&root)?);
     let harnesses = mews_host::HarnessCatalog::discover(Some(&root))?.descriptors();
     tokio::spawn({
         let registry = registry.as_ref().clone();
         let root = root.to_path_buf();
-        async move { registry.watch_host_extensions(root).await }
+        async move { registry.watch_agent_extensions(root).await }
     });
     peer_out
         .send(PeerEnvelope::ToolResponse {
@@ -180,9 +180,9 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
                     }
                     let promotes =
                         matches!(&body, mews_protocol::HubToHost::ActivateHubTransfer { .. });
-                    if matches!(&body, mews_protocol::HubToHost::RunAcp { .. }) {
+                    if matches!(&body, mews_protocol::HubToHost::ExecuteAcpTurn { .. }) {
                         let request_id = match &body {
-                            mews_protocol::HubToHost::RunAcp { request_id, .. } => {
+                            mews_protocol::HubToHost::ExecuteAcpTurn { request_id, .. } => {
                                 request_id.clone()
                             }
                             _ => unreachable!(),

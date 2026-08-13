@@ -32,41 +32,41 @@ pub enum SessionEntryPayload {
         metadata: Value,
         source: MessageSource,
     },
-    RunStarted {
-        run_id: RunId,
+    TurnStarted {
+        turn_id: TurnId,
         harness: HarnessProvenance,
     },
     /// One provider invocation. Blocks remain in provider order so replay can
     /// preserve signatures and opaque state at their exact boundaries.
     AssistantResponse {
-        run_id: RunId,
+        turn_id: TurnId,
         response: AssistantResponse,
     },
     ToolStarted {
-        run_id: RunId,
+        turn_id: TurnId,
         call: ToolCall,
     },
     ToolResult {
-        run_id: RunId,
+        turn_id: TurnId,
         result: ToolResult,
     },
     Reasoning {
-        run_id: RunId,
+        turn_id: TurnId,
         text: String,
         visibility: ReasoningVisibility,
         provenance: ReasoningProvenance,
     },
-    RunCompleted {
-        run_id: RunId,
+    TurnCompleted {
+        turn_id: TurnId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stop_reason: Option<String>,
     },
-    RunFailed {
-        run_id: RunId,
+    TurnFailed {
+        turn_id: TurnId,
         error: String,
     },
-    RunCancelled {
-        run_id: RunId,
+    TurnCancelled {
+        turn_id: TurnId,
     },
     ContextCompaction {
         summary: String,
@@ -74,7 +74,7 @@ pub enum SessionEntryPayload {
         tokens_before: u64,
     },
     HarnessObservation {
-        run_id: RunId,
+        turn_id: TurnId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         harness_session_id: Option<String>,
         kind: String,
@@ -105,6 +105,9 @@ pub struct ToolResult {
     pub tool: String,
     pub result: Value,
     pub is_error: bool,
+    /// The effect may have happened, but no definitive result was observed.
+    #[serde(default)]
+    pub uncertain: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,6 +236,7 @@ pub fn portable_history(entries: &[SessionEntry]) -> Vec<PortableHistoryItem> {
                         tool: result.tool.clone(),
                         result: result.result.clone(),
                         is_error: result.is_error,
+                        uncertain: result.uncertain,
                     },
                 });
             }
@@ -244,19 +248,19 @@ pub fn portable_history(entries: &[SessionEntry]) -> Vec<PortableHistoryItem> {
                     },
                 })
             }
-            SessionEntryPayload::RunStarted { .. }
+            SessionEntryPayload::TurnStarted { .. }
             | SessionEntryPayload::ToolStarted { .. }
             | SessionEntryPayload::Reasoning { .. }
-            | SessionEntryPayload::RunCompleted { .. }
-            | SessionEntryPayload::RunFailed { .. }
-            | SessionEntryPayload::RunCancelled { .. }
+            | SessionEntryPayload::TurnCompleted { .. }
+            | SessionEntryPayload::TurnFailed { .. }
+            | SessionEntryPayload::TurnCancelled { .. }
             | SessionEntryPayload::HarnessObservation { .. } => {}
         }
     }
     projected
 }
 
-/// A run-scoped identity assigned when MEWS accepts an ACP event. It is
+/// A Turn-scoped identity assigned when MEWS accepts an ACP event. It is
 /// deliberately independent of the event payload so repeated chunks survive.
 pub type AcpEventKey = String;
 
@@ -334,6 +338,8 @@ pub enum MessageContent {
         tool: String,
         result: Value,
         is_error: bool,
+        #[serde(default)]
+        uncertain: bool,
     },
     ProviderState {
         provider: String,
@@ -350,7 +356,7 @@ pub struct MessageSource {
     pub channel_origin: Option<ChannelOrigin>,
 }
 
-/// The standalone Channel identity and destination that originated a Run.
+/// The standalone Channel identity and destination that originated a Turn.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelOrigin {
     pub consumer_id: ConsumerId,
@@ -364,4 +370,38 @@ pub enum SourceKind {
     Channel,
     Harness,
     Host,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ToolResult;
+
+    #[test]
+    fn legacy_tool_results_default_to_definitive() {
+        let result: ToolResult = serde_json::from_value(serde_json::json!({
+            "call_id": "call-1",
+            "tool": "write",
+            "result": null,
+            "is_error": true
+        }))
+        .unwrap();
+
+        assert!(!result.uncertain);
+
+        let content: super::MessageContent = serde_json::from_value(serde_json::json!({
+            "type": "tool_result",
+            "call_id": "call-1",
+            "tool": "write",
+            "result": null,
+            "is_error": true
+        }))
+        .unwrap();
+        assert!(matches!(
+            content,
+            super::MessageContent::ToolResult {
+                uncertain: false,
+                ..
+            }
+        ));
+    }
 }

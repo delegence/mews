@@ -34,10 +34,11 @@ pub struct JoinedHostState {
 
 pub async fn accept_join(root: &Path, offer: JoinOffer) -> Result<()> {
     let mews = Mews::open_connection(root.to_path_buf())?;
+    let journal_notify = std::sync::Arc::new(tokio::sync::Notify::new());
     let local_host = std::sync::Arc::new(
         crate::host::ConnectedHost::in_process(
             mews.installation()?.hub_host_id,
-            mews_host::ToolRegistry::with_host_extensions(root)?,
+            mews_host::ToolRegistry::with_agent_extensions(root)?,
         )
         .await?,
     );
@@ -52,10 +53,11 @@ pub async fn accept_join(root: &Path, offer: JoinOffer) -> Result<()> {
             session_locks: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            run_tasks: std::sync::Arc::new(tokio::sync::Mutex::new(
+            turn_tasks: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            event_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+            event_notify: std::sync::Arc::clone(&journal_notify),
+            journal_notify,
         },
         local_host,
     )
@@ -117,7 +119,7 @@ async fn accept_join_inner(
             trusted_remote_signing_key: &joining_identity.public_key,
             local_noise: &hub_noise,
             expected_remote_noise_key: None,
-            stream_id: &stream,
+            subject_id: &stream,
         },
     )
     .await?;
@@ -126,8 +128,13 @@ async fn accept_join_inner(
     if control.moving.load(std::sync::atomic::Ordering::Acquire) {
         bail!("Hub is moving; request a new invitation after handoff");
     }
-    let mut mews = Mews::open_connection(root.to_path_buf())?;
+    let mut state = Mews::open_connection(root.to_path_buf())?;
+    let mut mews = state.commands(mews_store::CommandContext::new(
+        offer.invitation_id.to_string(),
+        mews_protocol::EventActor::system(),
+    ));
     let host = mews.enroll_host(&offer, &request)?;
+    control.journal_notify.notify_waiters();
     let relay_admission = mews.relay_admission_for_host(&host)?;
     let hub_relay_admission = RelayAdmission::create(
         &authority,
@@ -188,7 +195,7 @@ pub async fn join_host(
             trusted_remote_signing_key: &offer.installation_public_key,
             local_noise: host_noise,
             expected_remote_noise_key: Some(&offer.hub_noise_public_key),
-            stream_id: &stream,
+            subject_id: &stream,
         },
     )
     .await?;

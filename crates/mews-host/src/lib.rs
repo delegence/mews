@@ -11,7 +11,8 @@ mod rpc;
 pub mod tools;
 
 pub use connection::{
-    CancellationRegistryOwner, ConnectedHost, HostControl, HostExecutor, RemoteAcpRun, run_host_rpc,
+    CancellationRegistryOwner, ConnectedHost, HostControl, HostExecutor, RemoteAcpTurn,
+    run_host_rpc,
 };
 pub use environment::LocalEnvironment;
 pub use harnesses::{HarnessCatalog, HarnessLaunch, HarnessSetup};

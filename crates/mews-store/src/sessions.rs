@@ -1,43 +1,166 @@
 use super::*;
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum EffectOutcome {
+    Succeeded(Option<Value>),
+    Failed(String),
+    Uncertain(String),
+}
+
 impl Store {
+    pub fn schedule_effect(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        effect: mews_protocol::EffectRequest,
+    ) -> Result<mews_protocol::OperationId, StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        validate_active_turn(&transaction, session_id, turn_id)?;
+        let operation_id = schedule_effect_in(&transaction, session_id, turn_id, effect)?;
+        transaction.commit()?;
+        Ok(operation_id)
+    }
+
+    pub fn mark_effect_started(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        operation_id: &mews_protocol::OperationId,
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        validate_active_turn(&transaction, session_id, turn_id)?;
+        mark_effect_started_in(&transaction, session_id, turn_id, operation_id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn start_effect(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        effect: mews_protocol::EffectRequest,
+    ) -> Result<mews_protocol::OperationId, StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        validate_active_turn(&transaction, session_id, turn_id)?;
+        let operation_id = schedule_effect_in(&transaction, session_id, turn_id, effect)?;
+        mark_effect_started_in(&transaction, session_id, turn_id, &operation_id)?;
+        transaction.commit()?;
+        Ok(operation_id)
+    }
+
+    pub fn finish_effect(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        operation_id: &mews_protocol::OperationId,
+        outcome: EffectOutcome,
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        validate_active_turn(&transaction, session_id, turn_id)?;
+        finish_effect_in(&transaction, session_id, turn_id, operation_id, outcome)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Accepts the user's input and creates its Turn as one idempotent command.
+    /// A key reused with different content, metadata, or source is rejected.
+    pub fn replay_turn_idempotent(
+        &self,
+        session_id: &SessionId,
+        key: &str,
+        request_content: &MessageContent,
+        metadata: &Value,
+        source: &MessageSource,
+    ) -> Result<Option<(Turn, Message)>, StoreError> {
+        validate_turn_key(key)?;
+        let command_id = turn_command_id(session_id, key);
+        let Some(receipt) = self.command_receipt(&command_id)? else {
+            return Ok(None);
+        };
+        let hash = turn_request_hash(session_id, request_content, metadata, source)?;
+        if receipt.request_hash != hash {
+            return Err(StoreError::CommandConflict { command_id });
+        }
+        let (turn, message) = load_turn_result(self, session_id, &receipt.result)?;
+        Ok(Some((turn, message)))
+    }
+
+    pub fn accept_turn_idempotent(
+        &self,
+        session_id: &SessionId,
+        key: &str,
+        request_content: MessageContent,
+        resolved_content: MessageContent,
+        metadata: Value,
+        source: MessageSource,
+    ) -> Result<(Turn, Message, bool), StoreError> {
+        validate_turn_key(key)?;
+        validate_message_input(&request_content, &metadata)?;
+        validate_message_input(&resolved_content, &metadata)?;
+        validate_turn_source(&source)?;
+        // Reserve the write slot before reading state so the accepted Turn uses
+        // one authoritative Session/Agent snapshot.
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let agent_revision: u64 = transaction
+            .query_row(
+                "SELECT agents.current_revision
+                 FROM sessions JOIN agents ON agents.id = sessions.agent_id
+                 WHERE sessions.id = ?1",
+                [session_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound {
+                kind: "session",
+                id: session_id.to_string(),
+            })?;
+        let turn_id = TurnId::new();
+        let entry_id = MessageId::new();
+        let payload = mews_protocol::JournalEvent::TurnAccepted {
+            turn_id: turn_id.clone(),
+            agent_revision,
+            entry_id: entry_id.clone(),
+            content: resolved_content,
+            metadata: metadata.clone(),
+            source: source.clone(),
+        };
+        let append = crate::JournalAppend {
+            command_id: turn_command_id(session_id, key),
+            request_hash: turn_request_hash(session_id, &request_content, &metadata, &source)?,
+            result: serde_json::json!({
+                "turn_id": turn_id,
+                "entry_id": entry_id,
+            }),
+            subjects: vec![crate::JournalSubjectAppend {
+                subject_type: mews_protocol::JournalSubjectType::Session,
+                subject_id: session_id.to_string(),
+                entries: vec![crate::NewJournalEntry {
+                    id: EventId::new(),
+                    actor: mews_protocol::EventActor::from_source(&source),
+                    correlation_id: Some(key.to_owned()),
+                    payload,
+                }],
+            }],
+        };
+        let outcome = crate::events::append_journal_entries_in(
+            &transaction,
+            &append,
+            |transaction, events| apply_session_journal_entry(transaction, &events[0]),
+        )?;
+        transaction.commit()?;
+        let created = !outcome.was_replayed();
+        let (turn, message) = load_turn_result(self, session_id, &outcome.receipt().result)?;
+        Ok((turn, message, created))
+    }
+
     pub fn acp_session_binding(
         &self,
         session_id: &SessionId,
     ) -> Result<Option<AcpSessionBinding>, StoreError> {
-        self.connection
-            .query_row(
-                "SELECT host_id, harness, harness_definition_hash, acp_session_id,
-                        context_version, context_hash, context_channel, context_text, context_dispatched,
-                        created_at, replaced_at, last_replacement_reason
-                 FROM acp_session_bindings WHERE session_id = ?1",
-                [session_id.as_str()],
-                |row| {
-                    Ok(AcpSessionBinding {
-                        session_id: session_id.clone(),
-                        host_id: parse_id(row.get::<_, String>(0)?)?,
-                        harness: row.get(1)?,
-                        harness_definition_hash: row.get(2)?,
-                        acp_session_id: row.get(3)?,
-                        context_version: row.get(4)?,
-                        context_hash: row.get(5)?,
-                        context_channel: parse_json(format!("\"{}\"", row.get::<_, String>(6)?))?,
-                        context_text: row.get(7)?,
-                        context_dispatched: row.get::<_, i64>(8)? != 0,
-                        created_at: parse_time(row.get::<_, String>(9)?)?,
-                        replaced_at: row
-                            .get::<_, Option<String>>(10)?
-                            .map(parse_time)
-                            .transpose()?,
-                        last_replacement_reason: row
-                            .get::<_, Option<String>>(11)?
-                            .map(|value| parse_json(format!("\"{value}\"")))
-                            .transpose()?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(Into::into)
+        select_acp_binding(&self.connection, session_id)
     }
 
     #[allow(clippy::too_many_arguments)] // persistence boundary validates one complete binding transition
@@ -55,7 +178,7 @@ impl Store {
         context_dispatched: bool,
     ) -> Result<AcpSessionBinding, StoreError> {
         let transaction = self.connection.unchecked_transaction()?;
-        write_acp_binding(
+        let binding = decide_acp_binding(
             &transaction,
             session_id,
             host_id,
@@ -68,6 +191,16 @@ impl Store {
             channel,
             context_dispatched,
         )?;
+        let event = record_session_event(
+            &transaction,
+            session_id,
+            mews_protocol::EventActor {
+                kind: mews_protocol::EventActorKind::Harness,
+                id: Some(harness.to_owned()),
+            },
+            mews_protocol::JournalEvent::AcpBindingChanged { binding },
+        )?;
+        apply_session_journal_entry(&transaction, &event)?;
         transaction.commit()?;
         self.acp_session_binding(session_id)?
             .ok_or_else(|| StoreError::InvalidData("ACP Session binding was not persisted".into()))
@@ -86,10 +219,15 @@ impl Store {
         context_text: &str,
         channel: AcpInstructionChannel,
         context_dispatched: bool,
-        run_id: RunId,
+        turn_id: TurnId,
     ) -> Result<(), StoreError> {
         let transaction = self.connection.unchecked_transaction()?;
-        write_acp_binding(
+        let binding_key = format!("binding:{turn_id}");
+        if observation_exists(&transaction, session_id, Some(&binding_key))? {
+            transaction.commit()?;
+            return Ok(());
+        }
+        let binding = decide_acp_binding(
             &transaction,
             session_id,
             host_id,
@@ -102,21 +240,31 @@ impl Store {
             channel,
             context_dispatched,
         )?;
-        append_acp_observation_transaction(
+        let event = record_session_event(
             &transaction,
             session_id,
-            run_id.clone(),
+            mews_protocol::EventActor {
+                kind: mews_protocol::EventActorKind::Harness,
+                id: Some(harness.to_owned()),
+            },
+            mews_protocol::JournalEvent::AcpBindingChanged { binding },
+        )?;
+        apply_session_journal_entry(&transaction, &event)?;
+        record_acp_observation_transaction(
+            &transaction,
+            session_id,
+            turn_id.clone(),
             Some(acp_session_id.to_owned()),
-            Some(format!("binding:{run_id}")),
+            Some(binding_key),
             AcpObservation::BindingChanged {
                 transition: transition.clone(),
             },
         )?;
         if context_dispatched {
-            append_acp_observation_transaction(
+            record_acp_observation_transaction(
                 &transaction,
                 session_id,
-                run_id,
+                turn_id,
                 Some(acp_session_id.to_owned()),
                 Some(format!("context_dispatched:{acp_session_id}")),
                 AcpObservation::ContextDispatched {
@@ -136,50 +284,55 @@ impl Store {
     pub fn mark_acp_context_dispatched_with_observation(
         &self,
         session_id: &SessionId,
-        run_id: RunId,
+        turn_id: TurnId,
         acp_session_id: &str,
     ) -> Result<(), StoreError> {
-        let binding =
-            self.acp_session_binding(session_id)?
-                .ok_or_else(|| StoreError::NotFound {
-                    kind: "ACP Session binding",
-                    id: session_id.to_string(),
-                })?;
         let transaction = self.connection.unchecked_transaction()?;
-        let changed = transaction.execute(
-            "UPDATE acp_session_bindings SET context_dispatched = 1
-             WHERE session_id = ?1 AND acp_session_id = ?2",
-            params![session_id.as_str(), acp_session_id],
-        )?;
-        if changed != 1 {
+        let observation_key = format!("context_dispatched:{acp_session_id}");
+        if observation_exists(&transaction, session_id, Some(&observation_key))? {
+            transaction.commit()?;
+            return Ok(());
+        }
+        let binding =
+            select_acp_binding(&transaction, session_id)?.ok_or_else(|| StoreError::NotFound {
+                kind: "ACP Session binding",
+                id: session_id.to_string(),
+            })?;
+        if binding.acp_session_id != acp_session_id {
             return Err(StoreError::NotFound {
                 kind: "ACP Session binding",
                 id: session_id.to_string(),
             });
         }
-        let leaf: Option<MessageId> = transaction.query_row(
-            "SELECT leaf_entry_id FROM sessions WHERE id = ?1",
-            [session_id.as_str()],
-            |row| row.get::<_, Option<String>>(0)?.map(parse_id).transpose(),
+        let dispatched = record_session_event(
+            &transaction,
+            session_id,
+            mews_protocol::EventActor {
+                kind: mews_protocol::EventActorKind::Harness,
+                id: Some(binding.harness.clone()),
+            },
+            mews_protocol::JournalEvent::AcpContextDispatched {
+                host_id: binding.host_id.clone(),
+                harness: binding.harness.clone(),
+                context_version: binding.context_version,
+                context_hash: binding.context_hash.clone(),
+                channel: binding.context_channel,
+            },
         )?;
-        let sequence: u64 = transaction.query_row(
-            "SELECT COALESCE(MAX(sequence) + 1, 1) FROM session_entries WHERE session_id = ?1",
-            [session_id.as_str()],
-            |row| row.get(0),
-        )?;
+        apply_session_journal_entry(&transaction, &dispatched)?;
         let observation = AcpObservation::ContextDispatched {
             version: binding.context_version,
             hash: binding.context_hash,
             channel: binding.context_channel,
             text: binding.context_text,
         };
-        let payload =
-            harness_observation_payload(run_id, Some(acp_session_id.to_owned()), observation)?;
-        validate_session_item(&payload)?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO session_entries (id, session_id, sequence, parent_id, kind, contextual, observation_key, payload_json, created_at)
-             VALUES (?1, ?2, ?3, ?4, 'harness_observation', 0, ?5, ?6, ?7)",
-            params![MessageId::new().as_str(), session_id.as_str(), sequence, leaf.as_ref().map(MessageId::as_str), format!("context_dispatched:{acp_session_id}"), json(&payload)?, timestamp(Utc::now())],
+        record_acp_observation_transaction(
+            &transaction,
+            session_id,
+            turn_id,
+            Some(acp_session_id.to_owned()),
+            Some(observation_key),
+            observation,
         )?;
         transaction.commit()?;
         Ok(())
@@ -188,22 +341,21 @@ impl Store {
     pub fn session(&self, session_id: &SessionId) -> Result<Session, StoreError> {
         self.connection
             .query_row(
-                "SELECT agent_id, agent_revision, host_id, working_directory, model_override, leaf_entry_id, created_at
+                "SELECT agent_id, host_id, working_directory, model_override, leaf_entry_id, created_at
                  FROM sessions WHERE id = ?1",
                 [session_id.as_str()],
                 |row| {
                     Ok(Session {
                         id: session_id.clone(),
                         agent_id: parse_id(row.get::<_, String>(0)?)?,
-                        agent_revision: row.get(1)?,
-                        host_id: parse_id(row.get::<_, String>(2)?)?,
-                        working_directory: row.get::<_, String>(3)?.into(),
-                        model_override: row.get(4)?,
+                        host_id: parse_id(row.get::<_, String>(1)?)?,
+                        working_directory: row.get::<_, String>(2)?.into(),
+                        model_override: row.get(3)?,
                         leaf_entry_id: row
-                            .get::<_, Option<String>>(5)?
+                            .get::<_, Option<String>>(4)?
                             .map(parse_id)
                             .transpose()?,
-                        created_at: parse_time(row.get::<_, String>(6)?)?,
+                        created_at: parse_time(row.get::<_, String>(5)?)?,
                     })
                 },
             )
@@ -216,19 +368,18 @@ impl Store {
 
     pub fn sessions(&self) -> Result<Vec<Session>, StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, agent_id, agent_revision, host_id, working_directory, model_override, leaf_entry_id, created_at
+            "SELECT id, agent_id, host_id, working_directory, model_override, leaf_entry_id, created_at
              FROM sessions ORDER BY created_at DESC",
         )?;
         let rows = statement.query_map([], |row| {
             Ok(Session {
                 id: parse_id(row.get::<_, String>(0)?)?,
                 agent_id: parse_id(row.get::<_, String>(1)?)?,
-                agent_revision: row.get(2)?,
-                host_id: parse_id(row.get::<_, String>(3)?)?,
-                working_directory: row.get::<_, String>(4)?.into(),
-                model_override: row.get(5)?,
-                leaf_entry_id: row.get::<_, Option<String>>(6)?.map(parse_id).transpose()?,
-                created_at: parse_time(row.get::<_, String>(7)?)?,
+                host_id: parse_id(row.get::<_, String>(2)?)?,
+                working_directory: row.get::<_, String>(3)?.into(),
+                model_override: row.get(4)?,
+                leaf_entry_id: row.get::<_, Option<String>>(5)?.map(parse_id).transpose()?,
+                created_at: parse_time(row.get::<_, String>(6)?)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -254,40 +405,40 @@ impl Store {
             ));
         }
         let transaction = self.connection.transaction()?;
-        let revision: Option<u64> = transaction
+        let exists: Option<bool> = transaction
             .query_row(
-                "SELECT current_revision FROM agents WHERE id = ?1 AND archived = 0",
+                "SELECT 1 FROM agents WHERE id = ?1 AND archived = 0",
                 [agent_id.as_str()],
-                |row| row.get(0),
+                |_| Ok(true),
             )
             .optional()?;
-        let revision = revision.ok_or_else(|| StoreError::NotFound {
+        exists.ok_or_else(|| StoreError::NotFound {
             kind: "agent",
             id: agent_id.to_string(),
         })?;
         let session = Session {
             id: SessionId::new(),
             agent_id: agent_id.clone(),
-            agent_revision: revision,
             host_id: host_id.clone(),
             working_directory: working_directory.to_path_buf(),
             model_override: None,
             leaf_entry_id: None,
             created_at: Utc::now(),
         };
-        transaction.execute(
-            "INSERT INTO sessions
-             (id, agent_id, agent_revision, host_id, working_directory, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                session.id.as_str(),
-                session.agent_id.as_str(),
-                session.agent_revision,
-                session.host_id.as_str(),
-                session.working_directory.to_string_lossy(),
-                timestamp(session.created_at)
-            ],
+        let event = crate::events::record_journal_entry(
+            &transaction,
+            mews_protocol::JournalSubjectType::Session,
+            session.id.as_str(),
+            crate::NewJournalEntry {
+                id: EventId::new(),
+                actor: mews_protocol::EventActor::system(),
+                correlation_id: None,
+                payload: mews_protocol::JournalEvent::SessionCreated {
+                    session: session.clone(),
+                },
+            },
         )?;
+        apply_session_journal_entry(&transaction, &event)?;
         transaction.commit()?;
         Ok(session)
     }
@@ -302,16 +453,37 @@ impl Store {
                 "invalid Session model override".into(),
             ));
         }
-        let changed = self.connection.execute(
-            "UPDATE sessions SET model_override = ?2 WHERE id = ?1",
-            params![session_id.as_str(), model],
-        )?;
-        if changed != 1 {
+        if self
+            .connection
+            .query_row(
+                "SELECT 1 FROM sessions WHERE id = ?1",
+                [session_id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_none()
+        {
             return Err(StoreError::NotFound {
                 kind: "session",
                 id: session_id.to_string(),
             });
         }
+        let transaction = self.connection.unchecked_transaction()?;
+        let event = crate::events::record_journal_entry(
+            &transaction,
+            mews_protocol::JournalSubjectType::Session,
+            session_id.as_str(),
+            crate::NewJournalEntry {
+                id: EventId::new(),
+                actor: mews_protocol::EventActor::system(),
+                correlation_id: None,
+                payload: mews_protocol::JournalEvent::SessionModelChanged {
+                    model: model.map(str::to_owned),
+                },
+            },
+        )?;
+        apply_session_journal_entry(&transaction, &event)?;
+        transaction.commit()?;
         self.session(session_id)
     }
 
@@ -337,67 +509,32 @@ impl Store {
     pub fn append_assistant_response(
         &self,
         session_id: &SessionId,
-        run_id: &RunId,
+        turn_id: &TurnId,
         response: AssistantResponse,
     ) -> Result<SessionEntry, StoreError> {
-        let text = response
-            .blocks
-            .iter()
-            .filter_map(|block| match block {
-                mews_protocol::AssistantResponseBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<String>();
-        let transaction = self.connection.unchecked_transaction()?;
-        let entry = append_contextual_entry_transaction(
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        validate_active_turn(&transaction, session_id, turn_id)?;
+        let entry_id = MessageId::new();
+        let event = record_session_event(
             &transaction,
             session_id,
-            SessionEntryPayload::AssistantResponse {
-                run_id: run_id.clone(),
+            turn_actor(
+                &transaction,
+                session_id,
+                turn_id,
+                mews_protocol::EventActorKind::Harness,
+            )?,
+            mews_protocol::JournalEvent::AssistantResponseRecorded {
+                turn_id: turn_id.clone(),
+                entry_id: entry_id.clone(),
                 response,
             },
-            "assistant_response",
         )?;
-        if !text.is_empty() {
-            let event = ClientEventKind::AssistantMessage {
-                run_id: run_id.clone(),
-                message: Message {
-                    id: entry.id.clone(),
-                    session_id: session_id.clone(),
-                    sequence: entry.sequence,
-                    role: MessageRole::Assistant,
-                    content: MessageContent::Text { text },
-                    metadata: Value::Null,
-                    source: MessageSource {
-                        kind: SourceKind::Harness,
-                        id: "default".into(),
-                        channel_origin: None,
-                    },
-                    created_at: entry.created_at,
-                },
-            };
-            let event_id = EventId::new();
-            let origin = crate::events::channel_origin_json(&transaction, &event)?;
-            crate::events::validate_client_event(
-                session_id,
-                &event_id,
-                &event,
-                origin.as_deref(),
-                entry.created_at,
-            )?;
-            transaction.execute(
-                "INSERT INTO client_events (id, session_id, entry_id, kind_json, channel_origin_json, transient, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
-                params![
-                    event_id.as_str(),
-                    session_id.as_str(),
-                    entry.id.as_str(),
-                    json(&event)?,
-                    origin,
-                    timestamp(entry.created_at)
-                ],
-            )?;
-        }
+        apply_session_journal_entry(&transaction, &event)?;
+        let entry = select_session_entry(&transaction, session_id, &entry_id)?;
         transaction.commit()?;
         self.prune_client_events()?;
         Ok(entry)
@@ -406,138 +543,168 @@ impl Store {
     pub fn append_tool_result(
         &self,
         session_id: &SessionId,
-        run_id: &RunId,
+        turn_id: &TurnId,
         result: ToolResult,
     ) -> Result<SessionEntry, StoreError> {
         let transaction = self.connection.unchecked_transaction()?;
-        let entry = append_contextual_entry_transaction(
+        validate_active_turn(&transaction, session_id, turn_id)?;
+        let effect_status: Option<String> = transaction
+            .query_row(
+                "SELECT status FROM effects
+                 WHERE session_id = ?1 AND turn_id = ?2 AND call_id = ?3",
+                params![session_id.as_str(), turn_id.as_str(), result.call_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if matches!(effect_status.as_deref(), Some("scheduled" | "started")) {
+            return Err(StoreError::InvalidData(format!(
+                "tool result {} cannot be recorded before its execution completes",
+                result.call_id
+            )));
+        }
+        let entry_id = MessageId::new();
+        let event = record_session_event(
             &transaction,
             session_id,
-            SessionEntryPayload::ToolResult {
-                run_id: run_id.clone(),
+            turn_actor(
+                &transaction,
+                session_id,
+                turn_id,
+                mews_protocol::EventActorKind::Host,
+            )?,
+            mews_protocol::JournalEvent::ToolResultRecorded {
+                turn_id: turn_id.clone(),
+                entry_id: entry_id.clone(),
                 result: result.clone(),
             },
-            "tool_result",
         )?;
-        let message = Message {
-            id: entry.id.clone(),
-            session_id: session_id.clone(),
-            sequence: entry.sequence,
-            role: MessageRole::Tool,
-            content: MessageContent::ToolResult {
-                call_id: result.call_id,
-                tool: result.tool,
-                result: result.result,
-                is_error: result.is_error,
-            },
-            metadata: Value::Null,
-            source: MessageSource {
-                kind: SourceKind::Host,
-                id: "default".into(),
-                channel_origin: None,
-            },
-            created_at: entry.created_at,
-        };
-        let event = ClientEventKind::ToolCompleted {
-            run_id: run_id.clone(),
-            message,
-        };
-        transaction.execute(
-            "INSERT INTO client_events (id, session_id, entry_id, kind_json, channel_origin_json, transient, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
-            params![
-                EventId::new().as_str(),
-                session_id.as_str(),
-                entry.id.as_str(),
-                json(&event)?,
-                crate::events::channel_origin_json(&transaction, &event)?,
-                timestamp(entry.created_at)
-            ],
-        )?;
+        apply_session_journal_entry(&transaction, &event)?;
+        let entry = select_session_entry(&transaction, session_id, &entry_id)?;
         transaction.commit()?;
         Ok(entry)
     }
 
-    pub fn append_tool_started(
+    pub fn complete_tool_execution(
         &self,
         session_id: &SessionId,
-        run_id: &RunId,
-        call: ToolCall,
-    ) -> Result<SessionEntry, StoreError> {
-        let message_content = MessageContent::ToolCall {
-            call_id: call.call_id.clone(),
-            tool: call.tool.clone(),
-            arguments: call.arguments.clone(),
-            thought_signature: call.thought_signature.clone(),
-        };
+        turn_id: &TurnId,
+        result: ToolResult,
+    ) -> Result<(), StoreError> {
         let transaction = self.connection.unchecked_transaction()?;
-        let entry = append_observational_entry_transaction(
+        validate_active_turn(&transaction, session_id, turn_id)?;
+        let operation_id: mews_protocol::OperationId = transaction
+            .query_row(
+                "SELECT operation_id FROM effects
+                 WHERE session_id = ?1 AND turn_id = ?2 AND call_id = ?3
+                   AND status = 'started'",
+                params![session_id.as_str(), turn_id.as_str(), result.call_id],
+                |row| parse_id(row.get::<_, String>(0)?),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::InvalidData(format!(
+                    "started tool effect {} is missing from Turn {turn_id}",
+                    result.call_id
+                ))
+            })?;
+        let event = record_session_event(
             &transaction,
             session_id,
-            SessionEntryPayload::ToolStarted {
-                run_id: run_id.clone(),
-                call,
+            turn_actor(
+                &transaction,
+                session_id,
+                turn_id,
+                mews_protocol::EventActorKind::Host,
+            )?,
+            mews_protocol::JournalEvent::ToolExecutionCompleted {
+                operation_id,
+                turn_id: turn_id.clone(),
+                result,
             },
-            "tool_started",
-            None,
-        )?
-        .ok_or_else(|| StoreError::InvalidData("tool start was not persisted".into()))?;
-        let message = Message {
-            id: entry.id.clone(),
-            session_id: session_id.clone(),
-            sequence: entry.sequence,
-            role: MessageRole::Assistant,
-            content: message_content,
-            metadata: Value::Null,
-            source: MessageSource {
-                kind: SourceKind::Harness,
-                id: "default".into(),
-                channel_origin: None,
-            },
-            created_at: entry.created_at,
-        };
-        let event = ClientEventKind::ToolStarted {
-            run_id: run_id.clone(),
-            message,
-        };
-        transaction.execute(
-            "INSERT INTO client_events (id, session_id, entry_id, kind_json, channel_origin_json, transient, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
-            params![
-                EventId::new().as_str(),
-                session_id.as_str(),
-                entry.id.as_str(),
-                json(&event)?,
-                crate::events::channel_origin_json(&transaction, &event)?,
-                timestamp(entry.created_at)
-            ],
         )?;
+        apply_session_journal_entry(&transaction, &event)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn append_tool_requested(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        call: ToolCall,
+    ) -> Result<SessionEntry, StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        validate_active_turn(&transaction, session_id, turn_id)?;
+        let entry_id = MessageId::new();
+        let event = record_session_event(
+            &transaction,
+            session_id,
+            turn_actor(
+                &transaction,
+                session_id,
+                turn_id,
+                mews_protocol::EventActorKind::Harness,
+            )?,
+            mews_protocol::JournalEvent::ToolCallRequested {
+                turn_id: turn_id.clone(),
+                entry_id: entry_id.clone(),
+                call: call.clone(),
+            },
+        )?;
+        apply_session_journal_entry(&transaction, &event)?;
+        let entry = select_session_entry(&transaction, session_id, &entry_id)?;
         transaction.commit()?;
         Ok(entry)
+    }
+
+    pub fn start_tool_effect(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        call: ToolCall,
+    ) -> Result<mews_protocol::OperationId, StoreError> {
+        self.start_effect(
+            session_id,
+            turn_id,
+            mews_protocol::EffectRequest::ToolCall { call },
+        )
     }
 
     pub fn append_reasoning(
         &self,
         session_id: &SessionId,
-        run_id: &RunId,
+        turn_id: &TurnId,
         text: String,
         visibility: ReasoningVisibility,
         provenance: ReasoningProvenance,
         idempotency_key: Option<String>,
     ) -> Result<(), StoreError> {
         let transaction = self.connection.unchecked_transaction()?;
-        append_observational_entry_transaction(
+        validate_active_turn(&transaction, session_id, turn_id)?;
+        if observation_exists(&transaction, session_id, idempotency_key.as_deref())? {
+            transaction.commit()?;
+            return Ok(());
+        }
+        let entry_id = MessageId::new();
+        let event = record_session_event_correlated(
             &transaction,
             session_id,
-            SessionEntryPayload::Reasoning {
-                run_id: run_id.clone(),
+            turn_actor(
+                &transaction,
+                session_id,
+                turn_id,
+                mews_protocol::EventActorKind::Harness,
+            )?,
+            mews_protocol::JournalEvent::ReasoningRecorded {
+                turn_id: turn_id.clone(),
+                entry_id,
                 text,
                 visibility,
                 provenance,
             },
-            "reasoning",
-            idempotency_key.as_deref(),
+            idempotency_key,
         )?;
+        apply_session_journal_entry(&transaction, &event)?;
         transaction.commit()?;
         Ok(())
     }
@@ -545,25 +712,38 @@ impl Store {
     pub fn append_harness_observation(
         &self,
         session_id: &SessionId,
-        run_id: &RunId,
+        turn_id: &TurnId,
         harness_session_id: Option<String>,
         kind: impl Into<String>,
         data: Value,
         idempotency_key: Option<String>,
     ) -> Result<(), StoreError> {
         let transaction = self.connection.unchecked_transaction()?;
-        append_observational_entry_transaction(
+        validate_active_turn(&transaction, session_id, turn_id)?;
+        if observation_exists(&transaction, session_id, idempotency_key.as_deref())? {
+            transaction.commit()?;
+            return Ok(());
+        }
+        let entry_id = MessageId::new();
+        let event = record_session_event_correlated(
             &transaction,
             session_id,
-            SessionEntryPayload::HarnessObservation {
-                run_id: run_id.clone(),
+            turn_actor(
+                &transaction,
+                session_id,
+                turn_id,
+                mews_protocol::EventActorKind::Harness,
+            )?,
+            mews_protocol::JournalEvent::HarnessObservationRecorded {
+                turn_id: turn_id.clone(),
+                entry_id,
                 harness_session_id,
                 kind: kind.into(),
                 data,
             },
-            "harness_observation",
-            idempotency_key.as_deref(),
+            idempotency_key,
         )?;
+        apply_session_journal_entry(&transaction, &event)?;
         transaction.commit()?;
         Ok(())
     }
@@ -589,25 +769,21 @@ impl Store {
                 "compaction boundary must be in the active branch".into(),
             ));
         }
-        self.append_contextual_entry(
+        let transaction = self.connection.unchecked_transaction()?;
+        let entry_id = MessageId::new();
+        let event = record_session_event(
+            &transaction,
             session_id,
-            SessionEntryPayload::ContextCompaction {
+            mews_protocol::EventActor::system(),
+            mews_protocol::JournalEvent::ContextCompacted {
+                entry_id: entry_id.clone(),
                 summary,
                 first_kept_entry_id,
                 tokens_before,
             },
-            "context_compaction",
-        )
-    }
-
-    fn append_contextual_entry(
-        &self,
-        session_id: &SessionId,
-        payload: SessionEntryPayload,
-        kind: &str,
-    ) -> Result<SessionEntry, StoreError> {
-        let transaction = self.connection.unchecked_transaction()?;
-        let entry = append_contextual_entry_transaction(&transaction, session_id, payload, kind)?;
+        )?;
+        apply_session_journal_entry(&transaction, &event)?;
+        let entry = select_session_entry(&transaction, session_id, &entry_id)?;
         transaction.commit()?;
         Ok(entry)
     }
@@ -617,47 +793,21 @@ impl Store {
     pub fn append_acp_observation(
         &self,
         session_id: &SessionId,
-        run_id: RunId,
+        turn_id: TurnId,
         acp_session_id: Option<String>,
         event_key: Option<mews_protocol::AcpEventKey>,
         observation: AcpObservation,
     ) -> Result<(), StoreError> {
         let transaction = self.connection.unchecked_transaction()?;
-        let leaf: Option<MessageId> = transaction
-            .query_row(
-                "SELECT leaf_entry_id FROM sessions WHERE id = ?1",
-                [session_id.as_str()],
-                |row| row.get::<_, Option<String>>(0)?.map(parse_id).transpose(),
-            )
-            .optional()?
-            .ok_or_else(|| StoreError::NotFound {
-                kind: "session",
-                id: session_id.to_string(),
-            })?;
-        let sequence: u64 = transaction.query_row(
-            "SELECT COALESCE(MAX(sequence) + 1, 1) FROM session_entries WHERE session_id = ?1",
-            [session_id.as_str()],
-            |row| row.get(0),
-        )?;
-        let entry = SessionEntry {
-            id: MessageId::new(),
-            session_id: session_id.clone(),
-            sequence,
-            parent_id: leaf,
-            payload: harness_observation_payload(run_id, acp_session_id, observation)?,
-            created_at: Utc::now(),
-        };
-        validate_session_item(&entry.payload)?;
-        let inserted = transaction.execute(
-            "INSERT OR IGNORE INTO session_entries (id, session_id, sequence, parent_id, kind, contextual, observation_key, payload_json, created_at)
-             VALUES (?1, ?2, ?3, ?4, 'harness_observation', 0, ?5, ?6, ?7)",
-            params![entry.id.as_str(), entry.session_id.as_str(), entry.sequence,
-                entry.parent_id.as_ref().map(MessageId::as_str), event_key, json(&entry.payload)?, timestamp(entry.created_at)],
+        record_acp_observation_transaction(
+            &transaction,
+            session_id,
+            turn_id,
+            acp_session_id,
+            event_key,
+            observation,
         )?;
         transaction.commit()?;
-        if inserted == 0 {
-            return Ok(());
-        }
         Ok(())
     }
 
@@ -677,13 +827,7 @@ impl Store {
                 "append_message only accepts user messages; use a typed transcript append".into(),
             ));
         }
-        let metadata_bytes = serde_json::to_vec(&metadata)
-            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
-        if metadata_bytes.len() > 64 * 1024 {
-            return Err(StoreError::InvalidData(
-                "message metadata exceeds 64 KiB".into(),
-            ));
-        }
+        validate_message_input(&content, &metadata)?;
         let transaction = self.connection.unchecked_transaction()?;
         let current_leaf: Option<MessageId> = transaction
             .query_row(
@@ -702,53 +846,26 @@ impl Store {
                 current: current_leaf,
             });
         }
-        let sequence: u64 = transaction.query_row(
-            "SELECT COALESCE(MAX(sequence) + 1, 1) FROM session_entries WHERE session_id = ?1",
-            [session_id.as_str()],
-            |row| row.get(0),
-        )?;
-        let entry = SessionEntry {
-            id: MessageId::new(),
-            session_id: session_id.clone(),
-            sequence,
-            parent_id: current_leaf.clone(),
-            payload: SessionEntryPayload::UserMessage {
-                content: content.clone(),
-                metadata: metadata.clone(),
-                source: source.clone(),
+        let entry_id = MessageId::new();
+        let event = crate::events::record_journal_entry(
+            &transaction,
+            mews_protocol::JournalSubjectType::Session,
+            session_id.as_str(),
+            crate::NewJournalEntry {
+                id: EventId::new(),
+                actor: mews_protocol::EventActor::from_source(&source),
+                correlation_id: None,
+                payload: mews_protocol::JournalEvent::UserMessageAppended {
+                    entry_id: entry_id.clone(),
+                    content,
+                    metadata,
+                    source,
+                },
             },
-            created_at: Utc::now(),
-        };
-        validate_session_item(&entry.payload)?;
-        let message = message_from_entry(entry.clone())?;
-        transaction.execute(
-            "INSERT INTO session_entries
-             (id, session_id, sequence, parent_id, kind, contextual, payload_json, created_at)
-             VALUES (?1, ?2, ?3, ?4, 'user_message', 1, ?5, ?6)",
-            params![
-                entry.id.as_str(),
-                entry.session_id.as_str(),
-                entry.sequence,
-                entry.parent_id.as_ref().map(MessageId::as_str),
-                json(&entry.payload)?,
-                timestamp(entry.created_at)
-            ],
         )?;
-        let advanced = transaction.execute(
-            "UPDATE sessions SET leaf_entry_id = ?2
-             WHERE id = ?1 AND leaf_entry_id IS ?3",
-            params![
-                session_id.as_str(),
-                entry.id.as_str(),
-                current_leaf.as_ref().map(MessageId::as_str),
-            ],
-        )?;
-        if advanced != 1 {
-            return Err(StoreError::LeafConflict {
-                expected: expected_leaf.cloned(),
-                current: current_leaf,
-            });
-        }
+        apply_session_journal_entry(&transaction, &event)?;
+        let entry = select_session_entry(&transaction, session_id, &entry_id)?;
+        let message = message_from_entry(entry)?;
         transaction.commit()?;
         Ok(message)
     }
@@ -759,7 +876,10 @@ impl Store {
         expected_leaf: Option<&MessageId>,
         new_leaf: Option<&MessageId>,
     ) -> Result<Session, StoreError> {
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         let current_leaf: Option<MessageId> = transaction
             .query_row(
                 "SELECT leaf_entry_id FROM sessions WHERE id = ?1",
@@ -789,20 +909,20 @@ impl Store {
                 ));
             }
         }
-        let changed = transaction.execute(
-            "UPDATE sessions SET leaf_entry_id = ?2 WHERE id = ?1 AND leaf_entry_id IS ?3",
-            params![
-                session_id.as_str(),
-                new_leaf.map(MessageId::as_str),
-                current_leaf.as_ref().map(MessageId::as_str),
-            ],
+        let event = crate::events::record_journal_entry(
+            &transaction,
+            mews_protocol::JournalSubjectType::Session,
+            session_id.as_str(),
+            crate::NewJournalEntry {
+                id: EventId::new(),
+                actor: mews_protocol::EventActor::system(),
+                correlation_id: None,
+                payload: mews_protocol::JournalEvent::SessionLeafChanged {
+                    leaf_entry_id: new_leaf.cloned(),
+                },
+            },
         )?;
-        if changed != 1 {
-            return Err(StoreError::LeafConflict {
-                expected: expected_leaf.cloned(),
-                current: current_leaf,
-            });
-        }
+        apply_session_journal_entry(&transaction, &event)?;
         transaction.commit()?;
         self.session(session_id)
     }
@@ -948,20 +1068,1118 @@ pub(super) fn validate_session_item(payload: &SessionEntryPayload) -> Result<(),
     Ok(())
 }
 
-pub(super) fn session_entry_kind(payload: &SessionEntryPayload) -> &'static str {
-    match payload {
-        SessionEntryPayload::UserMessage { .. } => "user_message",
-        SessionEntryPayload::RunStarted { .. } => "run_started",
-        SessionEntryPayload::AssistantResponse { .. } => "assistant_response",
-        SessionEntryPayload::ToolStarted { .. } => "tool_started",
-        SessionEntryPayload::ToolResult { .. } => "tool_result",
-        SessionEntryPayload::Reasoning { .. } => "reasoning",
-        SessionEntryPayload::RunCompleted { .. } => "run_completed",
-        SessionEntryPayload::RunFailed { .. } => "run_failed",
-        SessionEntryPayload::RunCancelled { .. } => "run_cancelled",
-        SessionEntryPayload::ContextCompaction { .. } => "context_compaction",
-        SessionEntryPayload::HarnessObservation { .. } => "harness_observation",
+fn validate_message_input(content: &MessageContent, metadata: &Value) -> Result<(), StoreError> {
+    let metadata_bytes =
+        serde_json::to_vec(metadata).map_err(|error| StoreError::InvalidData(error.to_string()))?;
+    if metadata_bytes.len() > 64 * 1024 {
+        return Err(StoreError::InvalidData(
+            "message metadata exceeds 64 KiB".into(),
+        ));
     }
+    if matches!(content, MessageContent::Text { text } if text.trim().is_empty()) {
+        return Err(StoreError::InvalidData(
+            "message text cannot be empty".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_turn_key(key: &str) -> Result<(), StoreError> {
+    if key.is_empty() || key.len() > 200 {
+        return Err(StoreError::InvalidData(
+            "invalid turn idempotency key".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_turn_source(source: &MessageSource) -> Result<(), StoreError> {
+    if !matches!(source.kind, SourceKind::Client | SourceKind::Channel)
+        || source.id.is_empty()
+        || source.id.len() > 256
+    {
+        return Err(StoreError::InvalidData(
+            "turn source must be a Client or Channel with a valid ID".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn turn_command_id(session_id: &SessionId, key: &str) -> String {
+    format!("turn:{session_id}:{key}")
+}
+
+fn turn_request_hash(
+    session_id: &SessionId,
+    request_content: &MessageContent,
+    metadata: &Value,
+    source: &MessageSource,
+) -> Result<String, StoreError> {
+    crate::command_request_hash(&serde_json::json!({
+        "session_id": session_id,
+        "content": request_content,
+        "metadata": metadata,
+        "source": source,
+    }))
+}
+
+fn load_turn_result(
+    store: &Store,
+    session_id: &SessionId,
+    result: &Value,
+) -> Result<(Turn, Message), StoreError> {
+    let turn_id: TurnId = parse_id(
+        result
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| StoreError::InvalidData("turn receipt is missing Turn ID".into()))?
+            .to_owned(),
+    )?;
+    let entry_id: MessageId = parse_id(
+        result
+            .get("entry_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| StoreError::InvalidData("turn receipt is missing entry ID".into()))?
+            .to_owned(),
+    )?;
+    Ok((
+        store.turn(&turn_id)?,
+        message_from_entry(select_session_entry(
+            &store.connection,
+            session_id,
+            &entry_id,
+        )?)?,
+    ))
+}
+
+fn enum_json_string(value: &impl serde::Serialize) -> Result<String, StoreError> {
+    let value =
+        serde_json::to_string(value).map_err(|error| StoreError::InvalidData(error.to_string()))?;
+    Ok(value.trim_matches('"').to_owned())
+}
+
+fn select_acp_binding(
+    connection: &rusqlite::Connection,
+    session_id: &SessionId,
+) -> Result<Option<AcpSessionBinding>, StoreError> {
+    connection
+        .query_row(
+            "SELECT host_id, harness, harness_definition_hash, acp_session_id,
+                    context_version, context_hash, context_channel, context_text,
+                    context_dispatched, created_at, replaced_at, last_replacement_reason
+             FROM acp_session_bindings WHERE session_id = ?1",
+            [session_id.as_str()],
+            |row| {
+                Ok(AcpSessionBinding {
+                    session_id: session_id.clone(),
+                    host_id: parse_id(row.get::<_, String>(0)?)?,
+                    harness: row.get(1)?,
+                    harness_definition_hash: row.get(2)?,
+                    acp_session_id: row.get(3)?,
+                    context_version: row.get(4)?,
+                    context_hash: row.get(5)?,
+                    context_channel: parse_json(format!("\"{}\"", row.get::<_, String>(6)?))?,
+                    context_text: row.get(7)?,
+                    context_dispatched: row.get::<_, i64>(8)? != 0,
+                    created_at: parse_time(row.get::<_, String>(9)?)?,
+                    replaced_at: row
+                        .get::<_, Option<String>>(10)?
+                        .map(parse_time)
+                        .transpose()?,
+                    last_replacement_reason: row
+                        .get::<_, Option<String>>(11)?
+                        .map(|value| parse_json(format!("\"{value}\"")))
+                        .transpose()?,
+                })
+            },
+        )
+        .optional()
+        .map_err(StoreError::from)
+}
+
+fn select_session_entry(
+    connection: &rusqlite::Connection,
+    session_id: &SessionId,
+    entry_id: &MessageId,
+) -> Result<SessionEntry, StoreError> {
+    connection
+        .query_row(
+            "SELECT sequence, parent_id, payload_json, created_at
+             FROM session_entries WHERE session_id = ?1 AND id = ?2",
+            params![session_id.as_str(), entry_id.as_str()],
+            |row| {
+                Ok(SessionEntry {
+                    id: entry_id.clone(),
+                    session_id: session_id.clone(),
+                    sequence: row.get(0)?,
+                    parent_id: row.get::<_, Option<String>>(1)?.map(parse_id).transpose()?,
+                    payload: parse_json(row.get(2)?)?,
+                    created_at: parse_time(row.get(3)?)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::NotFound {
+            kind: "Session entry",
+            id: entry_id.to_string(),
+        })
+}
+
+pub(crate) fn apply_session_journal_entry(
+    transaction: &rusqlite::Transaction<'_>,
+    event: &mews_protocol::JournalEntry,
+) -> Result<(), StoreError> {
+    let session_id = crate::events::journal_session_id(event)?;
+    match &event.payload {
+        mews_protocol::JournalEvent::SessionCreated { session } => {
+            transaction.execute(
+                "INSERT INTO sessions
+                 (id, agent_id, host_id, working_directory, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    session.id.as_str(),
+                    session.agent_id.as_str(),
+                    session.host_id.as_str(),
+                    session.working_directory.to_string_lossy(),
+                    timestamp(session.created_at)
+                ],
+            )?;
+        }
+        mews_protocol::JournalEvent::SessionModelChanged { model } => {
+            let changed = transaction.execute(
+                "UPDATE sessions SET model_override = ?2 WHERE id = ?1",
+                params![session_id.as_str(), model],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::NotFound {
+                    kind: "session",
+                    id: session_id.to_string(),
+                });
+            }
+        }
+        mews_protocol::JournalEvent::UserMessageAppended {
+            entry_id,
+            content,
+            metadata,
+            source,
+        } => {
+            append_session_entry(
+                transaction,
+                event,
+                entry_id,
+                SessionEntryPayload::UserMessage {
+                    content: content.clone(),
+                    metadata: metadata.clone(),
+                    source: source.clone(),
+                },
+                "user_message",
+                true,
+            )?;
+        }
+        mews_protocol::JournalEvent::SessionLeafChanged { leaf_entry_id } => {
+            let changed = transaction.execute(
+                "UPDATE sessions SET leaf_entry_id = ?2 WHERE id = ?1",
+                params![
+                    session_id.as_str(),
+                    leaf_entry_id.as_ref().map(MessageId::as_str)
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::NotFound {
+                    kind: "session",
+                    id: session_id.to_string(),
+                });
+            }
+        }
+        mews_protocol::JournalEvent::TurnAccepted {
+            turn_id,
+            agent_revision,
+            entry_id,
+            content,
+            metadata,
+            source,
+        } => {
+            if let Some(active_turn) = transaction
+                .query_row(
+                    "SELECT id FROM turns WHERE session_id = ?1 AND completed_at IS NULL",
+                    [session_id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                return Err(StoreError::ActiveTurnConflict {
+                    session_id: session_id.to_string(),
+                    turn_id: active_turn,
+                });
+            }
+            let parent_id = current_session_leaf(transaction, &session_id)?;
+            let sequence: u64 = transaction.query_row(
+                "SELECT COALESCE(MAX(sequence) + 1, 1) FROM session_entries WHERE session_id = ?1",
+                [session_id.as_str()],
+                |row| row.get(0),
+            )?;
+            let payload = SessionEntryPayload::UserMessage {
+                content: content.clone(),
+                metadata: metadata.clone(),
+                source: source.clone(),
+            };
+            validate_session_item(&payload)?;
+            transaction.execute(
+                "INSERT INTO session_entries
+                 (id, session_id, sequence, parent_id, kind, contextual, payload_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 'user_message', 1, ?5, ?6)",
+                params![
+                    entry_id.as_str(),
+                    session_id.as_str(),
+                    sequence,
+                    parent_id.as_ref().map(MessageId::as_str),
+                    json(&payload)?,
+                    timestamp(event.recorded_at)
+                ],
+            )?;
+            transaction.execute(
+                "UPDATE sessions SET leaf_entry_id = ?2 WHERE id = ?1",
+                params![session_id.as_str(), entry_id.as_str()],
+            )?;
+            let revision_exists: bool = transaction.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sessions
+                     JOIN agent_revisions ON agent_revisions.agent_id = sessions.agent_id
+                     WHERE sessions.id = ?1 AND agent_revisions.revision = ?2
+                 )",
+                params![session_id.as_str(), agent_revision],
+                |row| row.get(0),
+            )?;
+            if !revision_exists {
+                return Err(StoreError::InvalidData(
+                    "Turn Agent revision does not belong to its Session Agent".into(),
+                ));
+            }
+            transaction.execute(
+                "INSERT INTO turns
+                 (id, session_id, agent_revision, idempotency_key, channel_origin_json, status_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    turn_id.as_str(),
+                    session_id.as_str(),
+                    agent_revision,
+                    event.correlation_id,
+                    source.channel_origin.as_ref().map(json).transpose()?,
+                    json(&TurnStatus::Running)?,
+                    timestamp(event.recorded_at)
+                ],
+            )?;
+        }
+        mews_protocol::JournalEvent::TurnStarted { turn_id, harness } => {
+            validate_active_turn(transaction, &session_id, turn_id)?;
+            transaction.execute(
+                "UPDATE turns SET harness = ?2, harness_definition_hash = ?3,
+                 harness_version = ?4 WHERE id = ?1",
+                params![
+                    turn_id.as_str(),
+                    harness.name,
+                    harness.definition_hash,
+                    harness.version
+                ],
+            )?;
+            let entry_id = message_id_for_event(&event.id)?;
+            append_session_entry(
+                transaction,
+                event,
+                &entry_id,
+                SessionEntryPayload::TurnStarted {
+                    turn_id: turn_id.clone(),
+                    harness: harness.clone(),
+                },
+                "turn_started",
+                false,
+            )?;
+            crate::delivery::append_durable_client_event(
+                transaction,
+                event,
+                Some(&entry_id),
+                &ClientEventKind::TurnStarted {
+                    turn_id: turn_id.clone(),
+                },
+            )?;
+        }
+        mews_protocol::JournalEvent::AssistantResponseRecorded {
+            turn_id,
+            entry_id,
+            response,
+        } => {
+            let entry = append_session_entry(
+                transaction,
+                event,
+                entry_id,
+                SessionEntryPayload::AssistantResponse {
+                    turn_id: turn_id.clone(),
+                    response: response.clone(),
+                },
+                "assistant_response",
+                true,
+            )?;
+            let text = response
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    mews_protocol::AssistantResponseBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            if !text.is_empty() {
+                crate::delivery::append_durable_client_event(
+                    transaction,
+                    event,
+                    Some(entry_id),
+                    &ClientEventKind::AssistantMessage {
+                        turn_id: turn_id.clone(),
+                        message: Message {
+                            id: entry.id,
+                            session_id: session_id.clone(),
+                            sequence: entry.sequence,
+                            role: MessageRole::Assistant,
+                            content: MessageContent::Text { text },
+                            metadata: Value::Null,
+                            source: message_source_for_event(event),
+                            created_at: entry.created_at,
+                        },
+                    },
+                )?;
+            }
+        }
+        mews_protocol::JournalEvent::ToolCallRequested {
+            turn_id,
+            entry_id,
+            call,
+        } => {
+            let entry = append_session_entry(
+                transaction,
+                event,
+                entry_id,
+                SessionEntryPayload::ToolStarted {
+                    turn_id: turn_id.clone(),
+                    call: call.clone(),
+                },
+                "tool_started",
+                false,
+            )?;
+            crate::delivery::append_durable_client_event(
+                transaction,
+                event,
+                Some(entry_id),
+                &ClientEventKind::ToolStarted {
+                    turn_id: turn_id.clone(),
+                    message: Message {
+                        id: entry.id,
+                        session_id: session_id.clone(),
+                        sequence: entry.sequence,
+                        role: MessageRole::Assistant,
+                        content: MessageContent::ToolCall {
+                            call_id: call.call_id.clone(),
+                            tool: call.tool.clone(),
+                            arguments: call.arguments.clone(),
+                            thought_signature: call.thought_signature.clone(),
+                        },
+                        metadata: Value::Null,
+                        source: message_source_for_event(event),
+                        created_at: entry.created_at,
+                    },
+                },
+            )?;
+        }
+        mews_protocol::JournalEvent::ToolResultRecorded {
+            turn_id,
+            entry_id,
+            result,
+        } => {
+            let entry = append_session_entry(
+                transaction,
+                event,
+                entry_id,
+                SessionEntryPayload::ToolResult {
+                    turn_id: turn_id.clone(),
+                    result: result.clone(),
+                },
+                "tool_result",
+                true,
+            )?;
+            crate::delivery::append_durable_client_event(
+                transaction,
+                event,
+                Some(entry_id),
+                &ClientEventKind::ToolCompleted {
+                    turn_id: turn_id.clone(),
+                    message: Message {
+                        id: entry.id,
+                        session_id: session_id.clone(),
+                        sequence: entry.sequence,
+                        role: MessageRole::Tool,
+                        content: MessageContent::ToolResult {
+                            call_id: result.call_id.clone(),
+                            tool: result.tool.clone(),
+                            result: result.result.clone(),
+                            is_error: result.is_error,
+                            uncertain: result.uncertain,
+                        },
+                        metadata: Value::Null,
+                        source: message_source_for_event(event),
+                        created_at: entry.created_at,
+                    },
+                },
+            )?;
+        }
+        mews_protocol::JournalEvent::ToolExecutionCompleted {
+            operation_id,
+            turn_id,
+            result,
+        } => {
+            let status = if result.uncertain {
+                "uncertain"
+            } else if result.is_error {
+                "failed"
+            } else {
+                "succeeded"
+            };
+            set_effect_terminal(
+                transaction,
+                event,
+                operation_id,
+                turn_id,
+                status,
+                Some(result),
+            )?;
+        }
+        mews_protocol::JournalEvent::ReasoningRecorded {
+            turn_id,
+            entry_id,
+            text,
+            visibility,
+            provenance,
+        } => {
+            append_session_entry(
+                transaction,
+                event,
+                entry_id,
+                SessionEntryPayload::Reasoning {
+                    turn_id: turn_id.clone(),
+                    text: text.clone(),
+                    visibility: *visibility,
+                    provenance: provenance.clone(),
+                },
+                "reasoning",
+                false,
+            )?;
+        }
+        mews_protocol::JournalEvent::HarnessObservationRecorded {
+            turn_id,
+            entry_id,
+            harness_session_id,
+            kind,
+            data,
+        } => {
+            append_session_entry(
+                transaction,
+                event,
+                entry_id,
+                SessionEntryPayload::HarnessObservation {
+                    turn_id: turn_id.clone(),
+                    harness_session_id: harness_session_id.clone(),
+                    kind: kind.clone(),
+                    data: data.clone(),
+                },
+                "harness_observation",
+                false,
+            )?;
+        }
+        mews_protocol::JournalEvent::ContextCompacted {
+            entry_id,
+            summary,
+            first_kept_entry_id,
+            tokens_before,
+        } => {
+            append_session_entry(
+                transaction,
+                event,
+                entry_id,
+                SessionEntryPayload::ContextCompaction {
+                    summary: summary.clone(),
+                    first_kept_entry_id: first_kept_entry_id.clone(),
+                    tokens_before: *tokens_before,
+                },
+                "context_compaction",
+                true,
+            )?;
+        }
+        mews_protocol::JournalEvent::EffectScheduled {
+            operation_id,
+            turn_id,
+            effect,
+        } => {
+            let (call_id, tool) = match effect {
+                mews_protocol::EffectRequest::ToolCall { call } => {
+                    (Some(call.call_id.as_str()), Some(call.tool.as_str()))
+                }
+                _ => (None, None),
+            };
+            transaction.execute(
+                "INSERT INTO effects
+                 (operation_id, session_id, turn_id, call_id, tool, request_json,
+                  status, scheduled_journal_entry_id, scheduled_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'scheduled', ?7, ?8)",
+                params![
+                    operation_id.as_str(),
+                    session_id.as_str(),
+                    turn_id.as_str(),
+                    call_id,
+                    tool,
+                    json(effect)?,
+                    event.id.as_str(),
+                    timestamp(event.recorded_at)
+                ],
+            )?;
+        }
+        mews_protocol::JournalEvent::EffectStarted { operation_id, .. } => {
+            let changed = transaction.execute(
+                "UPDATE effects SET status = 'started', started_at = ?2
+                 WHERE operation_id = ?1 AND status = 'scheduled'",
+                params![operation_id.as_str(), timestamp(event.recorded_at)],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::InvalidData(format!(
+                    "effect {operation_id} was not scheduled before it started"
+                )));
+            }
+        }
+        mews_protocol::JournalEvent::EffectSucceeded {
+            operation_id,
+            turn_id,
+            ..
+        } => {
+            set_effect_terminal(transaction, event, operation_id, turn_id, "succeeded", None)?;
+        }
+        mews_protocol::JournalEvent::EffectFailed {
+            operation_id,
+            turn_id,
+            ..
+        } => {
+            set_effect_terminal(transaction, event, operation_id, turn_id, "failed", None)?;
+        }
+        mews_protocol::JournalEvent::EffectUncertain {
+            operation_id,
+            turn_id,
+            ..
+        } => {
+            set_effect_terminal(transaction, event, operation_id, turn_id, "uncertain", None)?;
+        }
+        mews_protocol::JournalEvent::AcpBindingChanged { binding } => {
+            transaction.execute(
+                "INSERT INTO acp_session_bindings
+                 (session_id, host_id, harness, harness_definition_hash, acp_session_id,
+                  context_version, context_hash, context_channel, context_text,
+                  context_dispatched, created_at, replaced_at, last_replacement_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                    host_id=excluded.host_id, harness=excluded.harness,
+                    harness_definition_hash=excluded.harness_definition_hash,
+                    acp_session_id=excluded.acp_session_id,
+                    context_version=excluded.context_version, context_hash=excluded.context_hash,
+                    context_channel=excluded.context_channel, context_text=excluded.context_text,
+                    context_dispatched=excluded.context_dispatched,
+                    replaced_at=excluded.replaced_at,
+                    last_replacement_reason=excluded.last_replacement_reason",
+                params![
+                    binding.session_id.as_str(),
+                    binding.host_id.as_str(),
+                    binding.harness,
+                    binding.harness_definition_hash,
+                    binding.acp_session_id,
+                    binding.context_version,
+                    binding.context_hash,
+                    enum_json_string(&binding.context_channel)?,
+                    binding.context_text,
+                    binding.context_dispatched,
+                    timestamp(binding.created_at),
+                    binding.replaced_at.map(timestamp),
+                    binding
+                        .last_replacement_reason
+                        .as_ref()
+                        .map(enum_json_string)
+                        .transpose()?
+                ],
+            )?;
+        }
+        mews_protocol::JournalEvent::AcpContextDispatched {
+            host_id,
+            harness,
+            context_version,
+            context_hash,
+            channel,
+        } => {
+            let changed = transaction.execute(
+                "UPDATE acp_session_bindings SET context_dispatched = 1
+                 WHERE session_id = ?1 AND host_id = ?2 AND harness = ?3
+                   AND context_version = ?4 AND context_hash = ?5 AND context_channel = ?6",
+                params![
+                    session_id.as_str(),
+                    host_id.as_str(),
+                    harness,
+                    context_version,
+                    context_hash,
+                    enum_json_string(channel)?
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::InvalidData(
+                    "ACP context dispatch does not match its binding".into(),
+                ));
+            }
+        }
+        mews_protocol::JournalEvent::TurnCompleted {
+            turn_id,
+            stop_reason,
+        } => project_turn_terminal(
+            transaction,
+            event,
+            turn_id,
+            TurnStatus::Completed,
+            None,
+            SessionEntryPayload::TurnCompleted {
+                turn_id: turn_id.clone(),
+                stop_reason: stop_reason.clone(),
+            },
+            ClientEventKind::TurnCompleted {
+                turn_id: turn_id.clone(),
+            },
+        )?,
+        mews_protocol::JournalEvent::TurnFailed { turn_id, error } => project_turn_terminal(
+            transaction,
+            event,
+            turn_id,
+            TurnStatus::Failed,
+            Some(error),
+            SessionEntryPayload::TurnFailed {
+                turn_id: turn_id.clone(),
+                error: error.clone(),
+            },
+            ClientEventKind::TurnFailed {
+                turn_id: turn_id.clone(),
+                error: error.clone(),
+            },
+        )?,
+        mews_protocol::JournalEvent::TurnCancelled { turn_id } => project_turn_terminal(
+            transaction,
+            event,
+            turn_id,
+            TurnStatus::Cancelled,
+            None,
+            SessionEntryPayload::TurnCancelled {
+                turn_id: turn_id.clone(),
+            },
+            ClientEventKind::TurnCancelled {
+                turn_id: turn_id.clone(),
+            },
+        )?,
+        mews_protocol::JournalEvent::TurnInterrupted { turn_id, reason } => project_turn_terminal(
+            transaction,
+            event,
+            turn_id,
+            TurnStatus::Failed,
+            Some(reason),
+            SessionEntryPayload::TurnFailed {
+                turn_id: turn_id.clone(),
+                error: reason.clone(),
+            },
+            ClientEventKind::TurnFailed {
+                turn_id: turn_id.clone(),
+                error: reason.clone(),
+            },
+        )?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn message_id_for_event(event_id: &EventId) -> Result<MessageId, StoreError> {
+    let uuid = event_id
+        .as_str()
+        .strip_prefix("evt_")
+        .ok_or_else(|| StoreError::InvalidData("invalid event ID".into()))?;
+    Ok(parse_id(format!("msg_{uuid}"))?)
+}
+
+fn message_source_for_event(event: &mews_protocol::JournalEntry) -> MessageSource {
+    let kind = match event.actor.kind {
+        mews_protocol::EventActorKind::Client => SourceKind::Client,
+        mews_protocol::EventActorKind::Channel => SourceKind::Channel,
+        mews_protocol::EventActorKind::Harness => SourceKind::Harness,
+        mews_protocol::EventActorKind::Host | mews_protocol::EventActorKind::System => {
+            SourceKind::Host
+        }
+    };
+    MessageSource {
+        kind,
+        id: event.actor.id.clone().unwrap_or_else(|| "system".into()),
+        channel_origin: None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_turn_terminal(
+    transaction: &rusqlite::Transaction<'_>,
+    event: &mews_protocol::JournalEntry,
+    turn_id: &TurnId,
+    status: TurnStatus,
+    error: Option<&String>,
+    payload: SessionEntryPayload,
+    client_kind: ClientEventKind,
+) -> Result<(), StoreError> {
+    let changed = transaction.execute(
+        "UPDATE turns SET status_json = ?2, error = ?3, completed_at = ?4
+         WHERE id = ?1 AND completed_at IS NULL",
+        params![
+            turn_id.as_str(),
+            json(&status)?,
+            error,
+            timestamp(event.recorded_at)
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::InvalidData(format!(
+            "Turn {turn_id} is missing or already terminal"
+        )));
+    }
+    let entry_id = message_id_for_event(&event.id)?;
+    append_session_entry(
+        transaction,
+        event,
+        &entry_id,
+        payload,
+        match status {
+            TurnStatus::Completed => "turn_completed",
+            TurnStatus::Failed => "turn_failed",
+            TurnStatus::Cancelled => "turn_cancelled",
+            TurnStatus::Running => unreachable!(),
+        },
+        false,
+    )?;
+    crate::delivery::append_durable_client_event(transaction, event, Some(&entry_id), &client_kind)
+}
+
+fn set_effect_terminal(
+    transaction: &rusqlite::Transaction<'_>,
+    event: &mews_protocol::JournalEntry,
+    operation_id: &mews_protocol::OperationId,
+    turn_id: &TurnId,
+    status: &str,
+    raw_result: Option<&ToolResult>,
+) -> Result<(), StoreError> {
+    let session_id = crate::events::journal_session_id(event)?;
+    let changed = transaction.execute(
+        "UPDATE effects
+         SET status = ?4, terminal_journal_entry_id = ?5, completed_at = ?6,
+             raw_result_json = ?7
+         WHERE operation_id = ?1 AND session_id = ?2 AND turn_id = ?3
+           AND status IN ('scheduled', 'started')",
+        params![
+            operation_id.as_str(),
+            session_id.as_str(),
+            turn_id.as_str(),
+            status,
+            event.id.as_str(),
+            timestamp(event.recorded_at),
+            raw_result.map(json).transpose()?
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::InvalidData(format!(
+            "effect {operation_id} is missing or already terminal"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_active_turn(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &SessionId,
+    turn_id: &TurnId,
+) -> Result<(), StoreError> {
+    let active: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM turns
+             WHERE id = ?1 AND session_id = ?2 AND completed_at IS NULL
+         )",
+        params![turn_id.as_str(), session_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if !active {
+        return Err(StoreError::InvalidData(format!(
+            "Turn {turn_id} is not active in Session {session_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn turn_actor(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &SessionId,
+    turn_id: &TurnId,
+    kind: mews_protocol::EventActorKind,
+) -> Result<mews_protocol::EventActor, StoreError> {
+    let id = match kind {
+        mews_protocol::EventActorKind::Host => transaction.query_row(
+            "SELECT host_id FROM sessions WHERE id = ?1",
+            [session_id.as_str()],
+            |row| row.get(0),
+        )?,
+        mews_protocol::EventActorKind::Harness => transaction
+            .query_row(
+                "SELECT harness FROM turns WHERE id = ?1 AND session_id = ?2",
+                params![turn_id.as_str(), session_id.as_str()],
+                |row| row.get::<_, Option<String>>(0),
+            )?
+            .unwrap_or_else(|| "mews".into()),
+        _ => return Err(StoreError::InvalidData("invalid Turn actor kind".into())),
+    };
+    Ok(mews_protocol::EventActor { kind, id: Some(id) })
+}
+
+fn observation_exists(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &SessionId,
+    key: Option<&str>,
+) -> Result<bool, StoreError> {
+    let Some(key) = key else {
+        return Ok(false);
+    };
+    transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM session_entries
+                 WHERE session_id = ?1 AND observation_key = ?2
+             )",
+            params![session_id.as_str(), key],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::from)
+}
+
+pub(crate) fn record_session_event(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &SessionId,
+    actor: mews_protocol::EventActor,
+    payload: mews_protocol::JournalEvent,
+) -> Result<mews_protocol::JournalEntry, StoreError> {
+    record_session_event_correlated(transaction, session_id, actor, payload, None)
+}
+
+fn record_session_event_correlated(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &SessionId,
+    actor: mews_protocol::EventActor,
+    payload: mews_protocol::JournalEvent,
+    correlation_id: Option<String>,
+) -> Result<mews_protocol::JournalEntry, StoreError> {
+    crate::events::record_journal_entry(
+        transaction,
+        mews_protocol::JournalSubjectType::Session,
+        session_id.as_str(),
+        crate::NewJournalEntry {
+            id: EventId::new(),
+            actor,
+            correlation_id,
+            payload,
+        },
+    )
+}
+
+fn schedule_effect_in(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &SessionId,
+    turn_id: &TurnId,
+    effect: mews_protocol::EffectRequest,
+) -> Result<mews_protocol::OperationId, StoreError> {
+    let operation_id = mews_protocol::OperationId::new();
+    let actor = turn_actor(
+        transaction,
+        session_id,
+        turn_id,
+        mews_protocol::EventActorKind::Harness,
+    )?;
+    let scheduled = record_session_event(
+        transaction,
+        session_id,
+        actor.clone(),
+        mews_protocol::JournalEvent::EffectScheduled {
+            operation_id: operation_id.clone(),
+            turn_id: turn_id.clone(),
+            effect,
+        },
+    )?;
+    apply_session_journal_entry(transaction, &scheduled)?;
+    Ok(operation_id)
+}
+
+fn mark_effect_started_in(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &SessionId,
+    turn_id: &TurnId,
+    operation_id: &mews_protocol::OperationId,
+) -> Result<(), StoreError> {
+    let owned: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM effects
+             WHERE operation_id = ?1 AND session_id = ?2 AND turn_id = ?3
+               AND status = 'scheduled'
+         )",
+        params![operation_id.as_str(), session_id.as_str(), turn_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if !owned {
+        return Err(StoreError::InvalidData(format!(
+            "scheduled effect {operation_id} does not belong to active Turn {turn_id} in Session {session_id}"
+        )));
+    }
+    let actor = turn_actor(
+        transaction,
+        session_id,
+        turn_id,
+        mews_protocol::EventActorKind::Harness,
+    )?;
+    let started = record_session_event(
+        transaction,
+        session_id,
+        actor,
+        mews_protocol::JournalEvent::EffectStarted {
+            operation_id: operation_id.clone(),
+            turn_id: turn_id.clone(),
+        },
+    )?;
+    apply_session_journal_entry(transaction, &started)?;
+    Ok(())
+}
+
+fn finish_effect_in(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &SessionId,
+    turn_id: &TurnId,
+    operation_id: &mews_protocol::OperationId,
+    outcome: EffectOutcome,
+) -> Result<(), StoreError> {
+    let owned: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM effects
+             WHERE operation_id = ?1 AND session_id = ?2 AND turn_id = ?3
+               AND status = 'started'
+         )",
+        params![operation_id.as_str(), session_id.as_str(), turn_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if !owned {
+        return Err(StoreError::InvalidData(format!(
+            "started effect {operation_id} does not belong to active Turn {turn_id} in Session {session_id}"
+        )));
+    }
+    let payload = match outcome {
+        EffectOutcome::Succeeded(result) => mews_protocol::JournalEvent::EffectSucceeded {
+            operation_id: operation_id.clone(),
+            turn_id: turn_id.clone(),
+            result,
+        },
+        EffectOutcome::Failed(error) => mews_protocol::JournalEvent::EffectFailed {
+            operation_id: operation_id.clone(),
+            turn_id: turn_id.clone(),
+            error,
+        },
+        EffectOutcome::Uncertain(reason) => mews_protocol::JournalEvent::EffectUncertain {
+            operation_id: operation_id.clone(),
+            turn_id: turn_id.clone(),
+            reason,
+        },
+    };
+    let terminal = record_session_event(
+        transaction,
+        session_id,
+        turn_actor(
+            transaction,
+            session_id,
+            turn_id,
+            mews_protocol::EventActorKind::Host,
+        )?,
+        payload,
+    )?;
+    apply_session_journal_entry(transaction, &terminal)?;
+    Ok(())
+}
+
+fn append_session_entry(
+    transaction: &rusqlite::Transaction<'_>,
+    event: &mews_protocol::JournalEntry,
+    entry_id: &MessageId,
+    payload: SessionEntryPayload,
+    kind: &str,
+    contextual: bool,
+) -> Result<SessionEntry, StoreError> {
+    let session_id = crate::events::journal_session_id(event)?;
+    validate_session_item(&payload)?;
+    let parent_id = current_session_leaf(transaction, &session_id)?;
+    let sequence: u64 = transaction.query_row(
+        "SELECT COALESCE(MAX(sequence) + 1, 1) FROM session_entries WHERE session_id = ?1",
+        [session_id.as_str()],
+        |row| row.get(0),
+    )?;
+    // ACP item keys deduplicate observations. General correlation metadata is
+    // provenance and must not impose entry uniqueness for the whole Turn.
+    let observation_key = matches!(
+        payload,
+        SessionEntryPayload::Reasoning { .. } | SessionEntryPayload::HarnessObservation { .. }
+    )
+    .then_some(event.correlation_id.as_deref())
+    .flatten();
+    transaction.execute(
+        "INSERT INTO session_entries
+         (id, session_id, sequence, parent_id, kind, contextual, observation_key,
+          payload_json, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            entry_id.as_str(),
+            session_id.as_str(),
+            sequence,
+            parent_id.as_ref().map(MessageId::as_str),
+            kind,
+            contextual,
+            observation_key,
+            json(&payload)?,
+            timestamp(event.recorded_at)
+        ],
+    )?;
+    if contextual {
+        transaction.execute(
+            "UPDATE sessions SET leaf_entry_id = ?2 WHERE id = ?1",
+            params![session_id.as_str(), entry_id.as_str()],
+        )?;
+    }
+    Ok(SessionEntry {
+        id: entry_id.clone(),
+        session_id: session_id.clone(),
+        sequence,
+        parent_id,
+        payload,
+        created_at: event.recorded_at,
+    })
+}
+
+fn current_session_leaf(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &SessionId,
+) -> Result<Option<MessageId>, StoreError> {
+    transaction
+        .query_row(
+            "SELECT leaf_entry_id FROM sessions WHERE id = ?1",
+            [session_id.as_str()],
+            |row| row.get::<_, Option<String>>(0)?.map(parse_id).transpose(),
+        )
+        .map_err(StoreError::from)
 }
 
 fn message_from_entry(entry: SessionEntry) -> Result<Message, StoreError> {
@@ -998,6 +2216,7 @@ fn message_from_entry(entry: SessionEntry) -> Result<Message, StoreError> {
                 tool: result.tool,
                 result: result.result,
                 is_error: result.is_error,
+                uncertain: result.uncertain,
             },
             Value::Null,
             MessageSource {
@@ -1078,93 +2297,8 @@ fn apply_latest_compaction(entries: Vec<SessionEntry>) -> Vec<SessionEntry> {
     active
 }
 
-fn append_contextual_entry_transaction(
-    transaction: &rusqlite::Transaction<'_>,
-    session_id: &SessionId,
-    payload: SessionEntryPayload,
-    kind: &str,
-) -> Result<SessionEntry, StoreError> {
-    validate_session_item(&payload)?;
-    let leaf: Option<MessageId> = transaction
-        .query_row(
-            "SELECT leaf_entry_id FROM sessions WHERE id=?1",
-            [session_id.as_str()],
-            |row| row.get::<_, Option<String>>(0)?.map(parse_id).transpose(),
-        )
-        .optional()?
-        .ok_or_else(|| StoreError::NotFound {
-            kind: "session",
-            id: session_id.to_string(),
-        })?;
-    let sequence = transaction.query_row(
-        "SELECT COALESCE(MAX(sequence) + 1, 1) FROM session_entries WHERE session_id=?1",
-        [session_id.as_str()],
-        |row| row.get(0),
-    )?;
-    let entry = SessionEntry {
-        id: MessageId::new(),
-        session_id: session_id.clone(),
-        sequence,
-        parent_id: leaf.clone(),
-        payload,
-        created_at: Utc::now(),
-    };
-    transaction.execute(
-        "INSERT INTO session_entries (id,session_id,sequence,parent_id,kind,contextual,payload_json,created_at) VALUES (?1,?2,?3,?4,?5,1,?6,?7)",
-        params![entry.id.as_str(), session_id.as_str(), sequence, leaf.as_ref().map(MessageId::as_str), kind, json(&entry.payload)?, timestamp(entry.created_at)],
-    )?;
-    transaction.execute(
-        "UPDATE sessions SET leaf_entry_id=?2 WHERE id=?1",
-        params![session_id.as_str(), entry.id.as_str()],
-    )?;
-    Ok(entry)
-}
-
-fn append_observational_entry_transaction(
-    transaction: &rusqlite::Transaction<'_>,
-    session_id: &SessionId,
-    payload: SessionEntryPayload,
-    kind: &str,
-    idempotency_key: Option<&str>,
-) -> Result<Option<SessionEntry>, StoreError> {
-    validate_session_item(&payload)?;
-    let leaf: Option<MessageId> = transaction
-        .query_row(
-            "SELECT leaf_entry_id FROM sessions WHERE id = ?1",
-            [session_id.as_str()],
-            |row| row.get::<_, Option<String>>(0)?.map(parse_id).transpose(),
-        )
-        .optional()?
-        .ok_or_else(|| StoreError::NotFound {
-            kind: "session",
-            id: session_id.to_string(),
-        })?;
-    let sequence: u64 = transaction.query_row(
-        "SELECT COALESCE(MAX(sequence) + 1, 1) FROM session_entries WHERE session_id = ?1",
-        [session_id.as_str()],
-        |row| row.get(0),
-    )?;
-    let entry = SessionEntry {
-        id: MessageId::new(),
-        session_id: session_id.clone(),
-        sequence,
-        parent_id: leaf,
-        payload,
-        created_at: Utc::now(),
-    };
-    let inserted = transaction.execute(
-        "INSERT OR IGNORE INTO session_entries
-         (id, session_id, sequence, parent_id, kind, contextual, observation_key, payload_json, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8)",
-        params![entry.id.as_str(), session_id.as_str(), sequence,
-            entry.parent_id.as_ref().map(MessageId::as_str), kind, idempotency_key,
-            json(&entry.payload)?, timestamp(entry.created_at)],
-    )?;
-    Ok((inserted == 1).then_some(entry))
-}
-
 #[allow(clippy::too_many_arguments)]
-fn write_acp_binding(
+fn decide_acp_binding(
     transaction: &rusqlite::Transaction<'_>,
     session_id: &SessionId,
     host_id: &HostId,
@@ -1176,7 +2310,7 @@ fn write_acp_binding(
     context_text: &str,
     channel: AcpInstructionChannel,
     context_dispatched: bool,
-) -> Result<(), StoreError> {
+) -> Result<AcpSessionBinding, StoreError> {
     if harness.is_empty()
         || definition_hash.is_empty()
         || acp_session_id.is_empty()
@@ -1187,115 +2321,114 @@ fn write_acp_binding(
             "invalid ACP Session binding".into(),
         ));
     }
-    let channel_json = serde_json::to_string(&channel)
-        .map_err(|error| StoreError::InvalidData(error.to_string()))?;
-    let channel = channel_json.trim_matches('"');
-    let existing: Option<(String, String, String, String)> = transaction.query_row(
-        "SELECT host_id, harness, harness_definition_hash, acp_session_id FROM acp_session_bindings WHERE session_id = ?1", [session_id.as_str()],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-    ).optional()?;
+    let existing = select_acp_binding(transaction, session_id)?;
     let now = Utc::now();
     match existing {
-        None if matches!(transition, AcpBindingTransition::New) => {
-            transaction.execute("INSERT INTO acp_session_bindings (session_id, host_id, harness, harness_definition_hash, acp_session_id, context_version, context_hash, context_channel, context_text, context_dispatched, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)", params![session_id.as_str(), host_id.as_str(), harness, definition_hash, acp_session_id, context.version, AcpContextSnapshot::hash_rendered(context_text), channel, context_text, context_dispatched, timestamp(now)])?;
-        }
-        Some((bound_host, bound_harness, _, _))
+        None if matches!(transition, AcpBindingTransition::New) => Ok(AcpSessionBinding {
+            session_id: session_id.clone(),
+            host_id: host_id.clone(),
+            harness: harness.to_owned(),
+            harness_definition_hash: definition_hash.to_owned(),
+            acp_session_id: acp_session_id.to_owned(),
+            context_version: context.version,
+            context_hash: AcpContextSnapshot::hash_rendered(context_text),
+            context_channel: channel,
+            context_text: context_text.to_owned(),
+            context_dispatched,
+            created_at: now,
+            replaced_at: None,
+            last_replacement_reason: None,
+        }),
+        Some(existing)
             if matches!(transition, AcpBindingTransition::Replace { .. })
-                && bound_host == host_id.as_str()
-                && bound_harness == harness =>
+                && existing.host_id == *host_id =>
         {
             let AcpBindingTransition::Replace { reason } = transition else {
                 unreachable!()
             };
-            let reason = serde_json::to_string(reason)
-                .map_err(|error| StoreError::InvalidData(error.to_string()))?;
-            transaction.execute("UPDATE acp_session_bindings SET acp_session_id=?2, harness_definition_hash=?3, context_version=?4, context_hash=?5, context_channel=?6, context_text=?7, context_dispatched=?8, replaced_at=?9, last_replacement_reason=?10 WHERE session_id=?1", params![session_id.as_str(), acp_session_id, definition_hash, context.version, AcpContextSnapshot::hash_rendered(context_text), channel, context_text, context_dispatched, timestamp(now), reason.trim_matches('"')])?;
+            Ok(AcpSessionBinding {
+                acp_session_id: acp_session_id.to_owned(),
+                harness: harness.to_owned(),
+                harness_definition_hash: definition_hash.to_owned(),
+                context_version: context.version,
+                context_hash: AcpContextSnapshot::hash_rendered(context_text),
+                context_channel: channel,
+                context_text: context_text.to_owned(),
+                context_dispatched,
+                replaced_at: Some(now),
+                last_replacement_reason: Some(*reason),
+                ..existing
+            })
         }
-        Some((bound_host, bound_harness, bound_hash, old_id))
+        Some(existing)
             if matches!(transition, AcpBindingTransition::New)
-                && bound_host == host_id.as_str()
-                && bound_harness == harness
-                && bound_hash == definition_hash
-                && old_id == acp_session_id => {}
-        _ => {
-            return Err(StoreError::InvalidData(
-                "ACP Session binding conflicts with its existing Host or Harness".into(),
-            ));
+                && existing.host_id == *host_id
+                && existing.harness == harness
+                && existing.harness_definition_hash == definition_hash
+                && existing.acp_session_id == acp_session_id =>
+        {
+            Ok(existing)
         }
+        _ => Err(StoreError::InvalidData(
+            "ACP Session binding conflicts with its existing Host or Harness".into(),
+        )),
     }
-    Ok(())
 }
 
-fn append_acp_observation_transaction(
+pub(crate) fn record_acp_observation_transaction(
     transaction: &rusqlite::Transaction<'_>,
     session_id: &SessionId,
-    run_id: RunId,
+    turn_id: TurnId,
     acp_session_id: Option<String>,
     event_key: Option<mews_protocol::AcpEventKey>,
     observation: AcpObservation,
 ) -> Result<(), StoreError> {
-    let leaf: Option<MessageId> = transaction.query_row(
-        "SELECT leaf_entry_id FROM sessions WHERE id=?1",
-        [session_id.as_str()],
-        |row| row.get::<_, Option<String>>(0)?.map(parse_id).transpose(),
-    )?;
-    let sequence: u64 = transaction.query_row(
-        "SELECT COALESCE(MAX(sequence)+1, 1) FROM session_entries WHERE session_id=?1",
-        [session_id.as_str()],
-        |row| row.get(0),
-    )?;
-    let payload = harness_observation_payload(run_id, acp_session_id, observation)?;
-    validate_session_item(&payload)?;
-    transaction.execute("INSERT OR IGNORE INTO session_entries (id,session_id,sequence,parent_id,kind,contextual,observation_key,payload_json,created_at) VALUES (?1,?2,?3,?4,'harness_observation',0,?5,?6,?7)", params![MessageId::new().as_str(), session_id.as_str(), sequence, leaf.as_ref().map(MessageId::as_str), event_key, json(&payload)?, timestamp(Utc::now())])?;
-    Ok(())
-}
-
-pub(super) fn harness_observation_payload(
-    run_id: RunId,
-    harness_session_id: Option<String>,
-    observation: AcpObservation,
-) -> Result<SessionEntryPayload, StoreError> {
-    match observation {
+    if observation_exists(transaction, session_id, event_key.as_deref())? {
+        return Ok(());
+    }
+    let entry_id = MessageId::new();
+    let payload = match observation {
         AcpObservation::CompletedReasoning {
             text,
             message_id,
             visibility,
-        } => Ok(SessionEntryPayload::Reasoning {
-            run_id,
+        } => mews_protocol::JournalEvent::ReasoningRecorded {
+            turn_id,
+            entry_id,
             text,
             visibility,
             provenance: ReasoningProvenance::Harness {
                 harness: "acp".into(),
                 message_id,
             },
-        }),
-        AcpObservation::ToolActivity { activity }
-            if matches!(activity.status.as_deref(), Some("started" | "in_progress")) =>
-        {
-            Ok(SessionEntryPayload::ToolStarted {
-                run_id,
-                call: ToolCall {
-                    call_id: activity.call_id,
-                    tool: activity.title,
-                    arguments: activity.input,
-                    thought_signature: None,
-                },
-            })
-        }
+        },
         observation => {
-            let value = serde_json::to_value(observation)
+            let data = serde_json::to_value(observation)
                 .map_err(|error| StoreError::InvalidData(error.to_string()))?;
-            let kind = value
+            let kind = data
                 .get("type")
                 .and_then(Value::as_str)
                 .unwrap_or("acp")
                 .to_owned();
-            Ok(SessionEntryPayload::HarnessObservation {
-                run_id,
-                harness_session_id,
+            mews_protocol::JournalEvent::HarnessObservationRecorded {
+                turn_id,
+                entry_id,
+                harness_session_id: acp_session_id,
                 kind,
-                data: value,
-            })
+                data,
+            }
         }
-    }
+    };
+    let event = record_session_event_correlated(
+        transaction,
+        session_id,
+        mews_protocol::EventActor {
+            kind: mews_protocol::EventActorKind::Harness,
+            id: Some("acp".into()),
+        },
+        payload,
+        event_key,
+    )?;
+    apply_session_journal_entry(transaction, &event)?;
+    Ok(())
 }

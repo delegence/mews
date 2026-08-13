@@ -37,9 +37,9 @@ impl MappingStore {
                  metadata_json TEXT NOT NULL,
                  UNIQUE (conversation, external_id)
              );
-             CREATE TABLE IF NOT EXISTS active_runs (
+             CREATE TABLE IF NOT EXISTS active_turns (
                  session_id TEXT PRIMARY KEY,
-                 run_id TEXT NOT NULL UNIQUE
+                 turn_id TEXT NOT NULL UNIQUE
              );",
         )?;
         Ok(Self(connection, lock))
@@ -131,7 +131,7 @@ impl MappingStore {
 
     pub(crate) fn active(&self, session: &SessionId) -> Result<bool> {
         Ok(self.0.query_row(
-            "SELECT EXISTS(SELECT 1 FROM active_runs WHERE session_id = ?1)",
+            "SELECT EXISTS(SELECT 1 FROM active_turns WHERE session_id = ?1)",
             [session.as_str()],
             |row| row.get(0),
         )?)
@@ -155,45 +155,45 @@ impl MappingStore {
         &mut self,
         pending_id: i64,
         session: &SessionId,
-        run_id: &str,
+        turn_id: &str,
     ) -> Result<()> {
         let transaction = self.0.transaction()?;
         transaction.execute(
-            "INSERT INTO active_runs (session_id, run_id) VALUES (?1, ?2)",
-            params![session.as_str(), run_id],
+            "INSERT INTO active_turns (session_id, turn_id) VALUES (?1, ?2)",
+            params![session.as_str(), turn_id],
         )?;
         transaction.execute("DELETE FROM pending WHERE id = ?1", [pending_id])?;
         transaction.commit()?;
         Ok(())
     }
 
-    pub(crate) fn finish_run(&mut self, run_id: &str) -> Result<Option<SessionId>> {
+    pub(crate) fn finish_turn(&mut self, turn_id: &str) -> Result<Option<SessionId>> {
         let session = self
             .0
             .query_row(
-                "SELECT session_id FROM active_runs WHERE run_id = ?1",
-                [run_id],
+                "SELECT session_id FROM active_turns WHERE turn_id = ?1",
+                [turn_id],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
         self.0
-            .execute("DELETE FROM active_runs WHERE run_id = ?1", [run_id])?;
+            .execute("DELETE FROM active_turns WHERE turn_id = ?1", [turn_id])?;
         session
             .map(|value| value.parse().map_err(anyhow::Error::msg))
             .transpose()
     }
 
-    pub(crate) fn active_runs(&self) -> Result<Vec<(SessionId, String)>> {
+    pub(crate) fn active_turns(&self) -> Result<Vec<(SessionId, String)>> {
         let mut statement = self
             .0
-            .prepare("SELECT session_id, run_id FROM active_runs")?;
+            .prepare("SELECT session_id, turn_id FROM active_turns")?;
         let rows = statement
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter()
-            .map(|(session, run)| Ok((session.parse().map_err(anyhow::Error::msg)?, run)))
+            .map(|(session, turn)| Ok((session.parse().map_err(anyhow::Error::msg)?, turn)))
             .collect()
     }
 }
@@ -228,13 +228,13 @@ mod tests {
             .unwrap();
         let (pending, _, text, _) = store.next(&session).unwrap().unwrap();
         assert_eq!(text, "hello");
-        store.mark_started(pending, &session, "run-1").unwrap();
+        store.mark_started(pending, &session, "turn-1").unwrap();
         drop(store);
 
         let mut reopened = MappingStore::open(&path).unwrap();
         assert!(reopened.active(&session).unwrap());
         assert_eq!(reopened.next(&session).unwrap(), None);
-        assert_eq!(reopened.finish_run("run-1").unwrap(), Some(session));
+        assert_eq!(reopened.finish_turn("turn-1").unwrap(), Some(session));
     }
 
     #[test]

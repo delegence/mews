@@ -65,6 +65,8 @@ pub enum MessageContent {
         tool: String,
         result: Value,
         is_error: bool,
+        #[serde(default)]
+        uncertain: bool,
     },
     ProviderState {
         provider: String,

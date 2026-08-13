@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, path::PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use super::defaults::default_root;
 
@@ -34,22 +34,22 @@ pub enum Command {
     },
     /// Create, manage, and chat with agents
     #[command(
-        after_help = "Forms:\n  mews agents list\n  mews agents new [name] [--harness <name>] [--option <key=value>]...\n  mews agents rename <slug> <new-slug>\n  mews agents delete <slug>\n  mews agents <slug>\n  mews agents <slug> -p <message>"
+        after_help = "Forms:\n  mews agents list\n  mews agents new [name] [--harness <name>] [--option <key=value>]...\n  mews agents rename <slug> <new-slug>\n  mews agents delete <slug>\n  mews agents <slug>\n  mews agents <slug> -p <message> [--detach]"
     )]
     Agents {
         #[arg(
             trailing_var_arg = true,
-            value_name = "new [name] | <slug> [-p <message>]"
+            value_name = "new [name] | <slug> [-p <message> [--detach]]"
         )]
         args: Vec<String>,
     },
     /// List and continue agent sessions
     #[command(
-        after_help = "Forms:\n  mews sessions list\n  mews sessions <id>\n  mews sessions <id> ask <message>"
+        after_help = "Forms:\n  mews sessions list\n  mews sessions <id>\n  mews sessions <id> -p <message> [--detach]"
     )]
     Sessions {
         id: Option<String>,
-        #[arg(trailing_var_arg = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// List and manage enrolled hosts
@@ -76,6 +76,11 @@ pub enum Command {
     Providers {
         #[command(subcommand)]
         command: Option<ProviderCommand>,
+    },
+    /// Query or follow the audit journal
+    Journal {
+        #[command(subcommand)]
+        command: JournalCommand,
     },
     /// Run the machine service as a background daemon
     #[command(hide = true)]
@@ -160,9 +165,48 @@ pub enum ProviderModelsCommand {
     Update,
 }
 
+#[derive(Subcommand)]
+pub enum JournalCommand {
+    /// Query one page after an exclusive journal position
+    List {
+        #[command(flatten)]
+        query: JournalQueryArgs,
+    },
+    /// Follow matching entries, resuming after an exclusive journal position
+    Watch {
+        #[command(flatten)]
+        query: JournalQueryArgs,
+    },
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct JournalQueryArgs {
+    /// Exclusive journal position to resume after
+    #[arg(long, default_value_t = 0)]
+    pub after: u64,
+    /// Maximum matching entries returned in each page
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=500))]
+    pub limit: u16,
+    /// Restrict to one subject category
+    #[arg(long)]
+    pub subject_type: Option<mews_protocol::JournalSubjectType>,
+    /// Restrict to one subject identifier
+    #[arg(long)]
+    pub subject_id: Option<String>,
+    /// Restrict to event types; repeat to select more than one
+    #[arg(long = "event-type")]
+    pub event_types: Vec<mews_protocol::JournalEventType>,
+    /// Restrict to events associated with one Session
+    #[arg(long)]
+    pub session: Option<mews_protocol::SessionId>,
+    /// Restrict to one correlation identifier
+    #[arg(long)]
+    pub correlation: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, HarnessesCommand};
+    use super::{Cli, Command, HarnessesCommand, JournalCommand};
     use clap::{CommandFactory, Parser};
 
     #[test]
@@ -238,6 +282,36 @@ mod tests {
             Some(Command::Harnesses {
                 command: Some(HarnessesCommand::Setup { name: Some(name) })
             }) if name == "codex"
+        ));
+    }
+
+    #[test]
+    fn journal_filters_parse_as_typed_queries() {
+        let cli = Cli::try_parse_from([
+            "mews",
+            "journal",
+            "watch",
+            "--after",
+            "42",
+            "--subject-type",
+            "session",
+            "--event-type",
+            "turn_completed",
+            "--event-type",
+            "turn_failed",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(Command::Journal {
+                command: JournalCommand::Watch { query }
+            }) if query.after == 42
+                && query.subject_type == Some(mews_protocol::JournalSubjectType::Session)
+                && query.event_types == [
+                    mews_protocol::JournalEventType::TurnCompleted,
+                    mews_protocol::JournalEventType::TurnFailed,
+                ]
         ));
     }
 }

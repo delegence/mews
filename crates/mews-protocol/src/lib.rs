@@ -40,7 +40,7 @@ mod tests {
         let event = HostToHub::AcpEvent {
             request_id: request_id.clone(),
             event: AcpEvent::AssistantDelta {
-                event_key: "run-1:update-2".into(),
+                event_key: "turn-1:update-2".into(),
                 delta: "ha".into(),
                 message_id: None,
                 raw: serde_json::Value::Null,
@@ -48,7 +48,7 @@ mod tests {
         };
         let decoded: HostToHub = decode(&encode(event).unwrap()).unwrap();
         assert!(
-            matches!(decoded, HostToHub::AcpEvent { request_id: id, event: AcpEvent::AssistantDelta { event_key, .. } } if id == request_id && event_key == "run-1:update-2")
+            matches!(decoded, HostToHub::AcpEvent { request_id: id, event: AcpEvent::AssistantDelta { event_key, .. } } if id == request_id && event_key == "turn-1:update-2")
         );
     }
 
@@ -57,7 +57,7 @@ mod tests {
         let request_id = RequestId::new();
         let cwd = std::env::current_dir().unwrap();
         let decoded: HubToHost = decode(
-            &encode(HubToHost::RunAcp {
+            &encode(HubToHost::ExecuteAcpTurn {
                 request_id: request_id.clone(),
                 harness: "fixture".into(),
                 harness_options: std::collections::BTreeMap::from([(
@@ -68,10 +68,11 @@ mod tests {
                 canonical_cwd: cwd.clone(),
                 prompt: "canonical conversation".into(),
                 recovery_prompt: "recovery conversation".into(),
+                agent_id: AgentId::new(),
                 agent_slug: "fixture-agent".into(),
                 soul: "fixture soul".into(),
                 mews_session_id: "session-fixture".into(),
-                run_id: "run-fixture".into(),
+                turn_id: "turn-fixture".into(),
                 transition: AcpBindingTransition::Resume {
                     acp_session_id: "session-1".into(),
                 },
@@ -86,7 +87,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            matches!(decoded, HubToHost::RunAcp { request_id: id, harness, canonical_cwd, .. } if id == request_id && harness == "fixture" && canonical_cwd == cwd)
+            matches!(decoded, HubToHost::ExecuteAcpTurn { request_id: id, harness, canonical_cwd, .. } if id == request_id && harness == "fixture" && canonical_cwd == cwd)
         );
     }
 

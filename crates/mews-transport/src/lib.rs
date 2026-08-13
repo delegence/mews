@@ -23,7 +23,7 @@ pub struct PeerAuthentication<'a> {
     pub trusted_remote_signing_key: &'a str,
     pub local_noise: &'a NoiseIdentity,
     pub expected_remote_noise_key: Option<&'a str>,
-    pub stream_id: &'a str,
+    pub subject_id: &'a str,
 }
 
 pub async fn connect_initiator<L: RelayLink + 'static>(
@@ -34,7 +34,7 @@ pub async fn connect_initiator<L: RelayLink + 'static>(
         &authentication.installation_id,
         &authentication.local_peer,
         &authentication.remote_peer,
-        authentication.stream_id,
+        authentication.subject_id,
     );
     let mut noise = NoiseHandshake::initiator(authentication.local_noise, &prologue)?;
     let mut sequence = 0;
@@ -55,7 +55,7 @@ pub async fn connect_responder<L: RelayLink + 'static>(
         &authentication.installation_id,
         &authentication.remote_peer,
         &authentication.local_peer,
-        authentication.stream_id,
+        authentication.subject_id,
     );
     let mut noise = NoiseHandshake::responder(authentication.local_noise, &prologue)?;
     let message = receive_relay(&mut relay, &authentication, 0).await?;
@@ -70,9 +70,9 @@ fn channel_prologue(
     installation_id: &InstallationId,
     initiator: &RelayPeerId,
     responder: &RelayPeerId,
-    stream_id: &str,
+    subject_id: &str,
 ) -> Vec<u8> {
-    format!("mews-host-rpc-v1\0{installation_id}\0{initiator}\0{responder}\0{stream_id}")
+    format!("mews-host-rpc-v1\0{installation_id}\0{initiator}\0{responder}\0{subject_id}")
         .into_bytes()
 }
 
@@ -125,7 +125,7 @@ async fn finish_authentication<L: RelayLink + 'static>(
         installation_id: authentication.installation_id,
         local_peer: authentication.local_peer,
         remote_peer: authentication.remote_peer,
-        stream_id: authentication.stream_id.to_owned(),
+        subject_id: authentication.subject_id.to_owned(),
         send_sequence,
         receive_sequence,
     })
@@ -137,7 +137,7 @@ pub struct EncryptedRelayPeer {
     installation_id: InstallationId,
     local_peer: RelayPeerId,
     remote_peer: RelayPeerId,
-    stream_id: String,
+    subject_id: String,
     send_sequence: u64,
     receive_sequence: u64,
 }
@@ -166,7 +166,7 @@ impl EncryptedRelayPeer {
                 self.installation_id.clone(),
                 self.local_peer.clone(),
                 self.remote_peer.clone(),
-                self.stream_id.clone(),
+                self.subject_id.clone(),
                 self.send_sequence,
                 ciphertext,
             )?;
@@ -194,7 +194,7 @@ impl EncryptedRelayPeer {
             if frame.installation_id != self.installation_id
                 || frame.source_id != self.remote_peer
                 || frame.destination_id != self.local_peer
-                || frame.stream_id != self.stream_id
+                || frame.subject_id != self.subject_id
                 || frame.sequence != self.receive_sequence
             {
                 bail!("relay frame violates authenticated stream ordering");
@@ -230,7 +230,7 @@ impl EncryptedRelayPeer {
     }
 }
 
-/// Runs the Hub half of the serialized Host RPC over an authenticated relay.
+/// Turns the Hub half of the serialized Host RPC over an authenticated relay.
 pub async fn run_hub_host_link(
     mut peer: EncryptedRelayPeer,
     mut outbound: tokio::sync::mpsc::Receiver<HubToHost>,
@@ -288,7 +288,7 @@ async fn send_relay(
             authentication.installation_id.clone(),
             authentication.local_peer.clone(),
             authentication.remote_peer.clone(),
-            authentication.stream_id,
+            authentication.subject_id,
             sequence,
             ciphertext,
         )?)
@@ -308,7 +308,7 @@ async fn receive_relay(
     if frame.installation_id != authentication.installation_id
         || frame.source_id != authentication.remote_peer
         || frame.destination_id != authentication.local_peer
-        || frame.stream_id != authentication.stream_id
+        || frame.subject_id != authentication.subject_id
         || frame.sequence != sequence
     {
         bail!("invalid relay handshake frame");

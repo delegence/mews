@@ -179,7 +179,7 @@ mod tests {
             parent_id: None,
             created_at: Utc::now(),
             payload: SessionEntryPayload::AssistantResponse {
-                run_id: RunId::new(),
+                turn_id: TurnId::new(),
                 response: AssistantResponse {
                     provider: "google".into(),
                     model: "gemini".into(),

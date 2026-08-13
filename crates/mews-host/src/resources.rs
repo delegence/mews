@@ -15,7 +15,7 @@ pub struct Resource {
     pub path: PathBuf,
 }
 
-/// Immutable, path-free skill authority passed to one ACP Run. Unlike native
+/// Immutable, path-free skill authority passed to one ACP Turn. Unlike native
 /// discovery this intentionally does not consider project or global resources.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcpSkillSnapshot {

@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, path::Path};
 
 use anyhow::Result;
-use mews_protocol::{HostId, HubRequest, HubResponse, MessageSource, Run, Session, SessionId};
+use mews_protocol::{HostId, HubRequest, HubResponse, MessageSource, Session, SessionId, Turn};
 use serde_json::Value;
 
 use crate::{connection::LocalConnection, response};
@@ -254,7 +254,7 @@ impl MewsClient {
         prompt: String,
         metadata: Value,
         source: MessageSource,
-    ) -> Result<Run> {
+    ) -> Result<Turn> {
         self.start_turn_idempotent(
             uuid::Uuid::now_v7().to_string(),
             session_id,
@@ -272,8 +272,8 @@ impl MewsClient {
         prompt: String,
         metadata: Value,
         source: MessageSource,
-    ) -> Result<Run> {
-        response::run(
+    ) -> Result<Turn> {
+        response::turn(
             self.request(HubRequest::StartTurn {
                 idempotency_key,
                 session_id,
@@ -285,20 +285,20 @@ impl MewsClient {
         )
     }
 
-    pub async fn get_run(&mut self, id: mews_protocol::RunId) -> Result<Run> {
-        response::run(self.request(HubRequest::GetRun { id }).await?)
+    pub async fn get_turn(&mut self, id: mews_protocol::TurnId) -> Result<Turn> {
+        response::turn(self.request(HubRequest::GetTurn { id }).await?)
     }
 
-    pub async fn cancel_run(&mut self, id: mews_protocol::RunId) -> Result<()> {
-        self.expect_ack(HubRequest::CancelRun { id }).await
+    pub async fn cancel_turn(&mut self, id: mews_protocol::TurnId) -> Result<()> {
+        self.expect_ack(HubRequest::CancelTurn { id }).await
     }
 
-    pub async fn wait_for_run(&mut self, id: mews_protocol::RunId) -> Result<Run> {
+    pub async fn wait_for_turn(&mut self, id: mews_protocol::TurnId) -> Result<Turn> {
         let mut delay = std::time::Duration::from_millis(100);
         loop {
-            let run = self.get_run(id.clone()).await?;
-            if run.completed_at.is_some() {
-                return Ok(run);
+            let turn = self.get_turn(id.clone()).await?;
+            if turn.completed_at.is_some() {
+                return Ok(turn);
             }
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(std::time::Duration::from_secs(1));

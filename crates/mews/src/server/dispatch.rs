@@ -10,9 +10,9 @@ use crate::{
     app::Mews,
     host::{ConnectedHost, HostControl},
 };
-use mews_protocol::{HubRequest, HubResponse, ProtocolError};
+use mews_protocol::{EventActor, EventActorKind, HubRequest, HubResponse, ProtocolError};
 
-use super::{HubRuntime, active_runs, handoff::*};
+use super::{HubRuntime, active_turns, handoff::*, journal};
 
 #[derive(Clone, Copy)]
 pub(crate) enum RequestOrigin<'a> {
@@ -24,6 +24,7 @@ pub(crate) async fn dispatch(
     runtime: &HubRuntime,
     root: &Path,
     origin: RequestOrigin<'_>,
+    command_id: &mews_protocol::RequestId,
     request: HubRequest,
 ) -> Result<(HubResponse, bool)> {
     if let HubRequest::PollEvents {
@@ -33,8 +34,12 @@ pub(crate) async fn dispatch(
     } = &request
     {
         let events =
-            active_runs::poll_events(runtime, root, consumer_id.clone(), *limit, *wait_ms).await?;
+            active_turns::poll_events(runtime, root, consumer_id.clone(), *limit, *wait_ms).await?;
         return Ok((HubResponse::Events(events), false));
+    }
+    if let HubRequest::PollJournalEntries { query, wait_ms } = &request {
+        let events = journal::poll_journal_entries(runtime, root, query.clone(), *wait_ms).await?;
+        return Ok((HubResponse::JournalEntries(events), false));
     }
     let is_move = matches!(&request, HubRequest::MoveHub { .. });
     let _operation_guard = if is_move {
@@ -51,7 +56,9 @@ pub(crate) async fn dispatch(
         bail!("Hub is moving; try again after handoff");
     }
     let request = match request {
-        HubRequest::PollEvents { .. } => unreachable!("handled before acquiring the handoff gate"),
+        HubRequest::PollEvents { .. } | HubRequest::PollJournalEntries { .. } => {
+            unreachable!("handled before acquiring the handoff gate")
+        }
         HubRequest::StartTurn {
             idempotency_key,
             session_id,
@@ -59,7 +66,7 @@ pub(crate) async fn dispatch(
             metadata,
             source,
         } => {
-            let run = active_runs::start_turn(
+            let turn = active_turns::start_turn(
                 runtime,
                 root,
                 idempotency_key,
@@ -69,12 +76,21 @@ pub(crate) async fn dispatch(
                 source,
             )
             .await?;
-            return Ok((HubResponse::Run(run), false));
+            return Ok((HubResponse::Turn(turn), false));
         }
         request => request,
     };
 
-    let mut mews = Mews::open_connection(root)?;
+    let actor = match origin {
+        RequestOrigin::Local => EventActor::system(),
+        RequestOrigin::Host(host) => EventActor {
+            kind: EventActorKind::Host,
+            id: Some(host.host_id().to_string()),
+        },
+    };
+    let context = mews_store::CommandContext::new(command_id.to_string(), actor);
+    let mut state = Mews::open_connection(root)?;
+    let mut mews = state.commands(context);
     if let RequestOrigin::Host(host) = origin {
         mews.ensure_host(host.host_id())?;
     }
@@ -146,10 +162,13 @@ pub(crate) async fn dispatch(
             mews.acknowledge_events(&consumer_id, checkpoint)?;
             HubResponse::Ack
         }
-        HubRequest::GetRun { id } => HubResponse::Run(mews.run(&id)?),
-        HubRequest::CancelRun { id } => {
-            active_runs::cancel_run(&runtime.control, root, &id).await;
-            mews.cancel_run(&id)?;
+        HubRequest::QueryJournalEntries { query } => {
+            HubResponse::JournalEntries(mews.journal_entries_page(&query)?)
+        }
+        HubRequest::GetTurn { id } => HubResponse::Turn(mews.turn(&id)?),
+        HubRequest::CancelTurn { id } => {
+            active_turns::cancel_turn(&runtime.control, root, &id).await;
+            mews.cancel_turn(&id)?;
             runtime.control.event_notify.notify_waiters();
             HubResponse::Ack
         }
@@ -203,7 +222,9 @@ pub(crate) async fn dispatch(
                 )
             }
         }
-        HubRequest::StartTurn { .. } | HubRequest::PollEvents { .. } => {
+        HubRequest::StartTurn { .. }
+        | HubRequest::PollEvents { .. }
+        | HubRequest::PollJournalEntries { .. } => {
             unreachable!("handled before locking")
         }
         HubRequest::ListHosts => {
@@ -439,6 +460,7 @@ pub(crate) async fn dispatch(
                                 "Hub activation outcome is uncertain; target is armed and old Hub was safely demoted: {error:#}"
                             ))),
                         };
+                        runtime.control.journal_notify.notify_waiters();
                         return Ok((response, true));
                     }
                 }
@@ -449,16 +471,21 @@ pub(crate) async fn dispatch(
                     "Hub activation outcome is uncertain; the old Hub was safely demoted: {error:#}"
                 ))),
             };
+            runtime.control.journal_notify.notify_waiters();
             return Ok((response, true));
         }
         HubRequest::Shutdown => return Ok((HubResponse::Ack, true)),
     };
+    // Synchronous application commands have committed before reaching here.
+    // Waking on reads is harmless and keeps this boundary deliberately simple;
+    // long polls always recheck the exclusive cursor before sleeping.
+    runtime.control.journal_notify.notify_waiters();
     Ok((response, false))
 }
 
 async fn rename_agent(
     runtime: &HubRuntime,
-    mews: &mut Mews,
+    mews: &mut crate::app::MewsCommands<'_>,
     slug: &str,
     new_slug: &str,
 ) -> Result<crate::Agent> {
@@ -480,6 +507,35 @@ async fn rename_agent(
         })
         .collect::<Result<Vec<_>>>()?;
     drop(connected);
+
+    // A response can be lost after the durable rename. Replay the receipt and
+    // finish any pending local move before trying to synchronize the old slug.
+    if let Some(renamed) = mews.replay_agent_rename(slug, new_slug)? {
+        let revision = mews.agent_revision(&renamed)?;
+        for host in &remote {
+            if let Some(replica) = host.agent_replica(new_slug).await? {
+                if !replica_matches_revision(&replica, &revision) {
+                    bail!(
+                        "Host {} has an unsynchronized renamed agent replica",
+                        host.host_id()
+                    );
+                }
+                continue;
+            }
+            let previous = host.agent_replica(slug).await?;
+            if let Some(replica) = &previous
+                && !replica_matches_revision(replica, &revision)
+            {
+                bail!(
+                    "Host {} has an unsynchronized agent replica; synchronize it before renaming",
+                    host.host_id()
+                );
+            }
+            host.synchronize_agent(&renamed, &revision, previous.as_ref(), Some(slug))
+                .await?;
+        }
+        return Ok(renamed);
+    }
 
     let current_agent = mews.synchronize_agent(slug)?;
     let current = mews.agent_revision(&current_agent)?;
@@ -506,4 +562,13 @@ async fn rename_agent(
             .await?;
     }
     Ok(renamed)
+}
+
+fn replica_matches_revision(
+    replica: &mews_protocol::AgentReplica,
+    revision: &crate::AgentRevision,
+) -> bool {
+    replica.revision == revision.revision
+        && replica.soul.trim_end() == revision.soul.trim_end()
+        && replica.config_toml == revision.config_toml
 }

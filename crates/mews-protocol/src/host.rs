@@ -4,11 +4,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    Agent, AgentRevision, HarnessDescriptor, HostId, HubRequest, HubResponse, InstallationId,
-    RequestId, ToolDefinition,
+    Agent, AgentId, AgentRevision, HarnessDescriptor, HostId, HubRequest, HubResponse,
+    InstallationId, RequestId, ToolDefinition,
 };
 
-pub const HOST_PROTOCOL_VERSION: u32 = 1;
+pub const HOST_PROTOCOL_VERSION: u32 = 2;
 pub const MAX_HOST_FRAME_BYTES: usize = 256 * 1024;
 /// Reserved in Host frames for the request envelope, Agent configuration,
 /// tools, and other metadata surrounding project instructions.
@@ -100,6 +100,7 @@ pub enum HubToHost {
     },
     ExecuteTool {
         request_id: RequestId,
+        agent_id: AgentId,
         tool: String,
         arguments: Value,
         canonical_cwd: PathBuf,
@@ -109,13 +110,14 @@ pub enum HubToHost {
     },
     ExecuteHook {
         request_id: RequestId,
+        agent_id: AgentId,
         hook: String,
         payload: Value,
         canonical_cwd: PathBuf,
     },
     /// Execute an external ACP Harness on this Host. The prompt is already
     /// canonicalized by the Hub; launch details remain Host-local.
-    RunAcp {
+    ExecuteAcpTurn {
         request_id: RequestId,
         harness: String,
         harness_options: BTreeMap<String, String>,
@@ -123,10 +125,11 @@ pub enum HubToHost {
         canonical_cwd: PathBuf,
         prompt: String,
         recovery_prompt: String,
+        agent_id: AgentId,
         agent_slug: String,
         soul: String,
         mews_session_id: String,
-        run_id: String,
+        turn_id: String,
         transition: crate::AcpBindingTransition,
         /// Present only for a compatible resume. New/replaced Sessions are
         /// rendered by the executing Host from its selected-Agent skill scope.
@@ -274,7 +277,7 @@ pub enum HostToHub {
         timings: Option<AcpTimings>,
         error: Option<String>,
     },
-    /// A bounded, non-authoritative observation emitted while an ACP run is
+    /// A bounded, non-authoritative observation emitted while an ACP Turn is
     /// active. The request ID correlates it with the eventual `AcpResult`.
     AcpEvent {
         request_id: RequestId,
@@ -330,6 +333,10 @@ pub struct AcpTimings {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AcpEvent {
+    PromptDispatched {
+        event_key: crate::AcpEventKey,
+        session_id: String,
+    },
     AssistantDelta {
         event_key: crate::AcpEventKey,
         delta: String,

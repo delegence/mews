@@ -2,17 +2,55 @@ use std::collections::BTreeMap;
 
 use super::*;
 
-impl Mews {
-    pub fn rename_agent(&mut self, slug: &str, new_slug: &str) -> Result<Agent> {
-        self.synchronize_agent(slug)?;
+impl MewsCommands<'_> {
+    /// Replays a committed rename before callers try to read the old slug.
+    /// A transport retry can arrive after the database commit, the local file
+    /// move, or both, so recovery must precede normal rename preflight.
+    pub(crate) fn replay_agent_rename(
+        &mut self,
+        slug: &str,
+        new_slug: &str,
+    ) -> Result<Option<Agent>> {
         let source = self.root.join("agents").join(slug);
         let destination = self.root.join("agents").join(new_slug);
+        if !source.exists() && destination.exists() {
+            return Ok(Some(self.mews.store.rename_agent(
+                &self.context,
+                slug,
+                new_slug,
+            )?));
+        }
+        if source.exists() && !destination.exists() && self.mews.store.agent_by_slug(slug).is_err()
+        {
+            let agent = self
+                .mews
+                .store
+                .rename_agent(&self.context, slug, new_slug)?;
+            fs::rename(&source, &destination)?;
+            fs::File::open(self.root.join("agents"))?.sync_all()?;
+            return Ok(Some(agent));
+        }
+        Ok(None)
+    }
+
+    pub fn rename_agent(&mut self, slug: &str, new_slug: &str) -> Result<Agent> {
+        let source = self.root.join("agents").join(slug);
+        let destination = self.root.join("agents").join(new_slug);
+        if let Some(agent) = self.replay_agent_rename(slug, new_slug)? {
+            return Ok(agent);
+        }
+        self.synchronize_agent(slug)?;
         if destination.exists() {
             bail!("agent directory already exists: {}", destination.display());
         }
-        let agent = self.store.rename_agent(slug, new_slug)?;
+        let agent = self
+            .mews
+            .store
+            .rename_agent(&self.context, slug, new_slug)?;
         if let Err(error) = fs::rename(&source, &destination) {
-            let rollback = self.store.rename_agent(new_slug, slug);
+            let rollback = self
+                .store
+                .rollback_agent_rename(&self.context, new_slug, slug);
             rollback.context("agent directory rename failed and database rollback also failed")?;
             return Err(error.into());
         }
@@ -32,7 +70,7 @@ impl Mews {
     ) -> Result<Agent> {
         let installation = self.installation()?;
         if harness == mews_runtime::MEWS_HARNESS {
-            let defaults = self.store.provider_defaults()?;
+            let defaults = self.mews.store.provider_defaults()?;
             if let Some(model) = defaults.model {
                 harness_options.entry("model".into()).or_insert(model);
             }
@@ -55,17 +93,31 @@ impl Mews {
         })?;
         let directory = self.root.join("agents").join(slug);
         if directory.exists() {
+            if let Ok(agent) = self.mews.store.agent_by_slug(slug) {
+                let revision = self
+                    .store
+                    .agent_revision(&agent.id, agent.current_revision)?;
+                if revision.soul == DEFAULT_SOUL && revision.config_toml == config {
+                    fs::write(directory.join(REVISION_FILE), revision.revision.to_string())?;
+                    fs::write(directory.join(AGENT_ID_FILE), agent.id.as_str())?;
+                    return Ok(agent);
+                }
+            }
             bail!("agent directory already exists: {}", directory.display())
         }
         fs::create_dir_all(&directory)?;
         fs::write(directory.join("SOUL.md"), format!("{DEFAULT_SOUL}\n"))?;
         fs::write(directory.join("agent.toml"), &config)?;
-        match self
-            .store
-            .create_agent(slug, DEFAULT_SOUL, &config, &installation.hub_host_id)
-        {
+        match self.mews.store.create_agent(
+            &self.context,
+            slug,
+            DEFAULT_SOUL,
+            &config,
+            &installation.hub_host_id,
+        ) {
             Ok((agent, revision)) => {
                 fs::write(directory.join(REVISION_FILE), revision.revision.to_string())?;
+                fs::write(directory.join(AGENT_ID_FILE), agent.id.as_str())?;
                 Ok(agent)
             }
             Err(error) => {
@@ -76,12 +128,13 @@ impl Mews {
     }
 
     pub fn synchronize_agent(&mut self, slug: &str) -> Result<Agent> {
-        let agent = self.store.agent_by_slug(slug)?;
+        let agent = self.mews.store.agent_by_slug(slug)?;
         let current = self
             .store
             .agent_revision(&agent.id, agent.current_revision)?;
         let directory = self.root.join("agents").join(slug);
         fs::create_dir_all(&directory)?;
+        fs::write(directory.join(AGENT_ID_FILE), agent.id.as_str())?;
         let soul_path = directory.join("SOUL.md");
         let config_path = directory.join("agent.toml");
         let revision_path = directory.join(REVISION_FILE);
@@ -118,7 +171,10 @@ impl Mews {
             );
         };
         if replica_revision < current.revision {
-            let base = self.store.agent_revision(&agent.id, replica_revision)?;
+            let base = self
+                .mews
+                .store
+                .agent_revision(&agent.id, replica_revision)?;
             if soul.trim_end() != base.soul.trim_end() || config != base.config_toml {
                 fs::write(
                     directory.join(format!("SOUL.conflict-r{replica_revision}.md")),
@@ -145,7 +201,8 @@ impl Mews {
         }
         if soul.trim_end() != current.soul.trim_end() || config != current.config_toml {
             let installation = self.installation()?;
-            let revision = self.store.update_agent(
+            let revision = self.mews.store.update_agent(
+                &self.context,
                 &agent.id,
                 current.revision,
                 soul.trim_end(),
@@ -153,7 +210,7 @@ impl Mews {
                 &installation.hub_host_id,
             )?;
             fs::write(revision_path, revision.revision.to_string())?;
-            return Ok(self.store.agent_by_slug(slug)?);
+            return Ok(self.mews.store.agent_by_slug(slug)?);
         }
         Ok(agent)
     }
@@ -186,7 +243,8 @@ fn materialize(directory: &Path, revision: &crate::AgentRevision) -> Result<()> 
     fs::write(staged.join("SOUL.md"), &revision.soul)?;
     fs::write(staged.join("agent.toml"), &revision.config_toml)?;
     fs::write(staged.join(REVISION_FILE), revision.revision.to_string())?;
-    for file in ["SOUL.md", "agent.toml", REVISION_FILE] {
+    fs::write(staged.join(AGENT_ID_FILE), revision.agent_id.as_str())?;
+    for file in ["SOUL.md", "agent.toml", REVISION_FILE, AGENT_ID_FILE] {
         fs::OpenOptions::new()
             .write(true)
             .open(staged.join(file))?
@@ -195,24 +253,40 @@ fn materialize(directory: &Path, revision: &crate::AgentRevision) -> Result<()> 
     fs::File::open(&staged)?.sync_all()?;
     if directory.exists() {
         fs::rename(directory, &previous)?;
-        if previous.join("skills").exists()
-            && let Err(error) = fs::rename(previous.join("skills"), staged.join("skills"))
-        {
+        if let Err(error) = move_local_resources(&previous, &staged) {
             let _ = fs::rename(&previous, directory);
-            return Err(error.into());
+            return Err(error);
         }
     }
     if let Err(error) = fs::rename(&staged, directory) {
         if previous.exists() {
-            if staged.join("skills").exists() {
-                let _ = fs::rename(staged.join("skills"), previous.join("skills"));
-            }
+            let _ = move_local_resources(&staged, &previous);
             let _ = fs::rename(&previous, directory);
         }
         return Err(error.into());
     }
     fs::File::open(parent)?.sync_all()?;
     retain_previous_directories(parent, name)?;
+    Ok(())
+}
+
+/// Skills and extensions belong to the Host-local Agent replica, not its
+/// synchronized revision, so an atomic revision swap must carry them forward.
+fn move_local_resources(from: &Path, to: &Path) -> Result<()> {
+    let mut moved = Vec::new();
+    for name in ["skills", "extensions"] {
+        let source = from.join(name);
+        if !source.exists() {
+            continue;
+        }
+        if let Err(error) = fs::rename(&source, to.join(name)) {
+            for moved_name in moved.into_iter().rev() {
+                let _ = fs::rename(to.join(moved_name), from.join(moved_name));
+            }
+            return Err(error.into());
+        }
+        moved.push(name);
+    }
     Ok(())
 }
 

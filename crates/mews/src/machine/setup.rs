@@ -33,7 +33,7 @@ pub async fn create(
         role: RelayRole::Active,
     };
     let mews = Mews::setup(root, name)?;
-    mews.set_relay_url(&config.url)?;
+    mews.set_relay_url(&mews_store::CommandContext::system(), &config.url)?;
     crate::relay_supervisor::write(root, &config)?;
     drop(mews);
     if no_daemon {

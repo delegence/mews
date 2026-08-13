@@ -2,30 +2,32 @@ use super::*;
 use sha2::Digest;
 use std::io::Read;
 
-impl Mews {
+impl MewsCommands<'_> {
     pub fn begin_hub_move(&mut self, target: &crate::HostId) -> Result<HubSnapshot> {
-        if self.store.active_run_count()? != 0 {
-            bail!("cannot move Hub while Runs are active");
+        if self.mews.store.active_turn_count()? != 0 {
+            bail!("cannot move Hub while Turns are active");
         }
         let previous = self.installation()?.hub_host_id;
         if previous == *target {
-            bail!("target Host already runs Hub");
+            bail!("target Host already turns Hub");
         }
-        let previous_relay = self.store.host(&previous)?.relay_url;
+        let previous_relay = self.mews.store.host(&previous)?.relay_url;
         let target_relay = self
             .store
             .host(target)?
             .relay_url
             .context("target Host has no relay URL")?;
-        self.store.set_installation_relay_url(&target_relay)?;
-        self.store.move_hub(&previous, target)?;
+        self.mews
+            .store
+            .set_installation_relay_url(&self.context, &target_relay)?;
+        self.mews.store.move_hub(&self.context, &previous, target)?;
         let moved = self.installation()?;
         let snapshot_path = self.root.join("hub-move.snapshot");
         let result = (|| -> Result<HubSnapshot> {
             if snapshot_path.exists() {
                 fs::remove_file(&snapshot_path)?;
             }
-            self.store.backup_to(&snapshot_path)?;
+            self.mews.store.backup_to(&snapshot_path)?;
             let database_size = fs::metadata(&snapshot_path)?.len();
             let mut database = fs::File::open(&snapshot_path)?;
             let mut hasher = sha2::Sha256::new();
@@ -52,19 +54,24 @@ impl Mews {
             })
         })();
         if result.is_err() {
-            let _ = self.store.move_hub(target, &previous);
+            let _ = self.mews.store.move_hub(&self.context, target, &previous);
             if let Some(previous_relay) = previous_relay {
-                let _ = self.store.set_installation_relay_url(&previous_relay);
+                let _ = self
+                    .store
+                    .set_installation_relay_url(&self.context, &previous_relay);
             }
         }
         result
     }
 
     pub fn rollback_hub_move(&mut self, snapshot: &HubSnapshot) -> Result<()> {
-        self.store
-            .move_hub(&snapshot.target_hub, &snapshot.previous_hub)?;
-        if let Some(relay_url) = self.store.host(&snapshot.previous_hub)?.relay_url {
-            self.store.set_installation_relay_url(&relay_url)?;
+        self.mews
+            .store
+            .move_hub(&self.context, &snapshot.target_hub, &snapshot.previous_hub)?;
+        if let Some(relay_url) = self.mews.store.host(&snapshot.previous_hub)?.relay_url {
+            self.mews
+                .store
+                .set_installation_relay_url(&self.context, &relay_url)?;
         }
         Ok(())
     }
@@ -74,8 +81,8 @@ impl Mews {
         target_id: &crate::HostId,
     ) -> Result<crate::enrollment::join::JoinedHostState> {
         let installation = self.installation()?;
-        let old_host = self.store.host(&installation.hub_host_id)?;
-        let target = self.store.host(target_id)?;
+        let old_host = self.mews.store.host(&installation.hub_host_id)?;
+        let target = self.mews.store.host(target_id)?;
         let relay_url = target.relay_url.context("target Host has no relay URL")?;
         let authority = HostIdentity::load(&self.root.join("secrets/installation.key"))?;
         let expires_at = chrono::Utc::now() + chrono::Duration::days(36_500);
@@ -113,10 +120,13 @@ impl Mews {
             .or(installation.relay_url.clone())
             .context("no relay is configured; pass `--relay <URL>`")?;
         let expires_at = chrono::Utc::now() + chrono::Duration::minutes(15);
-        let (invitation_id, secret) = self.store.create_invitation(expires_at)?;
+        let (invitation_id, secret) = self
+            .mews
+            .store
+            .create_invitation(&self.context, expires_at)?;
         let identity = HostIdentity::load(&self.root.join("secrets/installation.key"))?;
         let hub_noise = NoiseIdentity::load(&self.root.join("secrets/hub-noise.key"))?;
-        self.store.set_relay_url(&relay_url)?;
+        self.mews.store.set_relay_url(&self.context, &relay_url)?;
         crate::enrollment::JoinOffer::create(
             installation.id,
             invitation_id,
@@ -168,7 +178,7 @@ impl Mews {
     ) -> Result<(Vec<String>, crate::enrollment::join::EnrollmentAccepted)> {
         let installation = self.installation()?;
         let authority = HostIdentity::load(&self.root.join("secrets/installation.key"))?;
-        let host = self.store.host(host_id)?;
+        let host = self.mews.store.host(host_id)?;
         let relay_urls = self.relay_candidates()?;
         Ok((
             relay_urls.clone(),
@@ -200,7 +210,8 @@ impl Mews {
         {
             bail!("invitation does not belong to this installation");
         }
-        Ok(self.store.consume_invitation(
+        Ok(self.mews.store.consume_invitation(
+            &self.context,
             &offer.invitation_id,
             &offer.secret,
             &request.host_name,

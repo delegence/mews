@@ -171,13 +171,13 @@ impl<C: Channel> ChannelRuntime<C> {
         for (_, session) in runtime.mappings.mappings()? {
             runtime.events.subscribe(consumer.clone(), session).await?;
         }
-        for (session, run_id) in runtime.mappings.active_runs()? {
-            let run = runtime
+        for (session, turn_id) in runtime.mappings.active_turns()? {
+            let turn = runtime
                 .requests
-                .get_run(run_id.parse().map_err(anyhow::Error::msg)?)
+                .get_turn(turn_id.parse().map_err(anyhow::Error::msg)?)
                 .await?;
-            if run.completed_at.is_some() {
-                runtime.mappings.finish_run(&run.id.to_string())?;
+            if turn.completed_at.is_some() {
+                runtime.mappings.finish_turn(&turn.id.to_string())?;
                 runtime.launch_next(&session).await?;
             }
         }
@@ -246,10 +246,10 @@ impl<C: Channel> ChannelRuntime<C> {
 
     async fn handle_event(&mut self, event: ClientEvent) -> Result<()> {
         let Some(origin) = event.channel_origin.clone() else {
-            return self.handle_run_state(event, false).await;
+            return self.handle_turn_state(event, false).await;
         };
         if origin.consumer_id != self.origin_consumer {
-            return self.handle_run_state(event, false).await;
+            return self.handle_turn_state(event, false).await;
         }
         let outbound = match &event.kind {
             ClientEventKind::AssistantMessage { message, .. }
@@ -273,13 +273,13 @@ impl<C: Channel> ChannelRuntime<C> {
                     text: delta.clone(),
                 })
             }
-            ClientEventKind::RunFailed { error, .. }
+            ClientEventKind::TurnFailed { error, .. }
                 if self
                     .subscriptions
                     .contains(&ChannelSubscription::LifecycleEvents) =>
             {
                 Some(OutboundEvent::Lifecycle {
-                    message: format!("MEWS Run failed: {error}"),
+                    message: format!("MEWS Turn failed: {error}"),
                 })
             }
             _ => None,
@@ -304,18 +304,19 @@ impl<C: Channel> ChannelRuntime<C> {
                 .map_err(|_| anyhow::anyhow!("Channel delivery dispatcher stopped"))?;
         }
 
-        self.handle_run_state(event, true).await
+        self.handle_turn_state(event, true).await
     }
 
-    async fn handle_run_state(&mut self, event: ClientEvent, _is_origin: bool) -> Result<()> {
+    async fn handle_turn_state(&mut self, event: ClientEvent, _is_origin: bool) -> Result<()> {
         match event.kind {
-            ClientEventKind::RunCompleted { run_id } | ClientEventKind::RunCancelled { run_id } => {
-                if let Some(session) = self.mappings.finish_run(&run_id.to_string())? {
+            ClientEventKind::TurnCompleted { turn_id }
+            | ClientEventKind::TurnCancelled { turn_id } => {
+                if let Some(session) = self.mappings.finish_turn(&turn_id.to_string())? {
                     self.launch_next(&session).await?;
                 }
             }
-            ClientEventKind::RunFailed { run_id, .. } => {
-                if let Some(session) = self.mappings.finish_run(&run_id.to_string())? {
+            ClientEventKind::TurnFailed { turn_id, .. } => {
+                if let Some(session) = self.mappings.finish_turn(&turn_id.to_string())? {
                     self.launch_next(&session).await?;
                 }
             }
@@ -375,7 +376,7 @@ impl<C: Channel> ChannelRuntime<C> {
         let Some((pending_id, external_id, text, metadata)) = self.mappings.next(session)? else {
             return Ok(());
         };
-        let run = self
+        let turn = self
             .requests
             .start_turn_idempotent(
                 format!(
@@ -402,7 +403,7 @@ impl<C: Channel> ChannelRuntime<C> {
             )
             .await?;
         self.mappings
-            .mark_started(pending_id, session, &run.id.to_string())?;
+            .mark_started(pending_id, session, &turn.id.to_string())?;
         Ok(())
     }
 }

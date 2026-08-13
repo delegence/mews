@@ -12,8 +12,7 @@ use serde_json::{Value, json};
 
 use super::builtins::{Bash, Edit, Read, Write};
 use super::extensions::{
-    ExtensionManifest, ExternalHook, ExternalTool, extension_manifests, resource_fingerprint,
-    runtime_extensions,
+    ExtensionManifest, ExternalHook, ExternalTool, resource_fingerprint, runtime_extensions,
 };
 
 #[async_trait]
@@ -41,13 +40,11 @@ struct RegistryInner {
     hooks: RwLock<Vec<ExternalHook>>,
 }
 
-/// The native `mews` toolset and Host extensions have different owners.
-/// Keeping them separate lets external Harnesses receive only extensions over
-/// MCP, while the native Harness continues to use both sets directly.
+/// Native tools are shared; extension tools and hooks are owned by one Agent.
 #[derive(Clone, Default)]
 struct Tools {
     native: BTreeMap<String, Arc<dyn Tool>>,
-    extensions: BTreeMap<String, Arc<dyn Tool>>,
+    extensions: BTreeMap<(String, String), Arc<dyn Tool>>,
 }
 
 impl Default for ToolRegistry {
@@ -73,9 +70,8 @@ impl ToolRegistry {
         registry
     }
 
-    /// Loads executable tool manifests from `<MEWS_HOME>/tools`. A Host owns
-    /// this directory; the Hub only sees the resulting catalog.
-    pub fn with_host_extensions(root: &Path) -> Result<Self> {
+    /// Loads extensions owned by Agents under `<MEWS_HOME>/agents/*/extensions`.
+    pub fn with_agent_extensions(root: &Path) -> Result<Self> {
         let mut registry = Self::with_defaults();
         Arc::get_mut(&mut registry.inner)
             .expect("new registry is unique")
@@ -88,7 +84,7 @@ impl ToolRegistry {
         self.inner.root.as_deref()
     }
 
-    pub async fn watch_host_extensions(&self, root: PathBuf) {
+    pub async fn watch_agent_extensions(&self, root: PathBuf) {
         let mut fingerprint = String::new();
         loop {
             // A short-lived in-process Host owns one watcher; let it finish
@@ -107,8 +103,8 @@ impl ToolRegistry {
     }
 
     fn reload_extensions(&self, root: &Path) -> Result<()> {
-        let mut tools = extension_manifests(root)?;
         let extensions = runtime_extensions(root)?;
+        let mut tools = BTreeMap::new();
         for extension in &extensions {
             for tool in &extension.tools {
                 let manifest = ExtensionManifest {
@@ -117,8 +113,16 @@ impl ToolRegistry {
                     command: extension.command.clone(),
                     schema: tool.schema.clone(),
                     envelope: true,
+                    agent_id: extension.agent_id.clone(),
                 };
-                if tools.insert(manifest.name.clone(), manifest).is_some() {
+                let agent_id = extension
+                    .agent_id
+                    .clone()
+                    .context("extension has no Agent ID")?;
+                if tools
+                    .insert((agent_id.to_string(), manifest.name.clone()), manifest)
+                    .is_some()
+                {
                     bail!("duplicate extension tool name");
                 }
             }
@@ -128,6 +132,7 @@ impl ToolRegistry {
             .into_iter()
             .flat_map(|extension| {
                 extension.hooks.into_iter().map(move |hook| ExternalHook {
+                    agent_id: extension.agent_id.clone().expect("validated Agent ID"),
                     extension: extension.name.clone(),
                     command: extension.command.clone(),
                     hook,
@@ -139,6 +144,7 @@ impl ToolRegistry {
 
     pub async fn execute_hooks(
         &self,
+        agent_id: &mews_protocol::AgentId,
         hook: &str,
         mut payload: Value,
         cwd: &Path,
@@ -150,7 +156,10 @@ impl ToolRegistry {
             .read()
             .expect("extension hooks poisoned")
             .clone();
-        for extension in hooks.into_iter().filter(|item| item.hook == hook) {
+        for extension in hooks
+            .into_iter()
+            .filter(|item| &item.agent_id == agent_id && item.hook == hook)
+        {
             let input = json!({
                 "type": "hook", "extension": extension.extension, "hook": hook, "payload": payload,
             });
@@ -164,16 +173,16 @@ impl ToolRegistry {
         Ok(payload)
     }
 
-    /// Registers a Host-provided extension. Native MEWS tools are registered
-    /// internally so callers cannot accidentally expose them through MCP.
-    fn register(&self, tool: impl Tool + 'static) {
+    /// Registers an Agent-owned extension tool. Native MEWS tools are kept
+    /// separate so external Harnesses receive only extension tools through MCP.
+    fn register(&self, agent_id: mews_protocol::AgentId, tool: impl Tool + 'static) {
         let name = tool.name().to_owned();
         self.inner
             .tools
             .write()
             .expect("tool registry poisoned")
             .extensions
-            .insert(name, Arc::new(tool));
+            .insert((agent_id.to_string(), name), Arc::new(tool));
         self.publish_catalog();
     }
 
@@ -199,7 +208,10 @@ impl ToolRegistry {
         true
     }
 
-    fn apply_extensions(&self, manifests: BTreeMap<String, ExtensionManifest>) -> Result<()> {
+    fn apply_extensions(
+        &self,
+        manifests: BTreeMap<(String, String), ExtensionManifest>,
+    ) -> Result<()> {
         let candidate = Self::with_defaults();
         for manifest in manifests.into_values() {
             if candidate
@@ -212,7 +224,11 @@ impl ToolRegistry {
             {
                 bail!("extension tool name conflicts with a native MEWS tool");
             }
-            candidate.register(ExternalTool(manifest));
+            let agent_id = manifest
+                .agent_id
+                .clone()
+                .context("extension tool has no Agent owner")?;
+            candidate.register(agent_id, ExternalTool(manifest));
         }
         let definitions = candidate.definitions();
         mews_protocol::encode(mews_protocol::HostToHub::ToolCatalogChanged {
@@ -234,7 +250,7 @@ impl ToolRegistry {
         tools
             .native
             .keys()
-            .chain(tools.extensions.keys())
+            .chain(tools.extensions.keys().map(|(_, name)| name))
             .cloned()
             .collect()
     }
@@ -244,29 +260,41 @@ impl ToolRegistry {
         tools
             .native
             .values()
-            .chain(tools.extensions.values())
             .map(|tool| mews_protocol::ToolDefinition {
                 name: tool.name().to_owned(),
                 description: tool.description().to_owned(),
                 schema: tool.schema(),
+                agent_id: None,
             })
+            .chain(tools.extensions.iter().map(|((agent_id, _), tool)| {
+                mews_protocol::ToolDefinition {
+                    name: tool.name().to_owned(),
+                    description: tool.description().to_owned(),
+                    schema: tool.schema(),
+                    agent_id: Some(agent_id.parse().expect("validated Agent ID")),
+                }
+            }))
             .collect()
     }
 
-    /// Definitions for Host extensions only. External Harnesses receive this
-    /// catalog through the Run-scoped MCP bridge; their native tools remain
-    /// entirely owned by the selected Harness.
-    pub fn extension_definitions(&self) -> Vec<mews_protocol::ToolDefinition> {
+    /// Definitions for one Agent's extensions. External Harnesses receive this
+    /// catalog through the Turn-scoped MCP bridge.
+    pub fn extension_definitions(
+        &self,
+        agent_id: &mews_protocol::AgentId,
+    ) -> Vec<mews_protocol::ToolDefinition> {
         self.inner
             .tools
             .read()
             .expect("tool registry poisoned")
             .extensions
-            .values()
-            .map(|tool| mews_protocol::ToolDefinition {
+            .iter()
+            .filter(|((owner, _), _)| owner == agent_id.as_str())
+            .map(|(_, tool)| mews_protocol::ToolDefinition {
                 name: tool.name().to_owned(),
                 description: tool.description().to_owned(),
                 schema: tool.schema(),
+                agent_id: None,
             })
             .collect()
     }
@@ -281,6 +309,7 @@ impl ToolRegistry {
 
     pub async fn execute(
         &self,
+        agent_id: &mews_protocol::AgentId,
         name: &str,
         arguments: Value,
         cwd: &Path,
@@ -290,7 +319,7 @@ impl ToolRegistry {
             let tools = self.inner.tools.read().expect("tool registry poisoned");
             tools
                 .extensions
-                .get(name)
+                .get(&(agent_id.to_string(), name.to_owned()))
                 .or_else(|| tools.native.get(name))
                 .with_context(|| format!("Host does not provide tool {name:?}"))?
                 .clone()
@@ -305,6 +334,14 @@ mod tests {
     use crate::tools::process::MAX_OUTPUT;
     use tokio::fs;
 
+    fn agent_replica(root: &Path, slug: &str) -> mews_protocol::AgentId {
+        let agent_id = mews_protocol::AgentId::new();
+        let directory = root.join("agents").join(slug);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(".agent-id"), agent_id.as_str()).unwrap();
+        agent_id
+    }
+
     #[tokio::test]
     async fn edit_refuses_ambiguous_changes() {
         let directory = tempfile::tempdir().unwrap();
@@ -315,6 +352,7 @@ mod tests {
         assert!(
             tools
                 .execute(
+                    &mews_protocol::AgentId::new(),
                     "edit",
                     json!({"path":"a.txt","old_text":"same","new_text":"x"}),
                     directory.path(),
@@ -344,6 +382,7 @@ mod tests {
 
         let result = tools
             .execute(
+                &mews_protocol::AgentId::new(),
                 "bash",
                 json!({"command":"printf ok","timeout_seconds":null}),
                 Path::new("."),
@@ -361,6 +400,7 @@ mod tests {
         let tools = ToolRegistry::with_defaults();
         let result = tools
             .execute(
+                &mews_protocol::AgentId::new(),
                 "bash",
                 json!({
                     "command":"(yes o | head -c 70000) & (yes e | head -c 70000 >&2) & wait",
@@ -381,22 +421,32 @@ mod tests {
     #[tokio::test]
     async fn extension_output_limit_terminates_the_process_group() {
         let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join("tools");
-        std::fs::create_dir(&directory).unwrap();
+        let agent_id = agent_replica(root.path(), "coder");
+        let directory = root.path().join("agents/coder/extensions");
+        std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(
             directory.join("noisy.toml"),
             r#"name = "noisy"
-description = "Exceed the output contract"
 command = ["sh", "-c", "yes x | head -c 70000; sleep 30"]
+
+[[tools]]
+name = "noisy"
+description = "Exceed the output contract"
 schema = { type = "object" }
 "#,
         )
         .unwrap();
-        let tools = ToolRegistry::with_host_extensions(root.path()).unwrap();
+        let tools = ToolRegistry::with_agent_extensions(root.path()).unwrap();
 
         let result = tokio::time::timeout(
             Duration::from_secs(3),
-            tools.execute("noisy", json!({}), root.path(), &CancellationToken::new()),
+            tools.execute(
+                &agent_id,
+                "noisy",
+                json!({}),
+                root.path(),
+                &CancellationToken::new(),
+            ),
         )
         .await
         .expect("the output limit should stop the sleeping process");
@@ -419,7 +469,9 @@ schema = { type = "object" }
             "sleep 30 & child=$!; printf %s $child > {}; wait",
             pid_path.display()
         );
+        let agent_id = mews_protocol::AgentId::new();
         let execution = tools.execute(
+            &agent_id,
             "bash",
             json!({"command":command,"timeout_seconds":30}),
             directory.path(),
@@ -462,8 +514,9 @@ schema = { type = "object" }
     #[tokio::test]
     async fn cancellation_stops_extension_hook_descendants() {
         let root = tempfile::tempdir().unwrap();
-        let extensions = root.path().join("extensions");
-        std::fs::create_dir(&extensions).unwrap();
+        let agent_id = agent_replica(root.path(), "coder");
+        let extensions = root.path().join("agents/coder/extensions");
+        std::fs::create_dir_all(&extensions).unwrap();
         let pid_path = root.path().join("hook-descendant.pid");
         let executable = root.path().join("hook.sh");
         std::fs::write(
@@ -486,10 +539,15 @@ hooks = ["before_model"]
         )
         .unwrap();
 
-        let registry = ToolRegistry::with_host_extensions(root.path()).unwrap();
+        let registry = ToolRegistry::with_agent_extensions(root.path()).unwrap();
         let cancellation = CancellationToken::new();
-        let execution =
-            registry.execute_hooks("before_model", json!({}), root.path(), &cancellation);
+        let execution = registry.execute_hooks(
+            &agent_id,
+            "before_model",
+            json!({}),
+            root.path(),
+            &cancellation,
+        );
         tokio::pin!(execution);
         let descendant = loop {
             tokio::select! {
@@ -528,6 +586,7 @@ hooks = ["before_model"]
 
         let error = ToolRegistry::with_defaults()
             .execute(
+                &mews_protocol::AgentId::new(),
                 "bash",
                 json!({"command":command,"timeout_seconds":1}),
                 directory.path(),
@@ -563,6 +622,7 @@ hooks = ["before_model"]
 
         let error = ToolRegistry::with_defaults()
             .execute(
+                &mews_protocol::AgentId::new(),
                 "read",
                 json!({"path":"large.txt"}),
                 directory.path(),
@@ -574,90 +634,11 @@ hooks = ["before_model"]
     }
 
     #[tokio::test]
-    async fn host_extension_manifest_loads_and_executes() {
+    async fn runtime_extension_authority_survives_an_agent_rename() {
         let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join("tools");
-        std::fs::create_dir(&directory).unwrap();
-        std::fs::write(
-            directory.join("hello.toml"),
-            r#"name = "hello"
-description = "Return a JSON greeting"
-command = ["sh", "-c", "printf '{\"hello\":true}'"]
-schema = { type = "object" }
-"#,
-        )
-        .unwrap();
-        let tools = ToolRegistry::with_host_extensions(root.path()).unwrap();
-        assert!(tools.names().contains(&"hello".to_owned()));
-        assert_eq!(
-            tools
-                .execute("hello", json!({}), root.path(), &CancellationToken::new(),)
-                .await
-                .unwrap(),
-            json!({"hello": true})
-        );
-    }
-
-    #[tokio::test]
-    async fn extension_catalog_excludes_native_mews_tools() {
-        let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join("tools");
-        std::fs::create_dir(&directory).unwrap();
-        std::fs::write(
-            directory.join("hello.toml"),
-            r#"name = "hello"
-description = "Return a JSON greeting"
-command = ["sh", "-c", "printf '{\"hello\":true}'"]
-schema = { type = "object" }
-"#,
-        )
-        .unwrap();
-
-        let registry = ToolRegistry::with_host_extensions(root.path()).unwrap();
-        let extensions: Vec<_> = registry
-            .extension_definitions()
-            .into_iter()
-            .map(|tool| tool.name)
-            .collect();
-        assert_eq!(extensions, ["hello"]);
-        assert!(
-            registry
-                .definitions()
-                .iter()
-                .any(|tool| tool.name == "read")
-        );
-        assert_eq!(
-            registry
-                .execute("hello", json!({}), root.path(), &CancellationToken::new(),)
-                .await
-                .unwrap(),
-            json!({"hello": true})
-        );
-    }
-
-    #[test]
-    fn extensions_cannot_shadow_native_mews_tools() {
-        let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join("tools");
-        std::fs::create_dir(&directory).unwrap();
-        std::fs::write(
-            directory.join("read.toml"),
-            r#"name = "read"
-description = "Attempt to replace the native read tool"
-command = ["true"]
-schema = { type = "object" }
-"#,
-        )
-        .unwrap();
-
-        assert!(ToolRegistry::with_host_extensions(root.path()).is_err());
-    }
-
-    #[tokio::test]
-    async fn runtime_extension_registers_tools_and_runs_hooks() {
-        let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join("extensions");
-        std::fs::create_dir(&directory).unwrap();
+        let agent_id = agent_replica(root.path(), "coder");
+        let directory = root.path().join("agents/coder/extensions");
+        std::fs::create_dir_all(&directory).unwrap();
         let executable = root.path().join("extension.sh");
         std::fs::write(
             &executable,
@@ -685,12 +666,18 @@ schema = {{ type = "object" }}
             ),
         )
         .unwrap();
+        std::fs::rename(
+            root.path().join("agents/coder"),
+            root.path().join("agents/renamed"),
+        )
+        .unwrap();
 
-        let registry = ToolRegistry::with_host_extensions(root.path()).unwrap();
+        let registry = ToolRegistry::with_agent_extensions(root.path()).unwrap();
         assert!(registry.names().contains(&"example_tool".to_owned()));
         assert_eq!(
             registry
                 .execute(
+                    &agent_id,
                     "example_tool",
                     json!({}),
                     root.path(),
@@ -703,6 +690,7 @@ schema = {{ type = "object" }}
         assert_eq!(
             registry
                 .execute_hooks(
+                    &agent_id,
                     "before_tool",
                     json!({}),
                     root.path(),
@@ -711,6 +699,20 @@ schema = {{ type = "object" }}
                 .await
                 .unwrap(),
             json!({"changed": true})
+        );
+        let other = mews_protocol::AgentId::new();
+        assert!(registry.extension_definitions(&other).is_empty());
+        assert!(
+            registry
+                .execute(
+                    &other,
+                    "example_tool",
+                    json!({}),
+                    root.path(),
+                    &CancellationToken::new(),
+                )
+                .await
+                .is_err()
         );
     }
 }

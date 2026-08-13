@@ -88,7 +88,7 @@ async fn serve_hub_host_once(
                     trusted_remote_signing_key: &accepted.host.public_key,
                     local_noise: &hub_noise,
                     expected_remote_noise_key: Some(&accepted.host.noise_public_key),
-                    stream_id: &stream,
+                    subject_id: &stream,
                 },
             ),
         )
@@ -154,11 +154,11 @@ async fn serve_hub_host_once(
     let dispatch_root = root.to_path_buf();
     let dispatch_host = Arc::clone(&connected);
     let dispatch_runtime = Arc::clone(&runtime);
-    serve_client_requests(client_rx, peer_out, move |request| {
+    serve_client_requests(client_rx, peer_out, move |request_id, request| {
         let root = dispatch_root.clone();
         let host = Arc::clone(&dispatch_host);
         let runtime = Arc::clone(&dispatch_runtime);
-        async move { dispatch_host_request(&runtime, &root, &host, request).await }
+        async move { dispatch_host_request(&runtime, &root, &host, &request_id, request).await }
     })
     .await?;
     let mut hosts = remote_hosts.lock().await;
@@ -177,7 +177,7 @@ async fn serve_client_requests<F, Fut>(
     dispatch: F,
 ) -> Result<()>
 where
-    F: Fn(HubRequest) -> Fut + Clone + 'static,
+    F: Fn(mews_protocol::RequestId, HubRequest) -> Fut + Clone + 'static,
     Fut: Future<Output = HubResponse> + 'static,
 {
     const MAX_CONCURRENT_REQUESTS: usize = 16;
@@ -196,10 +196,11 @@ where
                 let responses = responses.clone();
                 let dispatch = dispatch.clone();
                 requests.spawn_local(async move {
+                    let body = dispatch(request_id.clone(), request).await;
                     responses
                         .send(PeerEnvelope::ClientResponse {
                             request_id,
-                            body: dispatch(request).await,
+                            body,
                         })
                         .await
                 });
@@ -216,6 +217,7 @@ async fn dispatch_host_request(
     runtime: &HubRuntime,
     root: &Path,
     host: &ConnectedHost,
+    request_id: &mews_protocol::RequestId,
     request: HubRequest,
 ) -> HubResponse {
     if let Some(error) = remote_origin_error(&request) {
@@ -225,7 +227,15 @@ async fn dispatch_host_request(
         Ok(request) => request,
         Err(error) => return HubResponse::Error(protocol_error(&error)),
     };
-    match dispatch(runtime, root, RequestOrigin::Host(host), request).await {
+    match dispatch(
+        runtime,
+        root,
+        RequestOrigin::Host(host),
+        request_id,
+        request,
+    )
+    .await
+    {
         Ok((response, false)) => response,
         Ok((_, true)) => unreachable!("Host-origin requests cannot stop the Hub"),
         Err(error) => HubResponse::Error(protocol_error(&error)),
@@ -294,7 +304,7 @@ mod tests {
                 let scheduler = serve_client_requests(request_rx, response_tx, {
                     let active = Arc::clone(&active);
                     let peak = Arc::clone(&peak);
-                    move |request| {
+                    move |_request_id, request| {
                         let active = Arc::clone(&active);
                         let peak = Arc::clone(&peak);
                         async move {

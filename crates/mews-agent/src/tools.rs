@@ -58,6 +58,7 @@ mod tests {
         let catalog = ToolCatalog::compile(vec![ToolDefinition {
             name: "read".into(),
             description: "read".into(),
+            agent_id: None,
             schema: json!({
                 "type": "object",
                 "properties": {"path": {"type": "string"}},

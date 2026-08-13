@@ -554,10 +554,11 @@ fn messages(messages: &[crate::ModelMessage], model: &str, oauth: bool) -> Resul
                 call_id,
                 result,
                 is_error,
+                uncertain,
                 ..
             } => (
                 "user",
-                json!({"type":"tool_result","tool_use_id":call_id,"content":serde_json::to_string(result)?,"is_error":is_error}),
+                json!({"type":"tool_result","tool_use_id":call_id,"content":serde_json::to_string(&mews_agent::tool_result_for_model(result, *is_error, *uncertain))?,"is_error":is_error}),
             ),
             MessageContent::ProviderState {
                 provider,
@@ -691,6 +692,7 @@ mod tests {
                         tool: "read".into(),
                         result: json!({"content":"hello"}),
                         is_error: false,
+                        uncertain: false,
                     },
                 },
             ],
@@ -710,6 +712,7 @@ mod tests {
             ]}),
             "claude-test",
             &[mews_protocol::ToolDefinition {
+                agent_id: None,
                 name: "write".into(),
                 description: "write".into(),
                 schema: json!({}),

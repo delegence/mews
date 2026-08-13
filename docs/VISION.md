@@ -83,7 +83,7 @@ This avoids workspace replication, hidden project copies, and a second filesyste
 One Hub generation is the canonical authority for an installation. It owns:
 
 - Agent identities and revisions;
-- Sessions, Messages, Runs, and durable events;
+- authoritative Sessions, Messages, Turns, and their audit journal;
 - enrolled Host records and installation authority;
 - model credentials and Hub configuration;
 - handoff state needed to move Hub safely.
@@ -108,7 +108,7 @@ A Session permanently captures:
 - one Host;
 - one canonical working directory;
 - its selected model override, if any;
-- ordered Messages and Runs.
+- ordered Messages and Turns.
 
 New Agent invocations create new Sessions by default. Resuming is explicit. An existing Session always routes back to its bound Host and directory, even when the request originates from another machine or a channel adapter.
 
@@ -123,11 +123,11 @@ The built-in `mews` Harness is intentionally small: it sends the Agent's instruc
 - `edit`
 - `bash`
 
-This is the useful default, not a closed world. The default Agent allowlist also permits eligible executable extensions installed by the selected Host.
+This is the useful default, not a closed world. The default Agent allowlist also permits tools registered by that Agent's executable extensions on the selected Host.
 
 Models are replaceable at runtime. An Agent has a default model, and a Session may override it without changing the Agent. Provider authentication belongs to Hub state so it follows Hub movement.
 
-Tools are provided by the selected Host. The effective catalog is the intersection of what the Agent permits and what that Host currently offers. Hosts can add, replace, or remove executable extensions while running. MEWS publishes the catalog change without embedding every possible integration into the core.
+Tools execute on the selected Host. The effective catalog is the intersection of what the Agent permits, the built-ins, and tools registered by that Agent's extensions on that Host. Agent extensions can be added, replaced, or removed while running; MEWS publishes the scoped catalog change without embedding every possible integration into the core.
 
 Harnesses are replaceable as well. A different Harness may implement another model loop, context strategy, approval policy, or memory system while preserving the same Agent, Session, Host, and tool primitives.
 
@@ -140,7 +140,7 @@ The Agent runtime must not be coupled to one interface. MEWS should support:
 - Slack, Telegram, WhatsApp, and similar channels;
 - purpose-built applications and automations.
 
-These are clients of a small protocol, not hardcoded Hub features. A reusable client runtime should handle durable Run submission, event replay, and external-conversation-to-Session mapping. Each concrete channel owns platform-specific behavior and credentials.
+These are clients of a small protocol, not hardcoded Hub features. A reusable client runtime should handle durable Turn submission, event replay, and external-conversation-to-Session mapping. Each concrete channel owns platform-specific behavior and credentials.
 
 Adapters may attach bounded metadata and authenticated source attribution to user messages. A Telegram adapter, for example, can include the sender, chat, thread, reply, and platform message identifiers. The adapter decides what constitutes a conversation and whether it creates or resumes a Session. The Harness decides how relevant metadata is presented to the model. Hub stores it durably without understanding Telegram.
 
@@ -161,7 +161,7 @@ MEWS exposes a few stable boundaries:
 - protocol types for clients and Hosts;
 - model providers;
 - Harness implementations;
-- Host tools and executable extensions;
+- built-in tools and Agent-scoped executable extensions;
 - channel clients;
 - relay transport.
 
@@ -181,7 +181,7 @@ Hosts, working directories, Session resumption, model selection, and channel map
 
 ### Durable where it matters
 
-Agent definitions, Sessions, Messages, Runs, client events, enrollment, and Hub movement survive restarts. Transient transport state can be reconstructed.
+Agent definitions, Sessions, Messages, Turns, client events, enrollment, and Hub movement survive restarts. Transient transport state can be reconstructed.
 
 ### Minimal but complete
 

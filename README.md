@@ -1,6 +1,6 @@
 # MEWS
 
-MEWS is a home for durable AI agents.
+MEWS is a platform for creating durable AI agents.
 
 One **Hub** owns canonical Agent definitions, model credentials, sessions, and history.
 A **Host** is any connected machine (including the machine running Hub), that provides harnesses, tools and a filesystem.
@@ -59,9 +59,9 @@ mews agents list
 mews agents new <slug> [--harness <name>] [--option <key=value>]...
 mews agents rename <slug> <new-slug>
 mews agents delete <slug>
-mews agents <slug> -p <message>
+mews agents <slug> -p <message> [--detach]
 mews sessions list
-mews sessions <id> ask <message>
+mews sessions <id> -p <message> [--detach]
 mews hosts list
 mews hosts invite
 mews hosts remove <host>
@@ -76,12 +76,35 @@ mews providers logout <provider>
 mews providers models
 mews providers models update
 mews providers reasoning
+mews journal list [--after <position>] [--limit <count>] [filters...]
+mews journal watch [--after <position>] [--limit <count>] [filters...]
 mews status
 ```
 
-`mews-protocol` owns stable IDs, domain DTOs, and the serialized Hub/Host contracts; `mews-store` owns the concrete SQLite schema and persistence invariants; `mews-relay` owns the stateless relay protocol, client, and server; `mews-router` is the separately running local model gateway and owns model adapters, auth storage, and token refresh. On first start, the router creates an owner-only `auth.json` and imports any supported provider keys from its environment; the file moves with Hub. Setup and Agent authoring do not require credentials, but starting a Run requires a configured model. Use `mews providers login` to select an OAuth provider, or `mews providers set-key openai|anthropic|google` to set an API key directly. Anthropic login opens its browser-based PKCE authorization and listens on `localhost:54545` for the callback. Adding credentials attempts to refresh that provider's cached model catalog. `mews providers models` and `mews providers reasoning` select installation defaults, which are copied into newly created native `mews` Agents. Existing native Agents without an explicit model or reasoning option continue to inherit the current installation default. `mews providers models update` forces a catalog refresh. Optional reasoning values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`, translated to the provider's native controls. Choose Provider default to omit reasoning and use the model's default behavior. `mews agents coder` opens a line-oriented chat; each invocation creates a new Session, while `mews sessions <id>` explicitly resumes one from any machine and routes work to its bound Host.
+`mews journal list` reads one JSON page from the audit journal. `mews journal
+watch` follows it as newline-delimited JSON pages. Both commands use an exclusive
+journal-position `--after` cursor, so pass a page's `cursor` back as `--after` to
+resume without duplicating its last entry. Pages contain the next scanned cursor
+even when filters exclude intervening entries.
 
-`mews-client` provides the typed local-daemon API. `mews-channel` is an optional reusable runtime for external-conversation adapters: it persists mappings locally, starts asynchronous Runs through its machine's daemon, and consumes acknowledged durable Hub events. Concrete channel implementations remain outside the core workspace until one is needed.
+Journal queries can be narrowed with `--subject-type <type>`, `--subject-id <id>`,
+`--event-type <type>` (repeatable), `--session <id>`, and
+`--correlation <id>`. `--limit` controls matching entries per page (1–500, default
+100). For example:
+
+```sh
+mews journal list --session ses_... --event-type user_message_appended
+mews journal watch --after 420 --correlation request-...
+```
+
+SQLite state tables are authoritative. Each semantic mutation writes its state,
+typed journal entries, durable delivery rows, and optional idempotency receipt in
+one transaction. The journal supports audit and ordered queries; it is not used
+to rebuild state.
+
+`mews-protocol` owns stable IDs, domain DTOs, and the serialized Hub/Host contracts; `mews-store` owns the concrete SQLite schema and persistence invariants; `mews-relay` owns the stateless relay protocol, client, and server; `mews-router` is the separately running local model gateway and owns model adapters, auth storage, and token refresh. On first start, the router creates an owner-only `auth.json` and imports any supported provider keys from its environment; the file moves with Hub. Setup and Agent authoring do not require credentials, but starting a Turn requires a configured model. Use `mews providers login` to select an OAuth provider, or `mews providers set-key openai|anthropic|google` to set an API key directly. Anthropic login opens its browser-based PKCE authorization and listens on `localhost:54545` for the callback. Adding credentials attempts to refresh that provider's cached model catalog. `mews providers models` and `mews providers reasoning` select installation defaults, which are copied into newly created native `mews` Agents. Existing native Agents without an explicit model or reasoning option continue to inherit the current installation default. `mews providers models update` forces a catalog refresh. Optional reasoning values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`, translated to the provider's native controls. Choose Provider default to omit reasoning and use the model's default behavior. `mews agents coder` opens a line-oriented chat; each invocation creates a new Session, while `mews sessions <id>` explicitly resumes one from any machine and routes work to its bound Host.
+
+`mews-client` provides the typed local-daemon API. `mews-channel` is an optional reusable runtime for external-conversation adapters: it persists mappings locally, starts asynchronous Turns through its machine's daemon, and consumes acknowledged durable Hub events. Concrete channel implementations remain outside the core workspace until one is needed.
 
 The development database schema is intentionally migration-free. Run
 `mise run mews:reset` after a breaking schema change when using the project-local
@@ -93,7 +116,7 @@ For the built-in `mews` Harness, `/model <provider/model>` switches the model fo
 
 MEWS supports these Harness choices:
 
-- `mews` is the built-in model-and-tool Harness. It supplies the four built-in tools and, under the default `tools = ["*"]` allowlist, also exposes eligible tools installed by the selected Host. Its currently bundled model providers are `openai` (API key), `openai-codex` (ChatGPT/Codex OAuth), `anthropic` (OAuth or API key), and `google` (Gemini Developer API key).
+- `mews` is the built-in model-and-tool Harness. It supplies the four built-in tools and, under the default `tools = ["*"]` allowlist, also exposes tools registered by the selected Agent's extensions. Its currently bundled model providers are `openai` (API key), `openai-codex` (ChatGPT/Codex OAuth), `anthropic` (OAuth or API key), and `google` (Gemini Developer API key).
 - `mews harnesses setup` opens the same Harness selection wizard used by initial setup. `codex` and `claude` are managed ACP Harness recipes; `mews harnesses setup <name>` remains available as a shortcut for one Harness.
 - Bring your own ACP Harness by adding a trusted Host-local ACP definition under `<MEWS_HOME>/harnesses/*.toml` and running `mews harnesses setup <name>`. A Harness must support persistent Session continuation before MEWS can run it.
 
@@ -101,15 +124,13 @@ Harness setup, credentials, and executable definitions are Host-local. Agent rev
 
 The agent stack is deliberately split into brains and hands. `mews-agent` is the complete reusable harness API: streamed model/tool state machine, context/tool/hook contracts, cancellation, progress, queues, and lifecycle events. `mews-runtime` connects the native Harness to durable conversation state, `mews-acp` owns external ACP process/session/MCP behavior, and `mews-host` supplies concrete filesystem, process, resource, extension, tool, and Harness-recipe capabilities. Local and remote Hosts implement the same `AgentCapabilities` interface. Agent revisions default to parallel tools; set `tool_execution = "sequential"` in `agent.toml` when calls must not overlap.
 
-Each Host can add executable tools at runtime with `<MEWS_HOME>/tools/*.toml`. The Host daemon detects additions, replacements, and removals; Hub receives only the catalog and invokes the executable on that Host. See the architecture document for the tiny manifest/stdin/stdout contract.
-
 The built-in `mews` Harness discovers Agent Skills from
 `<MEWS_HOME>/agents/<agent-slug>/skills/` and ancestor `.agents/skills/`. Project Skills
 override same-named Agent Skills. Prompt templates are discovered from
 `<MEWS_HOME>/prompts/` and ancestor `.agents/prompts/`. Invoke a prompt with `/name arguments`. Unsandboxed runtime
-extensions in `<MEWS_HOME>/extensions/*.toml` can register tools and handle the
-native Harness lifecycle hooks; they hot-reload and run with the Host user's authority. ACP
-Harnesses receive run-scoped extension tools through MCP when they support it. ACP runs also
+extensions in `<MEWS_HOME>/agents/<agent-slug>/extensions/*.toml` can register tools and handle the
+native Harness lifecycle hooks for that Agent; they hot-reload and run with the Host user's authority. ACP
+Harnesses receive turn-scoped extension tools through MCP when they support it. ACP turns also
 receive only a snapshot of the selected Agent's skills through `mews_list_skills` and
 `mews_read_skill`; project/global skills are not exposed. One private endpoint supports both
 legacy MCP through `2025-11-25` and stateless MCP `2026-07-28`, selected from the client's wire
@@ -154,7 +175,7 @@ Automatic TLS and non-Unix local transports are outside the initial product.
 - Agent definitions synchronize; project files do not.
 - Invocations create new Sessions by default; there is no cross-session memory or implicit continuity.
 - Project `AGENTS.md` files provide directory-specific instructions, while `SOUL.md` defines Agent identity.
-- Effective tools are the intersection of an Agent allowlist and the selected Host's live tool catalog.
+- Effective tools are the intersection of an Agent allowlist, the built-ins, and that Agent's live extension-tool catalog.
 - Clients and adapters may attach bounded JSON metadata; Hub preserves it and Harnesses decide how to present it to models.
 - Remote connectivity uses a stateless, end-to-end-encrypted MEWS relay, not a general-purpose VPN.
 

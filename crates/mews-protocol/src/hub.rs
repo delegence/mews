@@ -5,11 +5,12 @@ use serde_json::Value;
 
 use crate::{
     Agent, AuthCredential, AuthStatus, ConsumerId, ConsumerKind, EventBatch, HostHarnessStatus,
-    HostId, HostStatus, Installation, Message, MessageSource, ModelInfo, ProviderDefaults,
-    ReasoningEffort, Run, RunId, Session, SessionEntry, SessionId, SessionModelConfig,
+    HostId, HostStatus, Installation, JournalEntry, JournalEventType, JournalSubjectType, Message,
+    MessageSource, ModelInfo, ProviderDefaults, ReasoningEffort, Session, SessionEntry, SessionId,
+    SessionModelConfig, Turn, TurnId,
 };
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_HUB_FRAME_BYTES: usize = 1024 * 1024;
 /// Reserved for the response tag, request ID, and JSON envelope around a
 /// paginated transcript or event response. Exact JSON overhead varies by item,
@@ -18,8 +19,10 @@ pub const HUB_PAGE_ENVELOPE_RESERVE_BYTES: usize = 256 * 1024;
 /// Page bodies fit inside a Hub frame with room for their serialized envelope.
 pub const MAX_SESSION_PAGE_PAYLOAD_BYTES: usize =
     MAX_HUB_FRAME_BYTES - HUB_PAGE_ENVELOPE_RESERVE_BYTES;
-/// Event pages use the same frame budget as transcript pages.
+/// Client delivery event pages use the same frame budget as transcript pages.
 pub const MAX_EVENT_PAGE_PAYLOAD_BYTES: usize = MAX_SESSION_PAGE_PAYLOAD_BYTES;
+/// Journal pages use the same frame budget as transcript pages.
+pub const MAX_JOURNAL_PAGE_PAYLOAD_BYTES: usize = MAX_SESSION_PAGE_PAYLOAD_BYTES;
 /// Every stored timeline item must fit in a page by itself.
 pub const MAX_SESSION_ITEM_BYTES: usize = 700 * 1024;
 /// ACP session IDs are opaque provider identifiers, not payload containers.
@@ -167,11 +170,11 @@ pub enum HubRequest {
         #[serde(default)]
         source: Option<MessageSource>,
     },
-    GetRun {
-        id: RunId,
+    GetTurn {
+        id: TurnId,
     },
-    CancelRun {
-        id: RunId,
+    CancelTurn {
+        id: TurnId,
     },
     SubscribeSession {
         consumer_id: ConsumerId,
@@ -196,6 +199,14 @@ pub enum HubRequest {
     AcknowledgeEvents {
         consumer_id: ConsumerId,
         checkpoint: u64,
+    },
+    QueryJournalEntries {
+        query: JournalQuery,
+    },
+    PollJournalEntries {
+        query: JournalQuery,
+        #[serde(default)]
+        wait_ms: u32,
     },
     ListHosts,
     ListHarnesses,
@@ -223,8 +234,9 @@ pub enum HubResponse {
     SessionHistory(SessionHistoryPage),
     SessionEntries(SessionEntriesPage),
     SessionModelConfig(SessionModelConfig),
-    Run(Run),
+    Turn(Turn),
     Events(EventBatch),
+    JournalEntries(JournalPage),
     Hosts(Vec<HostStatus>),
     Harnesses(Vec<HostHarnessStatus>),
     Auth(Vec<AuthStatus>),
@@ -245,6 +257,55 @@ pub struct SessionHistoryPage {
 pub struct SessionEntriesPage {
     pub entries: Vec<SessionEntry>,
     pub next: Option<u64>,
+}
+
+/// Filters over the audit journal. All populated fields are ANDed;
+/// `event_types` is an OR-set within that conjunction.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JournalFilter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_type: Option<JournalSubjectType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_types: Vec<JournalEventType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JournalQuery {
+    /// Exclusive journal cursor: only positions greater than `after` are read.
+    #[serde(default)]
+    pub after: u64,
+    #[serde(default = "default_event_limit")]
+    pub limit: u16,
+    #[serde(default)]
+    pub filter: JournalFilter,
+}
+
+impl Default for JournalQuery {
+    fn default() -> Self {
+        Self {
+            after: 0,
+            limit: default_event_limit(),
+            filter: JournalFilter::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JournalPage {
+    pub entries: Vec<JournalEntry>,
+    /// The last journal position scanned, including filtered-out entries.
+    pub cursor: u64,
+    /// Another entry matching this page's filter exists after `cursor`.
+    pub has_more: bool,
 }
 
 fn default_page_limit() -> u16 {
@@ -322,7 +383,7 @@ mod tests {
         let encoded = encode_hub_frame(&Frame::with_request_id(HubRequest::Status, id)).unwrap();
         assert_eq!(
             String::from_utf8(encoded).unwrap(),
-            r#"{"protocol":1,"request_id":"req_0198f73b-9c31-7c01-8000-000000000000","body":{"type":"status"}}"#
+            r#"{"protocol":2,"request_id":"req_0198f73b-9c31-7c01-8000-000000000000","body":{"type":"status"}}"#
         );
     }
 
@@ -334,7 +395,38 @@ mod tests {
         .unwrap();
         assert_eq!(
             encoded,
-            r#"{"type":"error","data":{"code":"unsupported_version","message":"protocol version 2 is incompatible with version 1; restart the MEWS daemon","retryable":false}}"#
+            r#"{"type":"error","data":{"code":"unsupported_version","message":"protocol version 3 is incompatible with version 2; restart the MEWS daemon","retryable":false}}"#
+        );
+    }
+
+    #[test]
+    fn journal_entry_query_has_an_exclusive_cursor_and_stable_filters() {
+        let query = JournalQuery {
+            after: 41,
+            limit: 25,
+            filter: JournalFilter {
+                subject_type: Some(JournalSubjectType::Session),
+                subject_id: Some("ses_0198f73b-9c31-7c01-8000-000000000000".into()),
+                event_types: vec![JournalEventType::TurnCompleted],
+                session_id: Some("ses_0198f73b-9c31-7c01-8000-000000000000".parse().unwrap()),
+                correlation_id: Some("request-1".into()),
+            },
+        };
+        let encoded = serde_json::to_value(HubRequest::QueryJournalEntries {
+            query: query.clone(),
+        })
+        .unwrap();
+
+        assert_eq!(encoded["type"], "query_journal_entries");
+        assert_eq!(encoded["query"]["after"], 41);
+        assert_eq!(encoded["query"]["filter"]["subject_type"], "session");
+        assert_eq!(
+            encoded["query"]["filter"]["event_types"][0],
+            "turn_completed"
+        );
+        let decoded: HubRequest = serde_json::from_value(encoded).unwrap();
+        assert!(
+            matches!(decoded, HubRequest::QueryJournalEntries { query: decoded } if decoded == query)
         );
     }
 
@@ -348,7 +440,7 @@ mod tests {
     #[test]
     fn incompatible_versions_are_typed_errors() {
         let frame = Frame {
-            protocol: 2,
+            protocol: PROTOCOL_VERSION + 1,
             request_id: crate::RequestId::new(),
             body: HubRequest::Status,
         };

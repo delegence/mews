@@ -111,7 +111,7 @@ pub(super) async fn capture(
     };
 
     let result = tokio::select! {
-        _ = cancellation.cancelled() => Err(anyhow::anyhow!("agent run cancelled")),
+        _ = cancellation.cancelled() => Err(anyhow::anyhow!("agent Turn cancelled")),
         result = timeout(duration, operation) => match result {
             Ok(result) => result,
             Err(_) => Err(anyhow::anyhow!("tool process timed out")),

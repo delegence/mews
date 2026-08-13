@@ -114,7 +114,7 @@ pub(super) fn install_adapter(root: &Path, adapter: &Adapter) -> Result<()> {
         }
     }
 
-    // Runs are started by a service manager whose PATH may not contain the
+    // Turns are started by a service manager whose PATH may not contain the
     // Node used during setup. Pin the interpreter alongside the managed
     // adapter instead of relying on its `#!/usr/bin/env node` shebang.
     let node = command_path("node").context("Node.js is required to run managed ACP adapters")?;

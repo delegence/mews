@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use async_trait::async_trait;
 use mews_protocol::ToolDefinition;
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,9 @@ pub struct ToolCall {
 pub struct ToolResult {
     pub value: Value,
     pub is_error: bool,
+    /// The effect may have happened, but no definitive result was observed.
+    #[serde(default)]
+    pub uncertain: bool,
     #[serde(default)]
     pub terminate: bool,
 }
@@ -35,6 +38,7 @@ impl ToolResult {
         Self {
             value,
             is_error: false,
+            uncertain: false,
             terminate: false,
         }
     }
@@ -42,6 +46,16 @@ impl ToolResult {
         Self {
             value: Value::String(error.to_string()),
             is_error: true,
+            uncertain: false,
+            terminate: false,
+        }
+    }
+
+    pub fn uncertain(reason: impl ToString) -> Self {
+        Self {
+            value: Value::String(reason.to_string()),
+            is_error: true,
+            uncertain: true,
             terminate: false,
         }
     }
@@ -75,12 +89,12 @@ pub struct ResourceDescriptor {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LifecycleHook {
-    RunStart,
+    TurnStart,
     BeforeModel,
     BeforeTool,
     AfterTool,
-    AfterTurn,
-    RunEnd,
+    AfterStep,
+    TurnEnd,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -116,11 +130,49 @@ impl CancellationToken {
     }
     pub fn check(&self) -> Result<()> {
         if self.is_cancelled() {
-            bail!("agent run cancelled")
+            Err(TurnCancelled.into())
         } else {
             Ok(())
         }
     }
+}
+
+/// Typed cooperative cancellation marker. Callers should inspect the error
+/// chain rather than classifying cancellation from display text.
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+#[error("agent Turn cancelled")]
+pub struct TurnCancelled;
+
+pub fn is_turn_cancelled(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<TurnCancelled>().is_some()
+        || matches!(
+            error.downcast_ref::<crate::ProviderError>(),
+            Some(crate::ProviderError::Cancelled)
+        )
+}
+
+/// Marks failures after a remote effect was dispatched but before its outcome
+/// could be observed. Retrying such an effect automatically may duplicate it.
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("effect outcome is uncertain: {reason}")]
+pub struct EffectUncertain {
+    reason: String,
+}
+
+impl EffectUncertain {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+pub fn effect_uncertainty(error: &anyhow::Error) -> Option<&EffectUncertain> {
+    error.downcast_ref::<EffectUncertain>()
 }
 
 #[async_trait(?Send)]
@@ -136,14 +188,15 @@ pub trait AgentCapabilities: Send + Sync {
         Ok(None)
     }
     fn tools(&self) -> Vec<ToolDefinition>;
-    /// Host extensions are distinct from the native MEWS tools. External
-    /// Harnesses receive only this catalog through the run-scoped MCP bridge.
+    /// Agent extensions are distinct from the native MEWS tools. External
+    /// Harnesses receive only the selected Agent's catalog through MCP.
     /// Returning no tools by default is intentionally least-authority.
-    fn extension_tools(&self) -> Vec<ToolDefinition> {
+    fn extension_tools(&self, _agent_id: &mews_protocol::AgentId) -> Vec<ToolDefinition> {
         Vec::new()
     }
     async fn execute(
         &self,
+        agent_id: &mews_protocol::AgentId,
         call: &ToolCall,
         cwd: &Path,
         cancellation: &CancellationToken,
@@ -151,11 +204,35 @@ pub trait AgentCapabilities: Send + Sync {
     ) -> Result<ToolResult>;
     async fn hook(
         &self,
+        agent_id: &mews_protocol::AgentId,
         hook: LifecycleHook,
         payload: Value,
         cwd: &Path,
         cancellation: &CancellationToken,
     ) -> Result<Value>;
+}
+
+pub const UNCERTAIN_EFFECT_INSTRUCTION: &str = "The external effect may have happened, but its outcome could not be observed. Do not retry automatically; ask the user before repeating the operation.";
+
+/// Keeps errors explicit when a provider-specific protocol has no native
+/// result-status field. Successful values retain their existing shape.
+pub fn tool_result_for_model(value: &Value, is_error: bool, uncertain: bool) -> Value {
+    if uncertain {
+        serde_json::json!({
+            "outcome": "uncertain",
+            "is_error": is_error,
+            "reason": value,
+            "instruction": UNCERTAIN_EFFECT_INSTRUCTION,
+        })
+    } else if is_error {
+        serde_json::json!({
+            "outcome": "error",
+            "is_error": true,
+            "error": value,
+        })
+    } else {
+        value.clone()
+    }
 }
 
 #[cfg(test)]
@@ -179,6 +256,34 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), token.cancelled())
             .await
             .expect("cancellation is sticky");
-        assert!(token.check().is_err());
+        let error = token.check().unwrap_err();
+        assert!(is_turn_cancelled(&error));
+    }
+
+    #[test]
+    fn provider_cancellation_uses_the_same_classification() {
+        let error =
+            anyhow::Error::from(crate::ProviderError::Cancelled).context("provider stream failed");
+        assert!(is_turn_cancelled(&error));
+    }
+
+    #[test]
+    fn provider_replay_preserves_ordinary_results_and_marks_uncertainty() {
+        let success = serde_json::json!({"value": 7});
+        assert_eq!(tool_result_for_model(&success, false, false), success);
+
+        let ordinary = tool_result_for_model(&serde_json::json!("denied"), true, false);
+        assert_eq!(ordinary["outcome"], "error");
+        assert_eq!(ordinary["error"], "denied");
+
+        let uncertain = tool_result_for_model(&serde_json::json!("reply lost"), true, true);
+        assert_eq!(uncertain["outcome"], "uncertain");
+        assert_eq!(uncertain["is_error"], true);
+        assert!(
+            uncertain["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("Do not retry automatically")
+        );
     }
 }

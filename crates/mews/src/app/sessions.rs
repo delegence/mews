@@ -1,6 +1,14 @@
 use super::*;
 
 impl Mews {
+    pub(crate) async fn expand_prompt(
+        host: &dyn AgentCapabilities,
+        cwd: &Path,
+        prompt: &str,
+    ) -> Result<String> {
+        expand_prompt(host, cwd, prompt).await
+    }
+
     pub fn session_history(&self, session_id: &crate::SessionId) -> Result<Vec<crate::Message>> {
         self.store.active_messages(session_id).map_err(Into::into)
     }
@@ -36,9 +44,23 @@ impl Mews {
         &self,
         session: &crate::Session,
     ) -> Result<crate::SessionModelConfig> {
+        let agent = self
+            .store
+            .agents()?
+            .into_iter()
+            .find(|agent| agent.id == session.agent_id)
+            .context("Session Agent no longer exists")?;
         let revision = self
             .store
-            .agent_revision(&session.agent_id, session.agent_revision)?;
+            .agent_revision(&session.agent_id, agent.current_revision)?;
+        self.session_model_config_for_revision(session, &revision)
+    }
+
+    pub(crate) fn session_model_config_for_revision(
+        &self,
+        session: &crate::Session,
+        revision: &crate::AgentRevision,
+    ) -> Result<crate::SessionModelConfig> {
         let config = crate::AgentConfig::parse(&revision.config_toml)?;
         if config.harness != mews_runtime::MEWS_HARNESS {
             return Ok(crate::SessionModelConfig {
@@ -78,7 +100,9 @@ impl Mews {
             reasoning,
         })
     }
+}
 
+impl MewsCommands<'_> {
     pub async fn ask(
         &mut self,
         slug: &str,
@@ -104,8 +128,23 @@ impl Mews {
         cwd: &Path,
         host: &dyn HostExecutor,
     ) -> Result<Session> {
+        let agent = self.synchronize_agent_on(slug, host).await?;
+        let cwd = host.attest_directory(cwd).await?;
+        Ok(self
+            .mews
+            .store
+            .create_session(&agent.id, host.host_id(), &cwd)?)
+    }
+
+    /// Reconcile the Hub and selected Host replicas before a Turn snapshots
+    /// the Agent revision it will execute.
+    pub async fn synchronize_agent_on(
+        &mut self,
+        slug: &str,
+        host: &dyn HostExecutor,
+    ) -> Result<Agent> {
         let agent = self.synchronize_agent(slug)?;
-        self.store.host(host.host_id())?;
+        self.mews.store.host(host.host_id())?;
         let mut agent = agent;
         let current = self
             .store
@@ -115,7 +154,10 @@ impl Mews {
             if replica.revision > current.revision {
                 bail!("Host agent replica is newer than Hub");
             }
-            let base = self.store.agent_revision(&agent.id, replica.revision)?;
+            let base = self
+                .mews
+                .store
+                .agent_revision(&agent.id, replica.revision)?;
             let edited = replica.soul.trim_end() != base.soul.trim_end()
                 || replica.config_toml != base.config_toml;
             if replica.revision < current.revision && edited {
@@ -125,14 +167,15 @@ impl Mews {
                 crate::AgentConfig::parse(&replica.config_toml)?
                     .validate()
                     .map_err(anyhow::Error::msg)?;
-                self.store.update_agent(
+                self.mews.store.update_agent(
+                    &self.context,
                     &agent.id,
                     current.revision,
                     replica.soul.trim_end(),
                     &replica.config_toml,
                     host.host_id(),
                 )?;
-                agent = self.store.agent_by_slug(slug)?;
+                agent = self.mews.store.agent_by_slug(slug)?;
             }
         }
         let revision = self
@@ -140,10 +183,11 @@ impl Mews {
             .agent_revision(&agent.id, agent.current_revision)?;
         host.synchronize_agent(&agent, &revision, observed_replica.as_ref(), None)
             .await?;
-        let cwd = host.attest_directory(cwd).await?;
-        Ok(self.store.create_session(&agent.id, host.host_id(), &cwd)?)
+        Ok(agent)
     }
+}
 
+impl Mews {
     pub fn session(&self, id: &crate::SessionId) -> Result<Session> {
         Ok(self.store.session(id)?)
     }
@@ -158,7 +202,7 @@ impl Mews {
             .context("Session Agent no longer exists")?;
         let revision = self
             .store
-            .agent_revision(&agent.id, session.agent_revision)?;
+            .agent_revision(&agent.id, agent.current_revision)?;
         let config = crate::AgentConfig::parse(&revision.config_toml)?;
         if config.harness != mews_runtime::MEWS_HARNESS {
             bail!("Session model overrides are only supported by the native mews Harness");
@@ -167,7 +211,7 @@ impl Mews {
     }
 }
 
-pub(super) async fn expand_prompt(
+pub(crate) async fn expand_prompt(
     host: &dyn AgentCapabilities,
     cwd: &Path,
     prompt: &str,

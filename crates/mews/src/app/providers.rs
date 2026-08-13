@@ -1,6 +1,6 @@
 use super::*;
 
-impl Mews {
+impl MewsCommands<'_> {
     pub async fn set_api_key(&self, provider: &str, key: String) -> Result<()> {
         Ok(mews_router::RouterClient::new(&self.root)
             .set_api_key(provider.to_owned(), key)
@@ -40,7 +40,7 @@ impl Mews {
     }
 
     pub fn provider_defaults(&self) -> Result<crate::ProviderDefaults> {
-        Ok(self.store.provider_defaults()?)
+        Ok(self.mews.store.provider_defaults()?)
     }
 
     pub async fn set_default_model(&self, model: &str) -> Result<()> {
@@ -52,7 +52,7 @@ impl Mews {
         {
             bail!("model {model:?} is absent from the catalog");
         }
-        self.store.set_default_model(model)?;
+        self.mews.store.set_default_model(&self.context, model)?;
         Ok(())
     }
 
@@ -82,7 +82,9 @@ impl Mews {
                 bail!("reasoning {reasoning:?} is not supported by {}", model.id);
             }
         }
-        self.store.set_default_reasoning(reasoning)?;
+        self.mews
+            .store
+            .set_default_reasoning(&self.context, reasoning)?;
         Ok(())
     }
 }

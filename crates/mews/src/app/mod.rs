@@ -12,23 +12,43 @@ use mews_relay::{RelayAdmission, RelayPeerId};
 use serde_json::Value;
 
 use crate::{
-    Agent, MessageContent, MessageRole, MessageSource, RunStatus, Session, SourceKind,
+    Agent, MessageContent, MessageSource, Session, SourceKind, TurnStatus,
     host::{ConnectedHost, HostExecutor},
     identity::{HostIdentity, NoiseIdentity},
 };
 use mews_host::ToolRegistry;
-use mews_store::Store;
+use mews_store::{CommandContext, Store};
 
 pub const DEFAULT_SOUL: &str =
     "You are a capable, practical agent. Be concise and use tools when they help.";
 #[cfg(test)]
 pub const DEFAULT_CONFIG: &str = "harness = \"mews\"\ntools = [\"*\"]\n";
 const REVISION_FILE: &str = ".revision";
+const AGENT_ID_FILE: &str = ".agent-id";
 const DATABASE_FILE: &str = "mews.db";
 
 pub struct Mews {
     root: PathBuf,
     store: Store,
+}
+
+/// A short-lived mutation capability with immutable command provenance.
+pub struct MewsCommands<'a> {
+    mews: &'a mut Mews,
+    context: CommandContext,
+}
+
+impl std::ops::Deref for MewsCommands<'_> {
+    type Target = Mews;
+    fn deref(&self) -> &Mews {
+        self.mews
+    }
+}
+
+impl std::ops::DerefMut for MewsCommands<'_> {
+    fn deref_mut(&mut self) -> &mut Mews {
+        self.mews
+    }
 }
 
 pub struct HubSnapshot {
@@ -49,18 +69,93 @@ mod acp;
 mod agents;
 mod core;
 mod handoff;
+mod journal;
 mod native;
 mod providers;
-mod runs;
 mod sessions;
-pub(crate) use runs::StartedRun;
+mod turns;
+pub(crate) use turns::StartedTurn;
 
 #[cfg(test)]
 use sessions::{parse_prompt_arguments, substitute_prompt_arguments};
 
 #[cfg(test)]
+impl Mews {
+    fn test_commands(&mut self) -> MewsCommands<'_> {
+        self.commands(CommandContext::system())
+    }
+
+    pub fn create_agent(&mut self, slug: &str) -> Result<Agent> {
+        self.test_commands().create_agent(slug)
+    }
+
+    pub fn rename_agent(&mut self, slug: &str, new_slug: &str) -> Result<Agent> {
+        self.test_commands().rename_agent(slug, new_slug)
+    }
+
+    pub fn synchronize_agent(&mut self, slug: &str) -> Result<Agent> {
+        self.test_commands().synchronize_agent(slug)
+    }
+
+    pub fn create_invitation(
+        &mut self,
+        relay: Option<&str>,
+    ) -> Result<crate::enrollment::JoinOffer> {
+        self.test_commands().create_invitation(relay)
+    }
+
+    pub async fn set_default_reasoning(
+        &mut self,
+        reasoning: Option<crate::ReasoningEffort>,
+    ) -> Result<()> {
+        self.test_commands().set_default_reasoning(reasoning).await
+    }
+    pub fn command_context(&self) -> CommandContext {
+        CommandContext::system()
+    }
+
+    pub fn create_agent_with_harness(
+        &mut self,
+        slug: &str,
+        harness: &str,
+        options: std::collections::BTreeMap<String, String>,
+    ) -> Result<Agent> {
+        self.test_commands()
+            .create_agent_with_harness(slug, harness, options)
+    }
+
+    pub fn replay_agent_rename(&mut self, slug: &str, new_slug: &str) -> Result<Option<Agent>> {
+        self.test_commands().replay_agent_rename(slug, new_slug)
+    }
+
+    pub async fn start_session(&mut self, slug: &str, cwd: &Path) -> Result<Session> {
+        self.test_commands().start_session(slug, cwd).await
+    }
+    pub fn enroll_host(
+        &mut self,
+        offer: &crate::enrollment::JoinOffer,
+        request: &crate::enrollment::JoinRequest,
+    ) -> Result<crate::Host> {
+        self.test_commands().enroll_host(offer, request)
+    }
+    pub fn begin_hub_move(&mut self, target: &crate::HostId) -> Result<HubSnapshot> {
+        self.test_commands().begin_hub_move(target)
+    }
+    pub fn rollback_hub_move(&mut self, snapshot: &HubSnapshot) -> Result<()> {
+        self.test_commands().rollback_hub_move(snapshot)
+    }
+    pub fn demoted_host_state(
+        &mut self,
+        target: &crate::HostId,
+    ) -> Result<crate::enrollment::join::JoinedHostState> {
+        self.test_commands().demoted_host_state(target)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use mews_protocol::MessageRole;
 
     #[test]
     fn setup_places_keys_in_the_secrets_directory() {
@@ -83,8 +178,9 @@ mod tests {
     #[test]
     fn invitation_uses_configured_relay_by_default() {
         let root = tempfile::tempdir().unwrap();
-        let mews = Mews::setup(root.path(), "laptop").unwrap();
-        mews.set_relay_url("ws://laptop.local:8787").unwrap();
+        let mut mews = Mews::setup(root.path(), "laptop").unwrap();
+        mews.set_relay_url(&CommandContext::system(), "ws://laptop.local:8787")
+            .unwrap();
 
         let offer = mews.create_invitation(None).unwrap();
 
@@ -95,9 +191,11 @@ mod tests {
     fn new_agents_copy_the_installation_provider_defaults() {
         let root = tempfile::tempdir().unwrap();
         let mut mews = Mews::setup(root.path(), "laptop").unwrap();
-        mews.store.set_default_model("openai/gpt-test").unwrap();
         mews.store
-            .set_default_reasoning(Some(crate::ReasoningEffort::High))
+            .set_default_model(&mews.command_context(), "openai/gpt-test")
+            .unwrap();
+        mews.store
+            .set_default_reasoning(&mews.command_context(), Some(crate::ReasoningEffort::High))
             .unwrap();
         let agent = mews.create_agent("coder").unwrap();
         let config = crate::AgentConfig::parse(
@@ -151,7 +249,7 @@ mod tests {
         assert!(error.to_string().contains("use Provider default instead"));
 
         mews.store
-            .set_default_reasoning(Some(crate::ReasoningEffort::Auto))
+            .set_default_reasoning(&mews.command_context(), Some(crate::ReasoningEffort::Auto))
             .unwrap();
         let error = mews.create_agent("coder").unwrap_err();
         assert!(error.to_string().contains("use Provider default instead"));
@@ -227,14 +325,64 @@ mod tests {
     }
 
     #[test]
-    fn synchronizing_an_agent_preserves_its_local_skills() {
+    fn rename_retry_finishes_a_file_move_after_the_database_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let mut mews = Mews::setup(root.path(), "laptop").unwrap();
+        mews.create_agent("coder").unwrap();
+
+        let context = CommandContext::new("rename-request", mews_protocol::EventActor::system());
+        let committed = mews
+            .store
+            .rename_agent(&context, "coder", "builder")
+            .unwrap();
+
+        let replayed = mews
+            .commands(context)
+            .replay_agent_rename("coder", "builder")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(replayed, committed);
+        assert!(!root.path().join("agents/coder").exists());
+        assert!(root.path().join("agents/builder").exists());
+    }
+
+    #[test]
+    fn rename_retry_replays_after_the_file_move() {
+        let root = tempfile::tempdir().unwrap();
+        let mut mews = Mews::setup(root.path(), "laptop").unwrap();
+        mews.create_agent("coder").unwrap();
+
+        let context = CommandContext::new("rename-request", mews_protocol::EventActor::system());
+        let committed = mews
+            .commands(context.clone())
+            .rename_agent("coder", "builder")
+            .unwrap();
+
+        let replayed = mews
+            .commands(context)
+            .replay_agent_rename("coder", "builder")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(replayed, committed);
+    }
+
+    #[test]
+    fn synchronizing_an_agent_preserves_its_local_resources() {
         let root = tempfile::tempdir().unwrap();
         let mut mews = Mews::setup(root.path(), "laptop").unwrap();
         mews.create_agent("coder").unwrap();
         std::fs::create_dir_all(root.path().join("agents/coder/skills/review")).unwrap();
+        std::fs::create_dir_all(root.path().join("agents/coder/extensions")).unwrap();
         std::fs::write(
             root.path().join("agents/coder/skills/review/SKILL.md"),
             "skill",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("agents/coder/extensions/policy.toml"),
+            "name = 'policy'\ncommand = ['true']\n",
         )
         .unwrap();
         std::fs::remove_file(root.path().join("agents/coder/SOUL.md")).unwrap();
@@ -246,13 +394,20 @@ mod tests {
                 .unwrap(),
             "skill"
         );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("agents/coder/extensions/policy.toml"))
+                .unwrap(),
+            "name = 'policy'\ncommand = ['true']\n"
+        );
     }
 
     #[test]
     fn new_agents_preserve_the_requested_harness_and_its_options() {
         let root = tempfile::tempdir().unwrap();
         let mut mews = Mews::setup(root.path(), "laptop").unwrap();
-        mews.store.set_default_model("openai/gpt-test").unwrap();
+        mews.store
+            .set_default_model(&mews.command_context(), "openai/gpt-test")
+            .unwrap();
         let agent = mews
             .create_agent_with_harness(
                 "coder",
@@ -308,7 +463,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agents_can_be_authored_without_a_provider_but_runs_explain_setup() {
+    async fn agents_can_be_authored_without_a_provider_but_turns_explain_setup() {
         let root = tempfile::tempdir().unwrap();
         let mut mews = Mews::setup(root.path(), "laptop").unwrap();
         mews.create_agent("coder").unwrap();
@@ -328,7 +483,9 @@ mod tests {
         assert!(error.contains("mews providers login"));
         assert!(mews.store.messages(&session.id).unwrap().is_empty());
 
-        mews.store.set_default_model("openai/gpt-test").unwrap();
+        mews.store
+            .set_default_model(&mews.command_context(), "openai/gpt-test")
+            .unwrap();
         assert_eq!(
             mews.session_model_config(&session)
                 .unwrap()
@@ -349,6 +506,7 @@ mod tests {
             .unwrap();
         mews.store
             .update_agent(
+                &mews.command_context(),
                 &agent.id,
                 current.revision,
                 &current.soul,

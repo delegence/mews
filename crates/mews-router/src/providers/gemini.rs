@@ -134,13 +134,14 @@ fn messages(messages: &[crate::ModelMessage], target_model: &str) -> Vec<Value> 
                     call_id,
                     tool,
                     result,
-                    ..
+                    is_error,
+                    uncertain,
                 } => json!({
                     "role": "user",
                     "parts": [{"functionResponse": {
                         "id": call_id,
                         "name": tool,
-                        "response": {"result": result},
+                        "response": {"result": mews_agent::tool_result_for_model(result, *is_error, *uncertain)},
                     }}],
                 }),
                 MessageContent::ProviderState {
@@ -310,6 +311,7 @@ mod tests {
                     tool: "read".into(),
                     result: json!({"content": "hello"}),
                     is_error: false,
+                    uncertain: false,
                 },
             }],
             "gemini-test",
@@ -439,6 +441,7 @@ mod tests {
                     content: MessageContent::Text { text: "Hi".into() },
                 }],
                 tools: vec![ToolDefinition {
+                    agent_id: None,
                     name: "bash".into(),
                     description: "Run a command".into(),
                     schema: json!({

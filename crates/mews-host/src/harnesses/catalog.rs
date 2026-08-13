@@ -520,8 +520,9 @@ async fn probe_descriptor(
             }
             if built_in && !profile_is_authenticated(root, &name) {
                 descriptor.availability.authentication = HarnessReadiness::Required;
-                descriptor.availability.detail =
-                    Some("managed profile authentication is required before Runs may start".into());
+                descriptor.availability.detail = Some(
+                    "managed profile authentication is required before Turns may start".into(),
+                );
             }
             descriptor
         }

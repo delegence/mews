@@ -3,8 +3,8 @@
 use anyhow::{Result, bail};
 use mews_protocol::{
     Agent, AuthStatus, EventBatch, HostHarnessStatus, HostStatus, HubResponse, Installation,
-    ModelInfo, ProviderDefaults, Run, Session, SessionEntriesPage, SessionHistoryPage,
-    SessionModelConfig,
+    JournalPage, ModelInfo, ProviderDefaults, Session, SessionEntriesPage, SessionHistoryPage,
+    SessionModelConfig, Turn,
 };
 
 macro_rules! expect {
@@ -26,8 +26,9 @@ expect!(session, Session, Session);
 expect!(session_history, SessionHistory, SessionHistoryPage);
 expect!(session_entries, SessionEntries, SessionEntriesPage);
 expect!(session_model_config, SessionModelConfig, SessionModelConfig);
-expect!(run, Run, Run);
+expect!(turn, Turn, Turn);
 expect!(events, Events, EventBatch);
+expect!(journal_entries, JournalEntries, JournalPage);
 expect!(hosts, Hosts, Vec<HostStatus>);
 expect!(harnesses, Harnesses, Vec<HostHarnessStatus>);
 expect!(auth, Auth, Vec<AuthStatus>);

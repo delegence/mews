@@ -5,7 +5,7 @@ use std::{
 
 use crate::ModelMessage;
 
-/// Thread-safe inboxes for messages that arrive while an agent run is active.
+/// Thread-safe inboxes for messages that arrive while an agent Turn is active.
 /// Runtimes can drain these from `steering_messages` and `follow_up_messages`.
 #[derive(Clone, Default)]
 pub struct MessageQueue {

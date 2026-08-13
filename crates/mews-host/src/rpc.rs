@@ -70,6 +70,7 @@ pub async fn handle_execution_request(
         }
         HubToHost::ExecuteTool {
             request_id,
+            agent_id,
             tool,
             arguments,
             canonical_cwd,
@@ -84,7 +85,7 @@ pub async fn handle_execution_request(
                 let cancellation = cancellation
                     .ok_or_else(|| anyhow::anyhow!("tool request has no cancellation scope"))?;
                 registry
-                    .execute(tool, arguments.clone(), &resolved, cancellation)
+                    .execute(agent_id, tool, arguments.clone(), &resolved, cancellation)
                     .await
             }
             .await;
@@ -101,6 +102,7 @@ pub async fn handle_execution_request(
         HubToHost::CancelTool { .. } => return None,
         HubToHost::ExecuteHook {
             request_id,
+            agent_id,
             hook,
             payload,
             canonical_cwd,
@@ -113,7 +115,7 @@ pub async fn handle_execution_request(
                 let cancellation = cancellation
                     .ok_or_else(|| anyhow::anyhow!("hook request has no cancellation scope"))?;
                 registry
-                    .execute_hooks(hook, payload.clone(), &resolved, cancellation)
+                    .execute_hooks(agent_id, hook, payload.clone(), &resolved, cancellation)
                     .await
             }
             .await;

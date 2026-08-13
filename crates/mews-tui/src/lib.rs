@@ -107,13 +107,13 @@ fn render_history(agent: &str, messages: Vec<Message>, colors: &Colors) {
         }
         match message.content {
             MessageContent::ToolCall { tool, .. } => {
-                println!("{}· calling {tool}{}", colors.activity, colors.reset);
+                println!("{}◇ calling {tool}{}", colors.activity, colors.reset);
             }
             MessageContent::ToolResult { tool, is_error, .. } => {
                 let (marker, color, outcome) = if is_error {
                     ("×", colors.error, "failed")
                 } else {
-                    ("·", colors.activity, "completed")
+                    ("◇", colors.activity, "completed")
                 };
                 println!("{color}{marker} {tool} {outcome}{}", colors.reset);
             }
@@ -184,7 +184,7 @@ async fn send_interactive_subscribed(
     prompt: String,
     consumer: mews_client::ConsumerId,
 ) -> Result<String> {
-    let run = client
+    let turn = client
         .start_turn(
             session.id.clone(),
             prompt,
@@ -196,7 +196,6 @@ async fn send_interactive_subscribed(
             },
         )
         .await?;
-    let mut answer = String::new();
     let mut thinking = ThinkingIndicator::start();
     let colors = Colors::detect();
     let mut reasoning = String::new();
@@ -204,37 +203,28 @@ async fn send_interactive_subscribed(
     let mut reasoning_visible = false;
     let mut pending_tools = HashMap::new();
     loop {
-        let batch = match client.poll_events(consumer.clone(), 30_000).await {
+        let batch = match client.poll_events(consumer.clone(), 1_000).await {
             Ok(batch) => batch,
             Err(error) => {
                 thinking.stop().await?;
                 return Err(error);
             }
         };
-        let mut finished = false;
-        let mut failure = None;
         let mut display_events = Vec::new();
         for event in &batch.events {
             match &event.kind {
-                mews_client::ClientEventKind::AssistantMessage { message, .. }
-                    if message.session_id == session.id =>
-                {
-                    if let mews_client::MessageContent::Text { text } = &message.content {
-                        answer.push_str(text);
-                    }
-                }
                 mews_client::ClientEventKind::ReasoningDelta {
-                    run_id,
+                    turn_id,
                     delta,
                     message_id,
-                } if *run_id == run.id => {
+                } if *turn_id == turn.id => {
                     display_events.push(DisplayEvent::Reasoning {
                         delta: delta.clone(),
                         message_id: message_id.clone(),
                     });
                 }
-                mews_client::ClientEventKind::ToolActivity { run_id, activity }
-                    if *run_id == run.id =>
+                mews_client::ClientEventKind::ToolActivity { turn_id, activity }
+                    if *turn_id == turn.id =>
                 {
                     if activity.status.as_deref() == Some("failed") {
                         let description = pending_tools
@@ -257,8 +247,8 @@ async fn send_interactive_subscribed(
                             .insert(activity.call_id.clone(), format_acp_activity(activity));
                     }
                 }
-                mews_client::ClientEventKind::ToolStarted { run_id, message }
-                    if *run_id == run.id =>
+                mews_client::ClientEventKind::ToolStarted { turn_id, message }
+                    if *turn_id == turn.id =>
                 {
                     if let mews_client::MessageContent::ToolCall {
                         call_id,
@@ -271,8 +261,8 @@ async fn send_interactive_subscribed(
                             .insert(call_id.clone(), format_tool_activity(tool, arguments));
                     }
                 }
-                mews_client::ClientEventKind::ToolCompleted { run_id, message }
-                    if *run_id == run.id =>
+                mews_client::ClientEventKind::ToolCompleted { turn_id, message }
+                    if *turn_id == turn.id =>
                 {
                     if let mews_client::MessageContent::ToolResult {
                         call_id,
@@ -300,15 +290,6 @@ async fn send_interactive_subscribed(
                             completed_activity(&description),
                         )));
                     }
-                }
-                mews_client::ClientEventKind::RunCompleted { run_id } if *run_id == run.id => {
-                    finished = true;
-                }
-                mews_client::ClientEventKind::RunFailed { run_id, error } if *run_id == run.id => {
-                    failure = Some(error.clone());
-                }
-                mews_client::ClientEventKind::RunCancelled { run_id } if *run_id == run.id => {
-                    failure = Some("Run cancelled".into());
                 }
                 _ => {}
             }
@@ -351,7 +332,7 @@ async fn send_interactive_subscribed(
                     reasoning_message_id = None;
                     match trace {
                         Trace::Activity(activity) => {
-                            println!("{}· {activity}{}", colors.activity, colors.reset)
+                            println!("{}◇ {activity}{}", colors.activity, colors.reset)
                         }
                         Trace::Error(error) => {
                             println!("{}× {error}{}", colors.error, colors.reset)
@@ -361,15 +342,25 @@ async fn send_interactive_subscribed(
                 }
             }
         }
-        if let Some(error) = failure {
-            thinking.stop().await?;
-            commit_reasoning(&mut reasoning, &mut reasoning_visible, &colors)?;
-            anyhow::bail!("Run failed: {error}");
-        }
-        if finished {
-            thinking.stop().await?;
-            commit_reasoning(&mut reasoning, &mut reasoning_visible, &colors)?;
-            return Ok(answer);
+        let current = match client.get_turn(turn.id.clone()).await {
+            Ok(current) => current,
+            Err(error) => {
+                thinking.stop().await?;
+                return Err(error);
+            }
+        };
+        match client.terminal_turn_answer(&current).await {
+            Ok(Some(answer)) => {
+                thinking.stop().await?;
+                commit_reasoning(&mut reasoning, &mut reasoning_visible, &colors)?;
+                return Ok(answer);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                thinking.stop().await?;
+                commit_reasoning(&mut reasoning, &mut reasoning_visible, &colors)?;
+                return Err(error);
+            }
         }
     }
 }

@@ -60,15 +60,16 @@ done
 
     let connected = ConnectedHost::in_process(
         HostId::new(),
-        ToolRegistry::with_host_extensions(host_root.path()).unwrap(),
+        ToolRegistry::with_agent_extensions(host_root.path()).unwrap(),
     )
     .await
     .unwrap();
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(crate::ACP_EVENT_CHANNEL_CAPACITY);
     let cancellation = mews_agent::CancellationToken::new();
-    let run = connected.run_acp(
-        RemoteAcpRun {
+    let turn = connected.execute_acp_turn(
+        RemoteAcpTurn {
+            agent_id: mews_protocol::AgentId::new(),
             harness: "fixture".into(),
             harness_options: Default::default(),
             tools: vec!["*".into()],
@@ -78,7 +79,7 @@ done
             agent_slug: "fixture-agent".into(),
             soul: "fixture soul".into(),
             mews_session_id: "session-fixture".into(),
-            run_id: "run-fixture".into(),
+            turn_id: "turn-fixture".into(),
             transition: mews_protocol::AcpBindingTransition::New,
             context: None,
         },
@@ -124,7 +125,7 @@ done
         };
         (bound, delta)
     };
-    let (answer, (bound, delta)) = tokio::join!(run, events);
+    let (answer, (bound, delta)) = tokio::join!(turn, events);
     let answer = answer.unwrap();
 
     assert_eq!(answer.answer, "remote fixture reply");
@@ -149,6 +150,7 @@ async fn serialized_boundary_executes_and_rechecks_cwd() {
         .unwrap();
     let result = host
         .execute_tool(
+            &mews_protocol::AgentId::new(),
             "read",
             serde_json::json!({"path":"hello.txt"}),
             &cwd.path().canonicalize().unwrap(),
@@ -156,6 +158,162 @@ async fn serialized_boundary_executes_and_rechecks_cwd() {
         .await
         .unwrap();
     assert_eq!(result["content"], "remote content");
+}
+
+#[tokio::test]
+async fn disconnect_after_tool_dispatch_is_an_uncertain_effect() {
+    let (hub_to_host, mut requests) = tokio::sync::mpsc::channel(1);
+    let (host_to_hub, replies) = tokio::sync::mpsc::channel(1);
+    let host = ConnectedHost::from_channels(HostId::new(), Vec::new(), hub_to_host, replies)
+        .await
+        .unwrap();
+    let remote = tokio::spawn(async move {
+        let request = requests.recv().await.expect("tool request");
+        assert!(matches!(request, HubToHost::ExecuteTool { .. }));
+        drop(host_to_hub);
+    });
+
+    let error = host
+        .execute_tool(
+            &mews_protocol::AgentId::new(),
+            "effect",
+            serde_json::json!({}),
+            std::path::Path::new("/"),
+        )
+        .await
+        .unwrap_err();
+    remote.await.unwrap();
+
+    assert!(mews_agent::effect_uncertainty(&error).is_some());
+}
+
+#[tokio::test]
+async fn disconnect_after_hook_dispatch_is_an_uncertain_effect() {
+    let (hub_to_host, mut requests) = tokio::sync::mpsc::channel(1);
+    let (host_to_hub, replies) = tokio::sync::mpsc::channel(1);
+    let host = ConnectedHost::from_channels(HostId::new(), Vec::new(), hub_to_host, replies)
+        .await
+        .unwrap();
+    let remote = tokio::spawn(async move {
+        let request = requests.recv().await.expect("hook request");
+        assert!(matches!(request, HubToHost::ExecuteHook { .. }));
+        drop(host_to_hub);
+    });
+
+    let error = host
+        .execute_hook(
+            &mews_protocol::AgentId::new(),
+            "before_model",
+            serde_json::json!({}),
+            std::path::Path::new("/"),
+            &mews_agent::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    remote.await.unwrap();
+
+    assert!(mews_agent::effect_uncertainty(&error).is_some());
+}
+
+#[tokio::test]
+async fn failure_before_tool_dispatch_is_not_uncertain() {
+    let (hub_to_host, requests) = tokio::sync::mpsc::channel(1);
+    let (_host_to_hub, replies) = tokio::sync::mpsc::channel(1);
+    drop(requests);
+    let host = ConnectedHost::from_channels(HostId::new(), Vec::new(), hub_to_host, replies)
+        .await
+        .unwrap();
+
+    let error = host
+        .execute_tool(
+            &mews_protocol::AgentId::new(),
+            "effect",
+            serde_json::json!({}),
+            std::path::Path::new("/"),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(mews_agent::effect_uncertainty(&error).is_none());
+}
+
+#[tokio::test]
+async fn remote_tool_error_reply_is_definitive() {
+    let (hub_to_host, mut requests) = tokio::sync::mpsc::channel(1);
+    let (host_to_hub, replies) = tokio::sync::mpsc::channel(1);
+    let host = ConnectedHost::from_channels(HostId::new(), Vec::new(), hub_to_host, replies)
+        .await
+        .unwrap();
+    let remote = tokio::spawn(async move {
+        let HubToHost::ExecuteTool { request_id, .. } =
+            requests.recv().await.expect("tool request")
+        else {
+            panic!("expected tool request");
+        };
+        host_to_hub
+            .send(HostToHub::ToolResult {
+                request_id,
+                result: serde_json::Value::Null,
+                error: Some("tool rejected the input".into()),
+            })
+            .await
+            .unwrap();
+    });
+
+    let error = host
+        .execute_tool(
+            &mews_protocol::AgentId::new(),
+            "effect",
+            serde_json::json!({}),
+            std::path::Path::new("/"),
+        )
+        .await
+        .unwrap_err();
+    remote.await.unwrap();
+
+    assert!(mews_agent::effect_uncertainty(&error).is_none());
+    assert_eq!(error.to_string(), "tool rejected the input");
+}
+
+#[tokio::test]
+async fn disconnect_after_acp_dispatch_is_an_uncertain_effect() {
+    let (hub_to_host, mut requests) = tokio::sync::mpsc::channel(1);
+    let (host_to_hub, replies) = tokio::sync::mpsc::channel(1);
+    let host = ConnectedHost::from_channels(HostId::new(), Vec::new(), hub_to_host, replies)
+        .await
+        .unwrap();
+    let remote = tokio::spawn(async move {
+        let request = requests.recv().await.expect("ACP request");
+        assert!(matches!(request, HubToHost::ExecuteAcpTurn { .. }));
+        drop(host_to_hub);
+    });
+    let (events, _event_receiver) = tokio::sync::mpsc::channel(1);
+
+    let error = host
+        .execute_acp_turn(
+            RemoteAcpTurn {
+                agent_id: mews_protocol::AgentId::new(),
+                harness: "fixture".into(),
+                harness_options: Default::default(),
+                tools: Vec::new(),
+                cwd: std::path::PathBuf::from("/"),
+                prompt: "prompt".into(),
+                recovery_prompt: "recovery".into(),
+                agent_slug: "agent".into(),
+                soul: "soul".into(),
+                mews_session_id: "session".into(),
+                turn_id: "turn".into(),
+                transition: mews_protocol::AcpBindingTransition::New,
+                context: None,
+            },
+            events,
+            &mews_agent::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    remote.await.unwrap();
+
+    assert!(mews_agent::effect_uncertainty(&error).is_some());
 }
 
 #[cfg(unix)]
@@ -173,6 +331,7 @@ async fn dropping_remote_tool_request_stops_shell_descendants() {
     );
     let execution = tokio::spawn(async move {
         host.execute_tool(
+            &mews_protocol::AgentId::new(),
             "bash",
             serde_json::json!({"command": command, "timeout_seconds": 30}),
             &cwd,
@@ -229,8 +388,15 @@ async fn cancelling_remote_capability_execution_stops_shell_descendants() {
         thought_signature: None,
     };
     let cwd = directory.path().canonicalize().unwrap();
-    let execution =
-        mews_agent::AgentCapabilities::execute(&host, &call, &cwd, &cancellation, &NoProgress);
+    let agent_id = mews_protocol::AgentId::new();
+    let execution = mews_agent::AgentCapabilities::execute(
+        &host,
+        &agent_id,
+        &call,
+        &cwd,
+        &cancellation,
+        &NoProgress,
+    );
     tokio::pin!(execution);
     let descendant = loop {
         tokio::select! {
@@ -348,6 +514,12 @@ fn host_renames_a_clean_agent_replica_and_retains_one_backup() {
         "skill",
     )
     .unwrap();
+    std::fs::create_dir_all(root.path().join("agents/coder/extensions")).unwrap();
+    std::fs::write(
+        root.path().join("agents/coder/extensions/policy.toml"),
+        "name = 'policy'\ncommand = ['true']\n",
+    )
+    .unwrap();
     let observed = read_agent(root.path(), "coder").unwrap().unwrap();
     let renamed = Agent {
         slug: "builder".into(),
@@ -371,6 +543,10 @@ fn host_renames_a_clean_agent_replica_and_retains_one_backup() {
     assert_eq!(
         std::fs::read_to_string(root.path().join("agents/builder/skills/review/SKILL.md")).unwrap(),
         "skill"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("agents/builder/extensions/policy.toml")).unwrap(),
+        "name = 'policy'\ncommand = ['true']\n"
     );
     let backups = std::fs::read_dir(root.path().join("agents"))
         .unwrap()
@@ -434,7 +610,8 @@ fn host_rejects_rename_when_the_old_replica_changed_after_preflight() {
 fn prepared_hub_requires_the_source_activation_nonce() {
     let hub_root = tempfile::tempdir().unwrap();
     let target_root = tempfile::tempdir().unwrap();
-    let mut mews = mews::app::Mews::setup(hub_root.path(), "laptop").unwrap();
+    let mut state = mews::app::Mews::setup(hub_root.path(), "laptop").unwrap();
+    let mut mews = state.commands(mews_store::CommandContext::system());
     std::fs::write(hub_root.path().join("auth.json"), "{}").unwrap();
     let offer = mews.create_invitation(Some("ws://127.0.0.1:9000")).unwrap();
     let identity =
@@ -513,7 +690,8 @@ fn prepared_hub_requires_the_source_activation_nonce() {
 fn prepared_hub_with_previous_database() -> (tempfile::TempDir, String) {
     let hub_root = tempfile::tempdir().unwrap();
     let target_root = tempfile::tempdir().unwrap();
-    let mut mews = mews::app::Mews::setup(hub_root.path(), "laptop").unwrap();
+    let mut state = mews::app::Mews::setup(hub_root.path(), "laptop").unwrap();
+    let mut mews = state.commands(mews_store::CommandContext::system());
     std::fs::write(hub_root.path().join("auth.json"), "{}").unwrap();
     let offer = mews.create_invitation(Some("ws://127.0.0.1:9000")).unwrap();
     let identity =

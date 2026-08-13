@@ -48,7 +48,7 @@ pub(crate) struct AcpProcess {
     pub(crate) config: AcpHarnessConfig,
 }
 
-/// Keeps process-tree ownership even if the async Run task itself is aborted.
+/// Keeps process-tree ownership even if the async Turn task itself is aborted.
 pub(crate) struct ProcessTreeGuard {
     process_id: Option<u32>,
 }
@@ -120,7 +120,7 @@ pub(crate) async fn terminate_process_tree(child: &mut Child) {
     #[cfg(unix)]
     if let Some(process_id) = child.id() {
         // The ACP child starts a fresh process group, so one signal covers any
-        // descendants it started for this Run.
+        // descendants it started for this Turn.
         unsafe {
             libc::kill(-(process_id as i32), libc::SIGKILL);
         }

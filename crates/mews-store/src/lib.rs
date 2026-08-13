@@ -25,8 +25,8 @@ use mews_protocol::{
     ClientEventKind, ConsumerId, ConsumerKind, EventBatch, EventId, HarnessProvenance, Host,
     HostId, Installation, InstallationId, InvitationId, Message, MessageContent, MessageId,
     MessageRole, MessageSource, ProviderDefaults, ReasoningEffort, ReasoningProvenance,
-    ReasoningVisibility, Run, RunId, RunStatus, Session, SessionEntry, SessionEntryPayload,
-    SessionId, SourceKind, ToolCall, ToolResult,
+    ReasoningVisibility, Session, SessionEntry, SessionEntryPayload, SessionId, SourceKind,
+    ToolCall, ToolResult, Turn, TurnId, TurnStatus,
 };
 
 #[derive(Debug, Error)]
@@ -41,6 +41,10 @@ pub enum StoreError {
     DuplicateAgent(String),
     #[error("agent revision conflict: expected {expected}, current {current}")]
     RevisionConflict { expected: u64, current: u64 },
+    #[error("command {command_id} was already used with a different request")]
+    CommandConflict { command_id: String },
+    #[error("session {session_id} already has active Turn {turn_id}")]
+    ActiveTurnConflict { session_id: String, turn_id: String },
     #[error("session leaf conflict: expected {expected:?}, current {current:?}")]
     LeafConflict {
         expected: Option<MessageId>,
@@ -56,15 +60,19 @@ pub struct Store {
 }
 
 mod agents;
+mod delivery;
 mod events;
 mod hosts;
 mod installation;
-mod runs;
 mod schema;
 mod sessions;
+mod turns;
 mod values;
 
 #[cfg(test)]
 mod tests;
 
 use values::*;
+
+pub use events::*;
+pub use sessions::EffectOutcome;

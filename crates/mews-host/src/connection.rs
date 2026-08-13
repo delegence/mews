@@ -11,8 +11,8 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use crate::ToolRegistry;
 use mews_agent::{
-    AgentCapabilities, CancellationToken, ContextDocument, ContextSnapshot, LifecycleHook,
-    ProgressReporter, ToolCall, ToolResult,
+    AgentCapabilities, CancellationToken, ContextDocument, ContextSnapshot, EffectUncertain,
+    LifecycleHook, ProgressReporter, ToolCall, ToolResult,
 };
 use mews_protocol::{
     AcpEvent, Agent, AgentReplica, AgentRevision, HarnessDescriptor, HostId, HostToHub, HubToHost,
@@ -34,23 +34,34 @@ enum HostReply {
     Harnesses(Vec<HarnessDescriptor>),
     Acp(mews_acp::AcpSessionOutcome),
 }
+
+enum HostReplyError {
+    Definitive(String),
+    Disconnected,
+}
+
+fn definitive<T>(result: Result<T, String>) -> Result<T, HostReplyError> {
+    result.map_err(HostReplyError::Definitive)
+}
+
 struct PendingRequest {
-    reply: oneshot::Sender<Result<HostReply, String>>,
+    reply: oneshot::Sender<Result<HostReply, HostReplyError>>,
     acp_events: Option<mpsc::Sender<AcpEvent>>,
 }
 type PendingRequests = Arc<std::sync::Mutex<HashMap<RequestId, PendingRequest>>>;
 
-pub struct RemoteAcpRun {
+pub struct RemoteAcpTurn {
     pub harness: String,
     pub harness_options: std::collections::BTreeMap<String, String>,
     pub tools: Vec<String>,
     pub cwd: std::path::PathBuf,
     pub prompt: String,
     pub recovery_prompt: String,
+    pub agent_id: mews_protocol::AgentId,
     pub agent_slug: String,
     pub soul: String,
     pub mews_session_id: String,
-    pub run_id: String,
+    pub turn_id: String,
     pub transition: mews_protocol::AcpBindingTransition,
     pub context: Option<mews_protocol::AcpBindingContext>,
 }
@@ -80,9 +91,9 @@ pub trait HostControl: Send + Sync {
     ) -> Result<()>;
     async fn update_relay_candidates(&self, relay_urls: Vec<String>) -> Result<()>;
     async fn refresh_harness_catalog(&self) -> Result<Vec<HarnessDescriptor>>;
-    async fn run_acp(
+    async fn execute_acp_turn(
         &self,
-        run: RemoteAcpRun,
+        turn: RemoteAcpTurn,
         events: mpsc::Sender<AcpEvent>,
         cancellation: &CancellationToken,
     ) -> Result<mews_acp::AcpSessionOutcome>;
@@ -90,7 +101,7 @@ pub trait HostControl: Send + Sync {
 }
 
 /// Composition boundary for a connected Host that provides both control-plane
-/// operations and the neutral execution environment used by agent runs.
+/// operations and the neutral execution environment used by agent turns.
 pub trait HostExecutor: HostControl + AgentCapabilities {
     fn agent_capabilities(&self) -> &dyn AgentCapabilities;
 }
@@ -140,6 +151,7 @@ impl ConnectedHost {
 
     pub(crate) async fn execute_tool(
         &self,
+        agent_id: &mews_protocol::AgentId,
         tool: &str,
         arguments: Value,
         cwd: &Path,
@@ -149,6 +161,7 @@ impl ConnectedHost {
             .request_inner(
                 HubToHost::ExecuteTool {
                     request_id: request_id.clone(),
+                    agent_id: agent_id.clone(),
                     tool: tool.to_owned(),
                     arguments,
                     canonical_cwd: cwd.to_path_buf(),
@@ -159,12 +172,13 @@ impl ConnectedHost {
             .await?
         {
             HostReply::Tool(value) => Ok(value),
-            _ => bail!("Host returned the wrong response type"),
+            _ => Err(EffectUncertain::new("Host returned no definitive tool result").into()),
         }
     }
 
-    async fn execute_hook(
+    pub(crate) async fn execute_hook(
         &self,
+        agent_id: &mews_protocol::AgentId,
         hook: &str,
         payload: Value,
         cwd: &Path,
@@ -175,6 +189,7 @@ impl ConnectedHost {
         let request = self.request_inner(
             HubToHost::ExecuteHook {
                 request_id: request_id.clone(),
+                agent_id: agent_id.clone(),
                 hook: hook.to_owned(),
                 payload,
                 canonical_cwd: cwd.to_path_buf(),
@@ -192,7 +207,7 @@ impl ConnectedHost {
         };
         match reply {
             HostReply::Hook(payload) => Ok(payload),
-            _ => bail!("Host returned the wrong response type"),
+            _ => Err(EffectUncertain::new("Host returned no definitive hook result").into()),
         }
     }
 
@@ -230,7 +245,7 @@ impl ConnectedHost {
         if let Some(root) = registry.root().map(Path::to_path_buf) {
             tokio::spawn({
                 let registry = registry.clone();
-                async move { registry.watch_host_extensions(root).await }
+                async move { registry.watch_agent_extensions(root).await }
             });
         }
         let (hub_sender, host_receiver) = mpsc::channel(32);
@@ -285,7 +300,7 @@ impl ConnectedHost {
                         {
                             let _ = reply
                                 .reply
-                                .send(error.map_or(Ok(HostReply::Configured), Err));
+                                .send(definitive(error.map_or(Ok(HostReply::Configured), Err)));
                         }
                     }
                     HostToHub::Ready { tools, harnesses } => {
@@ -312,9 +327,9 @@ impl ConnectedHost {
                             .expect("Host pending requests poisoned")
                             .remove(&request_id)
                         {
-                            let _ = reply
-                                .reply
-                                .send(error.map_or(Ok(HostReply::Harnesses(harnesses)), Err));
+                            let _ = reply.reply.send(definitive(
+                                error.map_or(Ok(HostReply::Harnesses(harnesses)), Err),
+                            ));
                         }
                     }
                     HostToHub::ToolResult {
@@ -329,7 +344,7 @@ impl ConnectedHost {
                         {
                             let _ = reply
                                 .reply
-                                .send(error.map_or(Ok(HostReply::Tool(result)), Err));
+                                .send(definitive(error.map_or(Ok(HostReply::Tool(result)), Err)));
                         }
                     }
                     HostToHub::HookResult {
@@ -347,7 +362,7 @@ impl ConnectedHost {
                                 (_, Some(error)) => Err(error),
                                 _ => Err("Host returned an empty hook result".into()),
                             };
-                            let _ = reply.reply.send(result);
+                            let _ = reply.reply.send(definitive(result));
                         }
                     }
                     HostToHub::AcpResult {
@@ -382,7 +397,7 @@ impl ConnectedHost {
                                 (_, _, _, _, Some(error)) => Err(error),
                                 _ => Err("Host returned an empty ACP result".into()),
                             };
-                            let _ = pending.reply.send(result);
+                            let _ = pending.reply.send(definitive(result));
                         }
                     }
                     HostToHub::AcpEvent { request_id, event } => {
@@ -411,7 +426,7 @@ impl ConnectedHost {
                                 (_, Some(error)) => Err(error),
                                 _ => Err("Host returned an invalid directory attestation".into()),
                             };
-                            let _ = reply.reply.send(response);
+                            let _ = reply.reply.send(definitive(response));
                         }
                     }
                     HostToHub::AgentSynchronized { request_id, error } => {
@@ -420,9 +435,9 @@ impl ConnectedHost {
                             .expect("Host pending requests poisoned")
                             .remove(&request_id)
                         {
-                            let _ = reply
-                                .reply
-                                .send(error.map_or(Ok(HostReply::AgentSynchronized), Err));
+                            let _ = reply.reply.send(definitive(
+                                error.map_or(Ok(HostReply::AgentSynchronized), Err),
+                            ));
                         }
                     }
                     HostToHub::AgentReplica {
@@ -435,9 +450,9 @@ impl ConnectedHost {
                             .expect("Host pending requests poisoned")
                             .remove(&request_id)
                         {
-                            let _ = reply
-                                .reply
-                                .send(error.map_or(Ok(HostReply::AgentReplica(replica)), Err));
+                            let _ = reply.reply.send(definitive(
+                                error.map_or(Ok(HostReply::AgentReplica(replica)), Err),
+                            ));
                         }
                     }
                     HostToHub::ProjectContext {
@@ -455,7 +470,7 @@ impl ConnectedHost {
                                 (_, Some(error)) => Err(error),
                                 _ => Err("Host returned invalid project context".into()),
                             };
-                            let _ = reply.reply.send(response);
+                            let _ = reply.reply.send(definitive(response));
                         }
                     }
                     HostToHub::Prompt {
@@ -468,9 +483,9 @@ impl ConnectedHost {
                             .expect("Host pending requests poisoned")
                             .remove(&request_id)
                         {
-                            let _ = reply
-                                .reply
-                                .send(error.map_or(Ok(HostReply::Prompt(content)), Err));
+                            let _ = reply.reply.send(definitive(
+                                error.map_or(Ok(HostReply::Prompt(content)), Err),
+                            ));
                         }
                     }
                     HostToHub::HubTransferResult {
@@ -483,9 +498,9 @@ impl ConnectedHost {
                             .expect("Host pending requests poisoned")
                             .remove(&request_id)
                         {
-                            let _ = reply
-                                .reply
-                                .send(error.map_or(Ok(HostReply::HubTransfer(next_offset)), Err));
+                            let _ = reply.reply.send(definitive(
+                                error.map_or(Ok(HostReply::HubTransfer(next_offset)), Err),
+                            ));
                         }
                     }
                     HostToHub::Pong { .. } => {}
@@ -496,7 +511,7 @@ impl ConnectedHost {
                 .expect("Host pending requests poisoned")
                 .drain()
             {
-                let _ = reply.reply.send(Err("Host disconnected".into()));
+                let _ = reply.reply.send(Err(HostReplyError::Disconnected));
             }
         });
         Ok(Self {
@@ -686,28 +701,29 @@ impl HostControl for ConnectedHost {
         }
     }
 
-    async fn run_acp(
+    async fn execute_acp_turn(
         &self,
-        run: RemoteAcpRun,
+        turn: RemoteAcpTurn,
         events: mpsc::Sender<AcpEvent>,
         cancellation: &CancellationToken,
     ) -> Result<mews_acp::AcpSessionOutcome> {
         let request_id = RequestId::new();
         let reply = self.request_with_events(
-            HubToHost::RunAcp {
+            HubToHost::ExecuteAcpTurn {
                 request_id: request_id.clone(),
-                harness: run.harness,
-                harness_options: run.harness_options,
-                tools: run.tools,
-                canonical_cwd: run.cwd,
-                prompt: run.prompt,
-                recovery_prompt: run.recovery_prompt,
-                agent_slug: run.agent_slug,
-                soul: run.soul,
-                mews_session_id: run.mews_session_id,
-                run_id: run.run_id,
-                transition: run.transition,
-                context: run.context,
+                harness: turn.harness,
+                harness_options: turn.harness_options,
+                tools: turn.tools,
+                canonical_cwd: turn.cwd,
+                prompt: turn.prompt,
+                recovery_prompt: turn.recovery_prompt,
+                agent_id: turn.agent_id,
+                agent_slug: turn.agent_slug,
+                soul: turn.soul,
+                mews_session_id: turn.mews_session_id,
+                turn_id: turn.turn_id,
+                transition: turn.transition,
+                context: turn.context,
             },
             events,
         );
@@ -715,16 +731,22 @@ impl HostControl for ConnectedHost {
         let reply = tokio::select! {
             reply = &mut reply => reply?,
             _ = cancellation.cancelled() => {
-                self.sender.send(HubToHost::CancelAcp { request_id }).await
-                    .context("Host disconnected while cancelling ACP Run")?;
-                tokio::time::timeout(std::time::Duration::from_secs(5), reply)
-                    .await
-                    .context("Host did not stop the cancelled ACP Run")??
+                if self.sender.send(HubToHost::CancelAcp { request_id }).await.is_err() {
+                    return Err(EffectUncertain::new(
+                        "Host disconnected while cancelling a dispatched ACP Turn",
+                    ).into());
+                }
+                match tokio::time::timeout(std::time::Duration::from_secs(5), reply).await {
+                    Ok(reply) => reply?,
+                    Err(_) => return Err(EffectUncertain::new(
+                        "Host did not confirm the outcome of the cancelled ACP Turn",
+                    ).into()),
+                }
             }
         };
         match reply {
             HostReply::Acp(answer) => Ok(answer),
-            _ => bail!("Host returned the wrong response type"),
+            _ => Err(EffectUncertain::new("Host returned no definitive ACP outcome").into()),
         }
     }
 
@@ -757,25 +779,30 @@ impl AgentCapabilities for ConnectedHost {
         self.tool_catalog()
     }
 
-    fn extension_tools(&self) -> Vec<mews_agent::ToolDefinition> {
-        // The Host protocol currently publishes one catalog. Its four native
-        // MEWS names are fixed and extensions may not shadow them, so this is
-        // a safe projection until the protocol carries a separate catalog.
+    fn extension_tools(
+        &self,
+        agent_id: &mews_protocol::AgentId,
+    ) -> Vec<mews_agent::ToolDefinition> {
         self.tool_catalog()
             .into_iter()
-            .filter(|tool| !matches!(tool.name.as_str(), "read" | "write" | "edit" | "bash"))
+            .filter(|tool| tool.agent_id.as_ref() == Some(agent_id))
+            .map(|mut tool| {
+                tool.agent_id = None;
+                tool
+            })
             .collect()
     }
 
     async fn execute(
         &self,
+        agent_id: &mews_protocol::AgentId,
         call: &ToolCall,
         cwd: &Path,
         cancellation: &CancellationToken,
         _progress: &dyn ProgressReporter,
     ) -> Result<ToolResult> {
         cancellation.check()?;
-        let execution = self.execute_tool(&call.name, call.arguments.clone(), cwd);
+        let execution = self.execute_tool(agent_id, &call.name, call.arguments.clone(), cwd);
         tokio::pin!(execution);
         let result = tokio::select! {
             result = &mut execution => result?,
@@ -789,20 +816,22 @@ impl AgentCapabilities for ConnectedHost {
 
     async fn hook(
         &self,
+        agent_id: &mews_protocol::AgentId,
         hook: LifecycleHook,
         payload: Value,
         cwd: &Path,
         cancellation: &CancellationToken,
     ) -> Result<Value> {
         let name = match hook {
-            LifecycleHook::RunStart => "run_start",
+            LifecycleHook::TurnStart => "turn_start",
             LifecycleHook::BeforeModel => "before_model",
             LifecycleHook::BeforeTool => "before_tool",
             LifecycleHook::AfterTool => "after_tool",
-            LifecycleHook::AfterTurn => "after_turn",
-            LifecycleHook::RunEnd => "run_end",
+            LifecycleHook::AfterStep => "after_step",
+            LifecycleHook::TurnEnd => "turn_end",
         };
-        self.execute_hook(name, payload, cwd, cancellation).await
+        self.execute_hook(agent_id, name, payload, cwd, cancellation)
+            .await
     }
 }
 
@@ -826,6 +855,12 @@ impl ConnectedHost {
         cancel_tool: Option<RequestId>,
     ) -> Result<HostReply> {
         let request = mews_protocol::decode(&mews_protocol::encode(request)?)?;
+        let uncertain_after_dispatch = matches!(
+            &request,
+            HubToHost::ExecuteTool { .. }
+                | HubToHost::ExecuteHook { .. }
+                | HubToHost::ExecuteAcpTurn { .. }
+        );
         let request_id = match &request {
             HubToHost::ExecuteTool { request_id, .. }
             | HubToHost::ExecuteHook { request_id, .. }
@@ -835,7 +870,7 @@ impl ConnectedHost {
             HubToHost::ReadProjectContext { request_id, .. } => request_id.clone(),
             HubToHost::ReadPrompt { request_id, .. } => request_id.clone(),
             HubToHost::RefreshHarnessCatalog { request_id } => request_id.clone(),
-            HubToHost::RunAcp { request_id, .. } => request_id.clone(),
+            HubToHost::ExecuteAcpTurn { request_id, .. } => request_id.clone(),
             HubToHost::CancelAcp { .. } => {
                 bail!("ACP cancellation is not a correlated Host request")
             }
@@ -879,12 +914,30 @@ impl ConnectedHost {
             request_id,
             armed: true,
         });
-        let result = tokio::time::timeout(std::time::Duration::from_secs(3605), receiver)
-            .await
-            .context("Host request timed out")?
-            .context("Host disconnected before replying")?
-            .map_err(anyhow::Error::msg);
-        if let Some(cancellation) = &mut cancellation {
+        let response = tokio::time::timeout(std::time::Duration::from_secs(3605), receiver).await;
+        let definitive_reply_received = matches!(
+            &response,
+            Ok(Ok(Ok(_))) | Ok(Ok(Err(HostReplyError::Definitive(_))))
+        );
+        let result = match response {
+            Err(_) if uncertain_after_dispatch => {
+                Err(EffectUncertain::new("Host effect request timed out after dispatch").into())
+            }
+            Err(error) => Err(error).context("Host request timed out"),
+            Ok(Err(_)) if uncertain_after_dispatch => Err(EffectUncertain::new(
+                "Host disconnected before replying to the dispatched effect",
+            )
+            .into()),
+            Ok(Err(error)) => Err(error).context("Host disconnected before replying"),
+            Ok(Ok(Err(HostReplyError::Disconnected))) if uncertain_after_dispatch => Err(
+                EffectUncertain::new("Host disconnected before replying to the dispatched effect")
+                    .into(),
+            ),
+            Ok(Ok(Err(HostReplyError::Disconnected))) => bail!("Host disconnected"),
+            Ok(Ok(Err(HostReplyError::Definitive(error)))) => Err(anyhow::Error::msg(error)),
+            Ok(Ok(Ok(reply))) => Ok(reply),
+        };
+        if definitive_reply_received && let Some(cancellation) = &mut cancellation {
             cancellation.armed = false;
         }
         result
@@ -1027,9 +1080,9 @@ async fn serve_host(
                     });
                     continue;
                 }
-                if matches!(message, HubToHost::RunAcp { .. }) {
+                if matches!(message, HubToHost::ExecuteAcpTurn { .. }) {
                     let request_id = match &message {
-                        HubToHost::RunAcp { request_id, .. } => request_id.clone(),
+                        HubToHost::ExecuteAcpTurn { request_id, .. } => request_id.clone(),
                         _ => unreachable!(),
                     };
                     let cancellation = CancellationToken::new();
@@ -1104,7 +1157,7 @@ async fn serve_host(
     }
 }
 
-/// Runs the Host half of the authenticated serialized Host protocol.
+/// Turns the Host half of the authenticated serialized Host protocol.
 pub async fn run_host_rpc(
     mut peer: mews_transport::EncryptedRelayPeer,
     registry: ToolRegistry,

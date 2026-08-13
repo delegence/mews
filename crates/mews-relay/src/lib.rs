@@ -185,7 +185,7 @@ pub struct RelayFrame {
     pub installation_id: InstallationId,
     pub source_id: RelayPeerId,
     pub destination_id: RelayPeerId,
-    pub stream_id: String,
+    pub subject_id: String,
     pub sequence: u64,
     #[serde(with = "base64_bytes")]
     pub ciphertext: Vec<u8>,
@@ -216,12 +216,12 @@ impl RelayFrame {
         installation_id: InstallationId,
         source_id: RelayPeerId,
         destination_id: RelayPeerId,
-        stream_id: impl Into<String>,
+        subject_id: impl Into<String>,
         sequence: u64,
         ciphertext: Vec<u8>,
     ) -> Result<Self, RelayError> {
-        let stream_id = stream_id.into();
-        if stream_id.is_empty() || stream_id.len() > 128 {
+        let subject_id = subject_id.into();
+        if subject_id.is_empty() || subject_id.len() > 128 {
             return Err(RelayError::InvalidStreamId);
         }
         if ciphertext.len() > MAX_CIPHERTEXT_BYTES {
@@ -234,14 +234,14 @@ impl RelayFrame {
             installation_id,
             source_id,
             destination_id,
-            stream_id,
+            subject_id,
             sequence,
             ciphertext,
         })
     }
 
     pub(crate) fn validate(&self) -> Result<(), RelayError> {
-        if self.stream_id.is_empty() || self.stream_id.len() > 128 {
+        if self.subject_id.is_empty() || self.subject_id.len() > 128 {
             return Err(RelayError::InvalidStreamId);
         }
         if self.ciphertext.len() > MAX_CIPHERTEXT_BYTES {

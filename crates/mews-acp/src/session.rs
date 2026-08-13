@@ -15,7 +15,7 @@ use mews_protocol::{
 };
 
 use crate::{
-    mcp::{RunMcpBridge, RunMcpHttp},
+    mcp::{TurnMcpBridge, TurnMcpHttp},
     process::{AcpHarnessConfig, AcpProcess, ProcessTreeGuard, terminate_process_tree},
     rpc::{AcpCancelled, AcpErrorKind, RpcClient, classify_error, is_resource_not_found},
     updates::UpdateState,
@@ -46,6 +46,11 @@ pub struct AcpProbeTimings {
 }
 
 pub enum AcpStreamEvent {
+    /// The `session/prompt` request has been flushed to the Harness stdin.
+    PromptDispatched {
+        event_key: mews_protocol::AcpEventKey,
+        session_id: String,
+    },
     AssistantDelta {
         event_key: mews_protocol::AcpEventKey,
         delta: String,
@@ -102,15 +107,17 @@ fn accepted_event_key() -> mews_protocol::AcpEventKey {
 #[derive(Clone, Debug)]
 pub struct AcpHookMetadata {
     pub mews_session_id: String,
-    pub run_id: String,
+    pub turn_id: String,
     pub harness: String,
     pub context_hash: String,
     pub context_channel: AcpInstructionChannel,
-    pub invoke_run_start: bool,
+    pub invoke_turn_start: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct AcpSessionRequest {
+    pub agent_id: mews_protocol::AgentId,
+    pub agent_slug: String,
     pub transition: AcpBindingTransition,
     pub prompt: String,
     pub recovery_prompt: String,
@@ -162,7 +169,7 @@ where
     }
 }
 
-pub struct AcpRunRequest<'a> {
+pub struct AcpTurnRequest<'a> {
     pub config: AcpHarnessConfig,
     pub cwd: PathBuf,
     pub harness_options: BTreeMap<String, String>,
@@ -173,8 +180,8 @@ pub struct AcpRunRequest<'a> {
     pub events: &'a mut dyn AcpEventSink,
 }
 
-pub async fn run_acp_session(request: AcpRunRequest<'_>) -> Result<AcpSessionOutcome> {
-    let AcpRunRequest {
+pub async fn execute_acp_turn(request: AcpTurnRequest<'_>) -> Result<AcpSessionOutcome> {
+    let AcpTurnRequest {
         config,
         cwd,
         harness_options,
@@ -185,7 +192,7 @@ pub async fn run_acp_session(request: AcpRunRequest<'_>) -> Result<AcpSessionOut
         events,
     } = request;
     let mut emit = |event| events.emit(event);
-    run_acp_session_inner(
+    execute_acp_turn_inner(
         config,
         cwd,
         harness_options,
@@ -199,7 +206,7 @@ pub async fn run_acp_session(request: AcpRunRequest<'_>) -> Result<AcpSessionOut
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_acp_session_inner(
+async fn execute_acp_turn_inner(
     mut config: AcpHarnessConfig,
     cwd: PathBuf,
     harness_options: BTreeMap<String, String>,
@@ -211,19 +218,21 @@ async fn run_acp_session_inner(
 ) -> Result<AcpSessionOutcome> {
     let replacement_config = config.clone();
     let replacement_session = session.clone();
+    let agent_id = session.agent_id.clone();
     let hook_metadata = session.hook_metadata.clone();
     if let Some(metadata) = hook_metadata
         .as_ref()
-        .filter(|metadata| metadata.invoke_run_start)
+        .filter(|metadata| metadata.invoke_turn_start)
     {
         let payload = json!({
-            "session_id": metadata.mews_session_id, "run_id": metadata.run_id,
+            "session_id": metadata.mews_session_id, "turn_id": metadata.turn_id,
             "harness": metadata.harness, "cwd": cwd, "binding": session.transition,
             "context_hash": metadata.context_hash, "context_channel": metadata.context_channel,
         });
         match environment
             .hook(
-                mews_agent::LifecycleHook::RunStart,
+                &agent_id,
+                mews_agent::LifecycleHook::TurnStart,
                 payload,
                 &cwd,
                 &cancellation,
@@ -232,7 +241,7 @@ async fn run_acp_session_inner(
         {
             Ok(_) => events(AcpStreamEvent::HookOutcome {
                 event_key: accepted_event_key(),
-                hook: "run_start".into(),
+                hook: "turn_start".into(),
                 ok: true,
                 detail: None,
                 tool: None,
@@ -242,7 +251,7 @@ async fn run_acp_session_inner(
                 let detail = bounded_detail(&error.to_string());
                 events(AcpStreamEvent::HookOutcome {
                     event_key: accepted_event_key(),
-                    hook: "run_start".into(),
+                    hook: "turn_start".into(),
                     ok: false,
                     detail: Some(detail.clone()),
                     tool: None,
@@ -250,16 +259,16 @@ async fn run_acp_session_inner(
                 })?;
                 let _ = record_telemetry_hook(
                     environment,
-                    mews_agent::LifecycleHook::RunEnd,
-                    "run_end",
-                    json!({"session_id": metadata.mews_session_id, "run_id": metadata.run_id,
+                    &session.agent_id,
+                    mews_agent::LifecycleHook::TurnEnd,
+                    json!({"session_id": metadata.mews_session_id, "turn_id": metadata.turn_id,
                         "status": "failed", "outcome": bounded_detail(&error.to_string())}),
                     &cwd,
                     &cancellation,
                     events,
                 )
                 .await;
-                return Err(error).context("ACP run_start hook failed");
+                return Err(error).context("ACP turn_start hook failed");
             }
         }
     }
@@ -267,9 +276,9 @@ async fn run_acp_session_inner(
         if let Some(metadata) = &hook_metadata {
             let _ = record_telemetry_hook(
                 environment,
-                mews_agent::LifecycleHook::RunEnd,
-                "run_end",
-                json!({"session_id": metadata.mews_session_id, "run_id": metadata.run_id,
+                &agent_id,
+                mews_agent::LifecycleHook::TurnEnd,
+                json!({"session_id": metadata.mews_session_id, "turn_id": metadata.turn_id,
                     "status":"failed", "outcome": bounded_detail(&error.to_string())}),
                 &cwd,
                 &cancellation,
@@ -287,9 +296,9 @@ async fn run_acp_session_inner(
             if let Some(metadata) = &hook_metadata {
                 let _ = record_telemetry_hook(
                     environment,
-                    mews_agent::LifecycleHook::RunEnd,
-                    "run_end",
-                    json!({"session_id": metadata.mews_session_id, "run_id": metadata.run_id,
+                    &session.agent_id,
+                    mews_agent::LifecycleHook::TurnEnd,
+                    json!({"session_id": metadata.mews_session_id, "turn_id": metadata.turn_id,
                         "status":"failed", "outcome": bounded_detail(&error.to_string())}),
                     &cwd,
                     &cancellation,
@@ -337,9 +346,9 @@ async fn run_acp_session_inner(
             reason: AcpReplacementReason::ResourceNotFound,
         };
         if let Some(metadata) = &mut replacement.hook_metadata {
-            metadata.invoke_run_start = false;
+            metadata.invoke_turn_start = false;
         }
-        return Box::pin(run_acp_session_inner(
+        return Box::pin(execute_acp_turn_inner(
             replacement_config,
             cwd,
             harness_options,
@@ -352,12 +361,12 @@ async fn run_acp_session_inner(
         .await;
     }
     if let Some(metadata) = &hook_metadata {
-        let after_turn = if let Ok(outcome) = &result {
+        let after_step = if let Ok(outcome) = &result {
             record_telemetry_hook(
                 environment,
-                mews_agent::LifecycleHook::AfterTurn,
-                "after_turn",
-                json!({"session_id": metadata.mews_session_id, "run_id": metadata.run_id,
+                &agent_id,
+                mews_agent::LifecycleHook::AfterStep,
+                json!({"session_id": metadata.mews_session_id, "turn_id": metadata.turn_id,
                     "acp_session_id": outcome.session_id, "answer": bounded_detail(&outcome.answer),
                     "stop_reason": outcome.stop_reason, "activities": observed_activities}),
                 &cwd,
@@ -373,21 +382,21 @@ async fn run_acp_session_inner(
             Err(error) if crate::rpc::is_cancelled(error) => ("cancelled", None),
             Err(error) => ("failed", Some(bounded_detail(&error.to_string()))),
         };
-        let run_end = record_telemetry_hook(
+        let turn_end = record_telemetry_hook(
             environment,
-            mews_agent::LifecycleHook::RunEnd,
-            "run_end",
-            json!({"session_id": metadata.mews_session_id, "run_id": metadata.run_id,
+            &agent_id,
+            mews_agent::LifecycleHook::TurnEnd,
+            json!({"session_id": metadata.mews_session_id, "turn_id": metadata.turn_id,
                     "status": status, "outcome": detail}),
             &cwd,
             &cancellation,
             events,
         )
         .await;
-        match (after_turn, run_end) {
-            (Err(after_turn), Err(run_end)) => {
-                return Err(after_turn)
-                    .context(format!("run_end telemetry also failed: {run_end:#}"));
+        match (after_step, turn_end) {
+            (Err(after_step), Err(turn_end)) => {
+                return Err(after_step)
+                    .context(format!("turn_end telemetry also failed: {turn_end:#}"));
             }
             (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
             (Ok(()), Ok(())) => {}
@@ -409,15 +418,31 @@ async fn run_acp_session_inner(
 
 async fn record_telemetry_hook(
     environment: &dyn mews_agent::AgentCapabilities,
+    agent_id: &mews_protocol::AgentId,
     lifecycle: mews_agent::LifecycleHook,
-    hook: &str,
     payload: Value,
     cwd: &std::path::Path,
     cancellation: &mews_agent::CancellationToken,
     events: &mut dyn FnMut(AcpStreamEvent) -> Result<()>,
 ) -> Result<()> {
+    let hook = match lifecycle {
+        mews_agent::LifecycleHook::TurnStart => "turn_start",
+        mews_agent::LifecycleHook::BeforeModel => "before_model",
+        mews_agent::LifecycleHook::BeforeTool => "before_tool",
+        mews_agent::LifecycleHook::AfterTool => "after_tool",
+        mews_agent::LifecycleHook::AfterStep => "after_step",
+        mews_agent::LifecycleHook::TurnEnd => "turn_end",
+    };
+    // A Turn-end hook is cleanup: it must remain runnable after the Turn's
+    // cooperative cancellation token has fired.
+    let cleanup_cancellation = mews_agent::CancellationToken::new();
+    let cancellation = if lifecycle == mews_agent::LifecycleHook::TurnEnd {
+        &cleanup_cancellation
+    } else {
+        cancellation
+    };
     match environment
-        .hook(lifecycle, payload, cwd, cancellation)
+        .hook(agent_id, lifecycle, payload, cwd, cancellation)
         .await
     {
         Ok(_) => events(AcpStreamEvent::HookOutcome {
@@ -563,8 +588,9 @@ impl AcpProcess {
                 initialize.protocol_version
             );
         }
-        let mut mcp = RunMcpBridge::for_extensions_and_skills(
+        let mut mcp = TurnMcpBridge::for_extensions_and_skills(
             environment,
+            &session.agent_id,
             cwd.clone(),
             cancellation.clone(),
             allowed_tools,
@@ -573,7 +599,7 @@ impl AcpProcess {
         if let Some(metadata) = &session.hook_metadata {
             mcp.set_correlation(crate::mcp::McpCorrelation {
                 mews_session_id: metadata.mews_session_id.clone(),
-                run_id: metadata.run_id.clone(),
+                turn_id: metadata.turn_id.clone(),
                 harness: metadata.harness.clone(),
                 acp_session_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
             });
@@ -701,11 +727,11 @@ impl AcpProcess {
             mcp_http.as_ref(),
         )
         .await?;
-        let mut updates = UpdateState::for_run(
+        let mut updates = UpdateState::for_turn(
             session
                 .hook_metadata
                 .as_ref()
-                .map_or("local", |metadata| metadata.run_id.as_str()),
+                .map_or("local", |metadata| metadata.turn_id.as_str()),
         );
         let prompt = before_model(
             environment,
@@ -732,19 +758,40 @@ impl AcpProcess {
                 session_id: session_id.clone(),
             })?;
         }
+        let event_sink = std::cell::RefCell::new(&mut *events);
         let prompt_result = rpc
-            .request(
+            .request_with_dispatch(
                 "session/prompt",
                 json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": prompt }] }),
                 &cancellation,
                 Some(&mcp),
                 mcp_http.as_ref(),
-                |update| updates.apply(update, events),
+                || {
+                    (event_sink.borrow_mut())(AcpStreamEvent::PromptDispatched {
+                        event_key: format!("prompt_dispatched:{session_id}"),
+                        session_id: session_id.clone(),
+                    })
+                },
+                |update| updates.apply(update, &mut **event_sink.borrow_mut()),
             )
             .await;
-        let prompt_result = prompt_result?;
-        let prompt_result: PromptResult =
-            serde_json::from_value(prompt_result).context("invalid ACP session/prompt result")?;
+        let prompt_result = match prompt_result {
+            Ok(result) => result,
+            Err(error) if crate::rpc::is_cancelled(&error) || classify_error(&error).is_some() => {
+                return Err(error);
+            }
+            Err(error) => {
+                return Err(mews_agent::EffectUncertain::new(format!(
+                    "ACP prompt was dispatched but no definitive outcome was observed: {error:#}"
+                ))
+                .into());
+            }
+        };
+        let prompt_result: PromptResult = serde_json::from_value(prompt_result).map_err(|error| {
+            mews_agent::EffectUncertain::new(format!(
+                "ACP prompt returned an invalid terminal result: {error}"
+            ))
+        })?;
         if prompt_result.stop_reason == AcpStopReason::Cancelled {
             return Err(anyhow::anyhow!(AcpCancelled));
         }
@@ -760,8 +807,18 @@ impl AcpProcess {
             },
         })
         }.await;
+        let uncertain_effect = mcp.take_effect_uncertainty();
         let audit = drain_mcp_hook_outcomes(&mcp, events);
         mcp.revoke();
+        if let Some(reason) = uncertain_effect {
+            let error = anyhow::Error::from(mews_agent::EffectUncertain::new(reason));
+            return match audit {
+                Ok(()) => Err(error),
+                Err(audit) => Err(error.context(format!(
+                    "failed to persist MCP hook audit after uncertain effect: {audit:#}"
+                ))),
+            };
+        }
         match (lifecycle, audit) {
             (Ok(outcome), Ok(())) => Ok(outcome),
             (Err(primary), Ok(())) => Err(primary),
@@ -774,7 +831,7 @@ impl AcpProcess {
 }
 
 fn drain_mcp_hook_outcomes(
-    mcp: &RunMcpBridge<'_>,
+    mcp: &TurnMcpBridge<'_>,
     events: &mut dyn FnMut(AcpStreamEvent) -> Result<()>,
 ) -> Result<()> {
     for outcome in mcp.drain_hook_outcomes() {
@@ -790,7 +847,7 @@ fn drain_mcp_hook_outcomes(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)] // Run-scoped hook inputs are assembled at the ACP boundary.
+#[allow(clippy::too_many_arguments)] // Turn-scoped hook inputs are assembled at the ACP boundary.
 async fn before_model(
     environment: &dyn mews_agent::AgentCapabilities,
     session: &AcpSessionRequest,
@@ -805,12 +862,13 @@ async fn before_model(
         return Ok(prompt);
     };
     let payload = json!({
-        "session_id": metadata.mews_session_id, "run_id": metadata.run_id,
+        "session_id": metadata.mews_session_id, "turn_id": metadata.turn_id,
         "acp_session_id": acp_session_id, "harness": metadata.harness,
         "mode": transition, "prompt": prompt,
     });
     let response = match environment
         .hook(
+            &session.agent_id,
             mews_agent::LifecycleHook::BeforeModel,
             payload,
             cwd,
@@ -974,8 +1032,8 @@ async fn apply_harness_options<W>(
     session_id: &str,
     options: &BTreeMap<String, String>,
     cancellation: &mews_agent::CancellationToken,
-    mcp: Option<&RunMcpBridge<'_>>,
-    mcp_http: Option<&RunMcpHttp>,
+    mcp: Option<&TurnMcpBridge<'_>>,
+    mcp_http: Option<&TurnMcpHttp>,
 ) -> Result<()>
 where
     W: AsyncWriteExt + Unpin,
@@ -997,8 +1055,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        AcpHarnessConfig, AcpSessionRequest, AcpStopReason, AcpStreamEvent,
-        prepare_instruction_channel, probe_acp, run_acp_session_inner, session_new_params,
+        AcpHarnessConfig, AcpSessionRequest, AcpStopReason, AcpStreamEvent, execute_acp_turn_inner,
+        prepare_instruction_channel, probe_acp, session_new_params,
     };
     use crate::rpc::{AcpErrorKind, acp_rpc_error, classify_error, is_resource_not_found};
     use crate::updates::update_text;
@@ -1044,7 +1102,7 @@ mod tests {
             "session/new",
             &json!({"code":-32000,"message":"any diagnostic prose"}),
         )
-        .context("wrapped run failure");
+        .context("wrapped Turn failure");
         assert_eq!(
             classify_error(&authentication),
             Some(AcpErrorKind::AuthenticationRequired)
@@ -1060,6 +1118,8 @@ mod tests {
             r#"{"approval_policy":"never"}"#.into(),
         );
         let request = AcpSessionRequest {
+            agent_id: mews_protocol::AgentId::new(),
+            agent_slug: "coder".into(),
             transition: AcpBindingTransition::New,
             prompt: "user".into(),
             recovery_prompt: String::new(),
@@ -1144,11 +1204,13 @@ sleep 30
         .unwrap();
         fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let error = run_acp_session_inner(
+        let error = execute_acp_turn_inner(
             AcpHarnessConfig::new([fixture.into_os_string()]).unwrap(),
             directory.path().to_owned(),
             BTreeMap::new(),
             AcpSessionRequest {
+                agent_id: mews_protocol::AgentId::new(),
+                agent_slug: "coder".into(),
                 transition: AcpBindingTransition::New,
                 prompt: "hello".into(),
                 recovery_prompt: "hello".into(),
@@ -1192,11 +1254,13 @@ done
 
         let error = tokio::time::timeout(
             Duration::from_secs(2),
-            run_acp_session_inner(
+            execute_acp_turn_inner(
                 config,
                 directory.path().to_owned(),
                 BTreeMap::new(),
                 AcpSessionRequest {
+                    agent_id: mews_protocol::AgentId::new(),
+                    agent_slug: "coder".into(),
                     transition: AcpBindingTransition::New,
                     prompt: "never finishes".into(),
                     recovery_prompt: "never finishes".into(),
@@ -1239,11 +1303,13 @@ done
         fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
         let mut events = Vec::new();
 
-        run_acp_session_inner(
+        execute_acp_turn_inner(
             AcpHarnessConfig::new([fixture.into_os_string()]).unwrap(),
             directory.path().to_owned(),
             BTreeMap::new(),
             AcpSessionRequest {
+                agent_id: mews_protocol::AgentId::new(),
+                agent_slug: "coder".into(),
                 transition: AcpBindingTransition::New,
                 prompt: "may execute".into(),
                 recovery_prompt: "may execute".into(),
@@ -1294,11 +1360,13 @@ done
         fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
         let cancellation = CancellationToken::new();
         let mut events = |_| Ok(());
-        let execution = run_acp_session_inner(
+        let execution = execute_acp_turn_inner(
             AcpHarnessConfig::new([fixture.into_os_string()]).unwrap(),
             directory.path().to_owned(),
             BTreeMap::new(),
             AcpSessionRequest {
+                agent_id: mews_protocol::AgentId::new(),
+                agent_slug: "coder".into(),
                 transition: AcpBindingTransition::New,
                 prompt: "start child".into(),
                 recovery_prompt: "start child".into(),
@@ -1357,11 +1425,13 @@ done
         )
         .unwrap();
         fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
-        let outcome = run_acp_session_inner(
+        let outcome = execute_acp_turn_inner(
             AcpHarnessConfig::new(vec![fixture.to_string_lossy().into_owned()]).unwrap(),
             directory.path().to_path_buf(),
             BTreeMap::new(),
             AcpSessionRequest {
+                agent_id: mews_protocol::AgentId::new(),
+                agent_slug: "coder".into(),
                 transition: AcpBindingTransition::Resume {
                     acp_session_id: "native-1".into(),
                 },
@@ -1403,11 +1473,13 @@ while IFS= read -r line; do
 done
 "#).unwrap();
         fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
-        run_acp_session_inner(
+        execute_acp_turn_inner(
             AcpHarnessConfig::new(vec![fixture.to_string_lossy().into_owned()]).unwrap(),
             directory.path().to_path_buf(),
             BTreeMap::new(),
             AcpSessionRequest {
+                agent_id: mews_protocol::AgentId::new(),
+                agent_slug: "coder".into(),
                 transition: AcpBindingTransition::Resume {
                     acp_session_id: "saved".into(),
                 },
@@ -1450,11 +1522,13 @@ done
         .unwrap();
         fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
         let mut bound = Vec::new();
-        let outcome = run_acp_session_inner(
+        let outcome = execute_acp_turn_inner(
             AcpHarnessConfig::new(vec![fixture.to_string_lossy().into_owned()]).unwrap(),
             directory.path().to_path_buf(),
             BTreeMap::new(),
             AcpSessionRequest {
+                agent_id: mews_protocol::AgentId::new(),
+                agent_slug: "coder".into(),
                 transition: AcpBindingTransition::Resume {
                     acp_session_id: "native-1".into(),
                 },
@@ -1501,6 +1575,7 @@ done
         }
         async fn execute(
             &self,
+            _: &mews_protocol::AgentId,
             _: &ToolCall,
             _: &Path,
             _: &CancellationToken,
@@ -1510,6 +1585,7 @@ done
         }
         async fn hook(
             &self,
+            _: &mews_protocol::AgentId,
             _: LifecycleHook,
             _: serde_json::Value,
             _: &Path,
@@ -1548,11 +1624,13 @@ done
         fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
 
         let mut events = Vec::new();
-        let error = run_acp_session_inner(
+        let error = execute_acp_turn_inner(
             AcpHarnessConfig::new([fixture.into_os_string()]).unwrap(),
             directory.path().to_owned(),
             BTreeMap::new(),
             AcpSessionRequest {
+                agent_id: mews_protocol::AgentId::new(),
+                agent_slug: "coder".into(),
                 transition: AcpBindingTransition::New,
                 prompt: "hello".into(),
                 recovery_prompt: "hello".into(),
@@ -1605,11 +1683,13 @@ done
             "CODEX_CONFIG".into(),
             r#"{"approval_policy":"never","unrelated":true}"#.into(),
         );
-        run_acp_session_inner(
+        execute_acp_turn_inner(
             config,
             directory.path().to_owned(),
             BTreeMap::new(),
             AcpSessionRequest {
+                agent_id: mews_protocol::AgentId::new(),
+                agent_slug: "coder".into(),
                 transition: AcpBindingTransition::New,
                 prompt: "user text".into(),
                 recovery_prompt: "recovery text".into(),
@@ -1672,11 +1752,13 @@ done
             fs::write(&fixture, script).unwrap();
             fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
 
-            run_acp_session_inner(
+            execute_acp_turn_inner(
                 AcpHarnessConfig::new([fixture.into_os_string()]).unwrap(),
                 directory.path().to_owned(),
                 BTreeMap::new(),
                 AcpSessionRequest {
+                    agent_id: mews_protocol::AgentId::new(),
+                    agent_slug: "coder".into(),
                     transition,
                     prompt: "user text".into(),
                     recovery_prompt: "recovery text".into(),
@@ -1740,11 +1822,13 @@ done
         fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
 
         let mut events = Vec::new();
-        let outcome = run_acp_session_inner(
+        let outcome = execute_acp_turn_inner(
             AcpHarnessConfig::new([fixture.into_os_string()]).unwrap(),
             directory.path().to_owned(),
             BTreeMap::new(),
             AcpSessionRequest {
+                agent_id: mews_protocol::AgentId::new(),
+                agent_slug: "coder".into(),
                 transition: AcpBindingTransition::New,
                 prompt: "hello".into(),
                 recovery_prompt: "hello".into(),
@@ -1765,6 +1849,15 @@ done
         .unwrap();
         assert_eq!(outcome.answer, "intro\n\nfixture reply");
         assert_eq!(outcome.stop_reason, AcpStopReason::EndTurn);
+        let dispatched = events
+            .iter()
+            .position(|event| matches!(event, AcpStreamEvent::PromptDispatched { session_id, .. } if session_id == "fixture"))
+            .expect("prompt dispatch event");
+        let first_reply = events
+            .iter()
+            .position(|event| matches!(event, AcpStreamEvent::AssistantDelta { .. }))
+            .expect("assistant reply event");
+        assert!(dispatched < first_reply);
         assert!(events.iter().any(|event| {
             matches!(
                 event,

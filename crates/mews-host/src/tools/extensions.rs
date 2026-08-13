@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::Path};
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -17,6 +17,8 @@ pub(super) struct ExtensionManifest {
     pub schema: Value,
     #[serde(default, skip_serializing)]
     pub envelope: bool,
+    #[serde(default, skip_serializing)]
+    pub agent_id: Option<mews_protocol::AgentId>,
 }
 
 pub(super) struct ExternalTool(pub ExtensionManifest);
@@ -30,6 +32,10 @@ pub(super) struct RuntimeExtension {
     pub hooks: Vec<String>,
     #[serde(default)]
     pub tools: Vec<RuntimeTool>,
+    #[serde(skip)]
+    pub agent_id: Option<mews_protocol::AgentId>,
+    #[serde(skip)]
+    pub agent_slug: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -42,13 +48,41 @@ pub(super) struct RuntimeTool {
 
 #[derive(Clone)]
 pub(super) struct ExternalHook {
+    pub agent_id: mews_protocol::AgentId,
     pub extension: String,
     pub command: Vec<String>,
     pub hook: String,
 }
 
 pub(super) fn runtime_extensions(root: &Path) -> Result<Vec<RuntimeExtension>> {
-    runtime_extensions_in(&root.join("extensions"))
+    let agents = root.join("agents");
+    if !agents.exists() {
+        return Ok(Vec::new());
+    }
+    let mut extensions = Vec::new();
+    for entry in std::fs::read_dir(agents)? {
+        let entry = entry?;
+        if !is_agent_replica(&entry)? {
+            continue;
+        }
+        let agent_slug = entry.file_name().to_string_lossy().into_owned();
+        let agent_id: mews_protocol::AgentId =
+            std::fs::read_to_string(entry.path().join(".agent-id"))?
+                .trim()
+                .parse()
+                .map_err(anyhow::Error::msg)?;
+        for mut extension in runtime_extensions_in(&entry.path().join("extensions"))? {
+            extension.agent_id = Some(agent_id.clone());
+            extension.agent_slug = agent_slug.clone();
+            extensions.push(extension);
+        }
+    }
+    extensions.sort_by(|left, right| {
+        left.agent_slug
+            .cmp(&right.agent_slug)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(extensions)
 }
 
 fn runtime_extensions_in(directory: &Path) -> Result<Vec<RuntimeExtension>> {
@@ -69,12 +103,12 @@ fn runtime_extensions_in(directory: &Path) -> Result<Vec<RuntimeExtension>> {
         for hook in &extension.hooks {
             if !matches!(
                 hook.as_str(),
-                "run_start"
+                "turn_start"
                     | "before_model"
                     | "before_tool"
                     | "after_tool"
-                    | "after_turn"
-                    | "run_end"
+                    | "after_step"
+                    | "turn_end"
             ) {
                 bail!("unsupported extension hook {hook:?}");
             }
@@ -100,7 +134,16 @@ fn runtime_extensions_in(directory: &Path) -> Result<Vec<RuntimeExtension>> {
 
 pub(super) fn resource_fingerprint(root: &Path) -> Result<String> {
     let mut entries = Vec::new();
-    for directory in [root.join("tools"), root.join("extensions")] {
+    let agents = root.join("agents");
+    if !agents.exists() {
+        return Ok(String::new());
+    }
+    for agent in std::fs::read_dir(agents)? {
+        let agent = agent?;
+        if !is_agent_replica(&agent)? {
+            continue;
+        }
+        let directory = agent.path().join("extensions");
         if !directory.exists() {
             continue;
         }
@@ -119,52 +162,23 @@ pub(super) fn resource_fingerprint(root: &Path) -> Result<String> {
     Ok(entries.join("|"))
 }
 
-pub(super) fn extension_manifests(root: &Path) -> Result<BTreeMap<String, ExtensionManifest>> {
-    let directory = root.join("tools");
-    if !directory.exists() {
-        return Ok(BTreeMap::new());
+fn is_agent_replica(entry: &std::fs::DirEntry) -> Result<bool> {
+    if !entry.file_type()?.is_dir() {
+        return Ok(false);
     }
-    let mut manifests = BTreeMap::new();
-    for entry in std::fs::read_dir(&directory)? {
-        let path = entry?.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("toml") {
-            continue;
-        }
-        let metadata = std::fs::symlink_metadata(&path)?;
-        if !metadata.file_type().is_file() {
-            bail!("tool manifest must be a regular file");
-        }
-        if metadata.len() > 32 * 1024 {
-            bail!("tool manifest exceeds 32 KiB");
-        }
-        let manifest: ExtensionManifest = toml::from_str(&std::fs::read_to_string(&path)?)
-            .with_context(|| format!("parse tool manifest {}", path.display()))?;
-        if manifest.name.is_empty()
-            || !manifest
-                .name
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-        {
-            bail!("tool name must contain lowercase letters, digits, or underscores");
-        }
-        if manifest.command.is_empty() {
-            bail!("tool command must not be empty");
-        }
-        if manifest.description.is_empty()
-            || manifest.description.len() > 1024
-            || manifest.command.iter().map(String::len).sum::<usize>() > 8 * 1024
-            || serde_json::to_vec(&manifest.schema)?.len() > 32 * 1024
-        {
-            bail!("tool description, command, or schema exceeds its limit");
-        }
-        if manifest.schema.get("type").and_then(Value::as_str) != Some("object") {
-            bail!("tool schema must be a JSON object schema");
-        }
-        if manifests.insert(manifest.name.clone(), manifest).is_some() {
-            bail!("duplicate tool name");
-        }
-    }
-    Ok(manifests)
+    let slug = entry.file_name();
+    let Some(slug) = slug.to_str() else {
+        return Ok(false);
+    };
+    Ok(slug.len() <= 64
+        && !slug.is_empty()
+        && slug.split('-').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
+        && entry.path().join(".agent-id").is_file())
 }
 
 #[async_trait]
@@ -236,5 +250,22 @@ mod tests {
                 .to_string()
                 .contains("duplicate runtime extension name")
         );
+    }
+
+    #[test]
+    fn discovery_ignores_staged_and_previous_agent_directories() {
+        let root = tempfile::tempdir().unwrap();
+        for name in [".coder.staged-1", ".coder.previous-1"] {
+            let directory = root.path().join("agents").join(name).join("extensions");
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("hidden.toml"),
+                "name = 'hidden'\ncommand = ['true']\n",
+            )
+            .unwrap();
+        }
+
+        assert!(runtime_extensions(root.path()).unwrap().is_empty());
+        assert!(resource_fingerprint(root.path()).unwrap().is_empty());
     }
 }

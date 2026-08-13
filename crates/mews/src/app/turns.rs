@@ -2,7 +2,7 @@ use super::*;
 
 use super::{
     acp::{
-        AcpReasoningAggregate, checked_acp_binding, finish_acp_run, persist_local_acp_event,
+        AcpReasoningAggregate, checked_acp_binding, finish_acp_turn, persist_local_acp_event,
         persist_remote_acp_binding, persist_remote_acp_dispatch,
     },
     sessions::expand_prompt,
@@ -13,64 +13,131 @@ struct SendRequest<'a> {
     prompt: &'a str,
     metadata: Value,
     source: MessageSource,
-    run_id: Option<crate::RunId>,
+    turn_id: Option<crate::TurnId>,
+    prompt_is_expanded: bool,
     event_notify: Option<Arc<tokio::sync::Notify>>,
     cancellation: mews_agent::CancellationToken,
 }
 
-pub(crate) struct StartedRun {
-    pub id: crate::RunId,
+pub(crate) struct StartedTurn {
+    pub id: crate::TurnId,
     pub event_notify: Arc<tokio::sync::Notify>,
     pub cancellation: mews_agent::CancellationToken,
 }
 
-impl Mews {
-    pub fn start_run(&self, session_id: &crate::SessionId) -> Result<crate::Run> {
-        Ok(self.store.start_run(session_id)?)
-    }
+pub(super) fn emit_runtime_signal(
+    store: &Store,
+    session_id: &crate::SessionId,
+    turn_id: &crate::TurnId,
+    payload: mews_protocol::RuntimeSignalPayload,
+) -> Result<()> {
+    store.emit_runtime_signal(session_id, turn_id, payload)?;
+    Ok(())
+}
 
-    pub fn start_run_idempotent(
+/// Closes setup-error gaps after atomic turn acceptance. Normal runtime paths
+/// finish the Turn first, in which case this guard is a no-op.
+struct TurnTerminalGuard<'a> {
+    store: &'a Store,
+    turn_id: crate::TurnId,
+    cancellation: mews_agent::CancellationToken,
+}
+
+impl Drop for TurnTerminalGuard<'_> {
+    fn drop(&mut self) {
+        let Ok(turn) = self.store.turn(&self.turn_id) else {
+            return;
+        };
+        if turn.completed_at.is_some() {
+            return;
+        }
+        let cancelled = self.cancellation.is_cancelled();
+        let _ = self.store.finish_turn(
+            &self.turn_id,
+            if cancelled {
+                TurnStatus::Cancelled
+            } else {
+                TurnStatus::Failed
+            },
+            (!cancelled).then_some("Turn execution stopped before producing a terminal outcome"),
+        );
+    }
+}
+
+impl Mews {
+    pub fn accept_turn_idempotent(
         &self,
         session_id: &crate::SessionId,
         key: &str,
-        channel_origin: Option<&crate::ChannelOrigin>,
-    ) -> Result<(crate::Run, bool)> {
-        Ok(self
-            .store
-            .start_run_idempotent(session_id, key, channel_origin)?)
+        request_prompt: String,
+        resolved_prompt: String,
+        metadata: Value,
+        source: MessageSource,
+    ) -> Result<(crate::Turn, crate::Message, bool)> {
+        Ok(self.store.accept_turn_idempotent(
+            session_id,
+            key,
+            MessageContent::Text {
+                text: request_prompt,
+            },
+            MessageContent::Text {
+                text: resolved_prompt,
+            },
+            metadata,
+            source,
+        )?)
     }
 
-    pub fn run(&self, run_id: &crate::RunId) -> Result<crate::Run> {
-        Ok(self.store.run(run_id)?)
-    }
-
-    pub fn record_run_harness(
+    pub fn replay_turn_idempotent(
         &self,
-        run_id: &crate::RunId,
+        session_id: &crate::SessionId,
+        key: &str,
+        request_prompt: &str,
+        metadata: &Value,
+        source: &MessageSource,
+    ) -> Result<Option<(crate::Turn, crate::Message)>> {
+        Ok(self.store.replay_turn_idempotent(
+            session_id,
+            key,
+            &MessageContent::Text {
+                text: request_prompt.to_owned(),
+            },
+            metadata,
+            source,
+        )?)
+    }
+
+    pub fn turn(&self, turn_id: &crate::TurnId) -> Result<crate::Turn> {
+        Ok(self.store.turn(turn_id)?)
+    }
+
+    pub fn record_turn_harness(
+        &self,
+        turn_id: &crate::TurnId,
         descriptor: &mews_protocol::HarnessDescriptor,
     ) -> Result<()> {
-        Ok(self.store.record_run_harness(
-            run_id,
+        Ok(self.store.record_turn_harness(
+            turn_id,
             &descriptor.name,
             &descriptor.definition_hash,
             descriptor.executable_version.as_deref(),
         )?)
     }
 
-    pub fn cancel_run(&self, run_id: &crate::RunId) -> Result<()> {
-        let run = self.store.run(run_id)?;
-        if run.completed_at.is_some() {
+    pub fn cancel_turn(&self, turn_id: &crate::TurnId) -> Result<()> {
+        let turn = self.store.turn(turn_id)?;
+        if turn.completed_at.is_some() {
             return Ok(());
         }
         self.store
-            .finish_run(run_id, RunStatus::Cancelled, Some("cancelled by client"))?;
+            .finish_turn(turn_id, TurnStatus::Cancelled, Some("cancelled by client"))?;
         Ok(())
     }
 
-    pub fn fail_run(&self, run_id: &crate::RunId, error: &str) -> Result<()> {
+    pub fn fail_turn(&self, turn_id: &crate::TurnId, error: &str) -> Result<()> {
         Ok(self
             .store
-            .finish_run(run_id, RunStatus::Failed, Some(error))?)
+            .finish_turn(turn_id, TurnStatus::Failed, Some(error))?)
     }
 
     pub fn subscribe_session(
@@ -137,7 +204,8 @@ impl Mews {
             prompt,
             metadata,
             source,
-            run_id: None,
+            turn_id: None,
+            prompt_is_expanded: false,
             event_notify: None,
             cancellation: mews_agent::CancellationToken::new(),
         })
@@ -162,11 +230,11 @@ impl Mews {
     }
 
     pub(super) fn local_tools(&self) -> Result<ToolRegistry> {
-        let registry = ToolRegistry::with_host_extensions(&self.root)?;
+        let registry = ToolRegistry::with_agent_extensions(&self.root)?;
         tokio::spawn({
             let registry = registry.clone();
             let root = self.root.clone();
-            async move { registry.watch_host_extensions(root).await }
+            async move { registry.watch_agent_extensions(root).await }
         });
         Ok(registry)
     }
@@ -206,7 +274,8 @@ impl Mews {
                 prompt,
                 metadata,
                 source,
-                run_id: None,
+                turn_id: None,
+                prompt_is_expanded: false,
                 event_notify: None,
                 cancellation: mews_agent::CancellationToken::new(),
             },
@@ -225,7 +294,7 @@ impl Mews {
         metadata: Value,
         host: &dyn HostExecutor,
         source: MessageSource,
-        run: StartedRun,
+        turn: StartedTurn,
     ) -> Result<String> {
         self.execute_send(
             SendRequest {
@@ -233,9 +302,10 @@ impl Mews {
                 prompt,
                 metadata,
                 source,
-                run_id: Some(run.id),
-                event_notify: Some(run.event_notify),
-                cancellation: run.cancellation,
+                turn_id: Some(turn.id),
+                prompt_is_expanded: true,
+                event_notify: Some(turn.event_notify),
+                cancellation: turn.cancellation,
             },
             host.agent_capabilities(),
             host.host_id(),
@@ -258,21 +328,75 @@ impl Mews {
             prompt,
             metadata,
             source,
-            run_id,
+            turn_id,
+            prompt_is_expanded,
             event_notify,
             cancellation,
         } = request;
         if session.host_id != *environment_host_id {
             bail!("session belongs to a different Host");
         }
+        let request_prompt = prompt.to_owned();
+        let prompt = if prompt_is_expanded {
+            prompt.to_owned()
+        } else {
+            expand_prompt(environment, &session.working_directory, prompt).await?
+        };
+        if source.id.is_empty() || source.id.len() > 256 {
+            bail!("message source ID must contain 1 to 256 bytes");
+        }
+        if !matches!(source.kind, SourceKind::Client | SourceKind::Channel) {
+            bail!("user messages may only be attributed to a client or channel");
+        }
+        if turn_id.is_none() {
+            let model = self.session_model_config(session)?;
+            if model.harness == mews_runtime::MEWS_HARNESS && model.model.is_none() {
+                bail!(
+                    "No model is configured for this Agent. Configure one with `mews providers login` or `mews providers set-key <provider>`, then select it with `mews providers models`."
+                );
+            }
+        }
+        let accepted_turn = match turn_id {
+            Some(turn_id) => turn_id,
+            None => {
+                let command_id = format!("direct:{}", mews_protocol::RequestId::new());
+                self.store
+                    .accept_turn_idempotent(
+                        &session.id,
+                        &command_id,
+                        MessageContent::Text {
+                            text: request_prompt,
+                        },
+                        MessageContent::Text {
+                            text: prompt.clone(),
+                        },
+                        metadata,
+                        source,
+                    )?
+                    .0
+                    .id
+            }
+        };
+        let _terminal_guard = TurnTerminalGuard {
+            store: &self.store,
+            turn_id: accepted_turn.clone(),
+            cancellation: cancellation.clone(),
+        };
+        let turn = self.store.turn(&accepted_turn)?;
+        if turn.session_id != session.id {
+            bail!("Turn belongs to a different Session");
+        }
         let revision = self
             .store
-            .agent_revision(&session.agent_id, session.agent_revision)?;
+            .agent_revision(&session.agent_id, turn.agent_revision)?;
         let config = crate::AgentConfig::parse(&revision.config_toml)?;
-        // Native runs need a router model before the user message becomes
+        // Native turns need a router model before the user message becomes
         // durable. External Harnesses validate their own options at dispatch.
         if config.harness == mews_runtime::MEWS_HARNESS
-            && self.session_model_config(session)?.model.is_none()
+            && self
+                .session_model_config_for_revision(session, &revision)?
+                .model
+                .is_none()
         {
             bail!(
                 "No model is configured for this Agent. Configure one with `mews providers login` or `mews providers set-key <provider>`, then select it with `mews providers models`."
@@ -327,7 +451,7 @@ impl Mews {
             acp.environment = launch.environment;
             Some((acp, launch.instruction_channel))
         };
-        let system = revision.soul;
+        let system = revision.soul.clone();
         let agent_slug = self
             .store
             .agents()?
@@ -335,33 +459,10 @@ impl Mews {
             .find(|agent| agent.id == session.agent_id)
             .context("Session Agent no longer exists")?
             .slug;
-        let prompt = expand_prompt(environment, &session.working_directory, prompt).await?;
-        if source.id.is_empty() || source.id.len() > 256 {
-            bail!("message source ID must contain 1 to 256 bytes");
-        }
-        if !matches!(source.kind, SourceKind::Client | SourceKind::Channel) {
-            bail!("user messages may only be attributed to a client or channel");
-        }
-        self.store.append_message(
-            &session.id,
-            MessageRole::User,
-            MessageContent::Text {
-                text: prompt.clone(),
-            },
-            metadata,
-            source,
-        )?;
-        if config.harness != mews_runtime::MEWS_HARNESS && remote_host.is_none() {
-            let run = match run_id {
-                Some(id) => id,
-                None => self.store.start_run(&session.id)?.id,
-            };
-            self.record_run_harness(&run, &harness_descriptor)?;
-            let transition = checked_acp_binding(
-                self.store.acp_session_binding(&session.id)?,
-                session,
-                &harness_descriptor,
-            )?;
+        let result = async {
+            if config.harness != mews_runtime::MEWS_HARNESS && remote_host.is_none() {
+            let turn = accepted_turn.clone();
+            self.record_turn_harness(&turn, &harness_descriptor)?;
             let recovery_prompt = super::native::canonical_acp_prompt(&self.store, session, "")?;
             let (acp, launch_channel) = acp.context("local ACP Harness launch is unavailable")?;
             let skills = mews_host::resources::snapshot_agent_skills(&self.root, &agent_slug)?;
@@ -382,12 +483,43 @@ impl Mews {
             // this current Host snapshot. A successful Resume never sends it.
             let context_text = context.render().map_err(anyhow::Error::msg)?;
             let channel = launch_channel;
+            let binding_context = mews_protocol::AcpBindingContext {
+                version: context.version,
+                hash: mews_protocol::AcpContextSnapshot::hash_rendered(&context_text),
+                channel,
+                text: context_text.clone(),
+            };
+            let previous_harness = self
+                .store
+                .previous_turn_harness(&session.id, &turn)?;
+            let transition = checked_acp_binding(
+                self.store.acp_session_binding(&session.id)?,
+                session,
+                &harness_descriptor,
+                Some(&binding_context),
+                previous_harness.as_deref(),
+            )?;
             let mut reasoning = AcpReasoningAggregate::default();
-            let outcome = mews_acp::run_acp_session(mews_acp::AcpRunRequest {
+            let operation_id = self.store.schedule_effect(
+                &session.id,
+                &turn,
+                mews_protocol::EffectRequest::AcpPrompt {
+                    host_id: session.host_id.clone(),
+                    harness: harness_descriptor.name.clone(),
+                },
+            )?;
+            // This commit authorizes the irreversible ACP prompt. If Hub stops
+            // after this point, recovery must classify the outcome as uncertain.
+            self.store
+                .mark_effect_started(&session.id, &turn, &operation_id)?;
+            let prompt_dispatched = true;
+            let outcome = mews_acp::execute_acp_turn(mews_acp::AcpTurnRequest {
                 config: acp,
                 cwd: session.working_directory.clone(),
                 harness_options: config.harness_options.clone(),
                 session: mews_acp::AcpSessionRequest {
+                    agent_id: session.agent_id.clone(),
+                    agent_slug: agent_slug.clone(),
                     transition: transition.clone(),
                     prompt: prompt.clone(),
                     recovery_prompt,
@@ -404,13 +536,13 @@ impl Mews {
                         .collect(),
                     hook_metadata: Some(mews_acp::AcpHookMetadata {
                         mews_session_id: session.id.to_string(),
-                        run_id: run.to_string(),
+                        turn_id: turn.to_string(),
                         harness: harness_descriptor.name.clone(),
                         context_hash: mews_protocol::AcpContextSnapshot::hash_rendered(
                             &context_text,
                         ),
                         context_channel: channel,
-                        invoke_run_start: true,
+                        invoke_turn_start: true,
                     }),
                 },
                 environment,
@@ -434,13 +566,13 @@ impl Mews {
                             &context_text,
                             channel,
                             channel != mews_protocol::AcpInstructionChannel::FirstPrompt,
-                            run.clone(),
+                            turn.clone(),
                         )?;
                     }
                     persist_local_acp_event(
                         &self.store,
                         session,
-                        &run,
+                        &turn,
                         &harness_descriptor,
                         &event,
                         event_notify.as_ref(),
@@ -449,11 +581,17 @@ impl Mews {
                 },
             })
             .await;
-            reasoning.persist(&self.store, session, &run)?;
-            return finish_acp_run(
+            self.store.finish_effect(
+                &session.id,
+                &turn,
+                &operation_id,
+                acp_effect_outcome(&outcome, &cancellation, prompt_dispatched),
+            )?;
+            reasoning.persist(&self.store, session, &turn)?;
+            return finish_acp_turn(
                 &self.store,
                 session,
-                &run,
+                &turn,
                 &harness_descriptor,
                 outcome,
                 event_notify,
@@ -462,15 +600,16 @@ impl Mews {
         if config.harness != mews_runtime::MEWS_HARNESS
             && let Some(host) = remote_host
         {
-            let run = match run_id {
-                Some(id) => id,
-                None => self.store.start_run(&session.id)?.id,
-            };
-            self.record_run_harness(&run, &harness_descriptor)?;
+            let turn = accepted_turn.clone();
+            self.record_turn_harness(&turn, &harness_descriptor)?;
             let binding = checked_acp_binding(
                 self.store.acp_session_binding(&session.id)?,
                 session,
                 &harness_descriptor,
+                None,
+                self.store
+                    .previous_turn_harness(&session.id, &turn)?
+                    .as_deref(),
             )?;
             let recovery_prompt = super::native::canonical_acp_prompt(&self.store, session, "")?;
             let resume_context = match &binding {
@@ -487,28 +626,34 @@ impl Mews {
                 | mews_protocol::AcpBindingTransition::Replace { .. } => None,
             };
             let mut reasoning = AcpReasoningAggregate::default();
+            let operation_id = self.store.schedule_effect(
+                &session.id,
+                &turn,
+                mews_protocol::EffectRequest::AcpPrompt {
+                    host_id: session.host_id.clone(),
+                    harness: harness_descriptor.name.clone(),
+                },
+            )?;
+            // Commit dispatch authorization before the remote Host can send.
+            self.store
+                .mark_effect_started(&session.id, &turn, &operation_id)?;
+            let prompt_dispatched = true;
             let mut on_event = |event: mews_protocol::AcpEvent| -> Result<()> {
                 match event {
+                    mews_protocol::AcpEvent::PromptDispatched { .. } => {
+                        unreachable!("prompt dispatch events are handled by the operation owner")
+                    }
                     mews_protocol::AcpEvent::AssistantDelta {
-                        event_key,
+                        event_key: _,
                         delta,
                         message_id,
-                        raw,
+                        raw: _,
                     } => {
-                        self.store.append_acp_observation_with_client_event(
+                        emit_runtime_signal(
+                            &self.store,
                             &session.id,
-                            run.clone(),
-                            self.store
-                                .acp_session_binding(&session.id)?
-                                .map(|binding| binding.acp_session_id),
-                            Some(event_key),
-                            mews_protocol::AcpObservation::AssistantDelta {
-                                delta: delta.clone(),
-                                message_id: message_id.clone(),
-                                raw,
-                            },
-                            crate::ClientEventKind::AssistantDelta {
-                                run_id: run.clone(),
+                            &turn,
+                            mews_protocol::RuntimeSignalPayload::AssistantDelta {
                                 delta,
                                 message_id,
                             },
@@ -517,7 +662,7 @@ impl Mews {
                     mews_protocol::AcpEvent::ProviderState { event_key, data } => {
                         self.store.append_acp_observation(
                             &session.id,
-                            run.clone(),
+                            turn.clone(),
                             self.store
                                 .acp_session_binding(&session.id)?
                                 .map(|binding| binding.acp_session_id),
@@ -533,10 +678,11 @@ impl Mews {
                     } => {
                         let _ = (event_key, raw);
                         reasoning.push(message_id.clone(), &delta);
-                        self.store.append_client_event(
+                        emit_runtime_signal(
+                            &self.store,
                             &session.id,
-                            crate::ClientEventKind::ReasoningDelta {
-                                run_id: run.clone(),
+                            &turn,
+                            mews_protocol::RuntimeSignalPayload::ReasoningDelta {
                                 delta,
                                 message_id,
                             },
@@ -546,9 +692,9 @@ impl Mews {
                         event_key,
                         activity,
                     } => {
-                        self.store.append_acp_observation_with_client_event(
+                        self.store.append_acp_observation(
                             &session.id,
-                            run.clone(),
+                            turn.clone(),
                             self.store
                                 .acp_session_binding(&session.id)?
                                 .map(|binding| binding.acp_session_id),
@@ -556,10 +702,12 @@ impl Mews {
                             mews_protocol::AcpObservation::ToolActivity {
                                 activity: activity.clone(),
                             },
-                            crate::ClientEventKind::ToolActivity {
-                                run_id: run.clone(),
-                                activity,
-                            },
+                        )?;
+                        emit_runtime_signal(
+                            &self.store,
+                            &session.id,
+                            &turn,
+                            mews_protocol::RuntimeSignalPayload::ToolActivity { activity },
                         )?;
                     }
                     mews_protocol::AcpEvent::HookOutcome {
@@ -572,7 +720,7 @@ impl Mews {
                     } => {
                         self.store.append_acp_observation(
                             &session.id,
-                            run.clone(),
+                            turn.clone(),
                             self.store
                                 .acp_session_binding(&session.id)?
                                 .map(|binding| binding.acp_session_id),
@@ -599,7 +747,7 @@ impl Mews {
                         }
                         self.store.mark_acp_context_dispatched_with_observation(
                             &session.id,
-                            run.clone(),
+                            turn.clone(),
                             &acp_session_id,
                         )?;
                     }
@@ -614,18 +762,19 @@ impl Mews {
             };
             let (event_tx, mut event_rx) =
                 tokio::sync::mpsc::channel(crate::host::ACP_EVENT_CHANNEL_CAPACITY);
-            let outcome = host.run_acp(
-                crate::host::RemoteAcpRun {
+            let outcome = host.execute_acp_turn(
+                crate::host::RemoteAcpTurn {
                     harness: config.harness.clone(),
                     harness_options: config.harness_options.clone(),
                     tools: config.tools.clone(),
                     cwd: session.working_directory.clone(),
                     prompt: prompt.clone(),
                     recovery_prompt,
+                    agent_id: session.agent_id.clone(),
                     agent_slug: agent_slug.clone(),
                     soul: system.clone(),
                     mews_session_id: session.id.to_string(),
-                    run_id: run.to_string(),
+                    turn_id: turn.to_string(),
                     transition: binding,
                     context: resume_context,
                 },
@@ -639,15 +788,16 @@ impl Mews {
                     event = event_rx.recv() => {
                         if let Some(event) = event {
                             match event {
+                                mews_protocol::AcpEvent::PromptDispatched { .. } => {}
                                 mews_protocol::AcpEvent::SessionBound { acknowledgement_id, session_id: acp_session_id, transition, context, .. } => {
                                     persist_remote_acp_binding(
-                                        &self.store, host, session, &run, &harness_descriptor,
+                                        &self.store, host, session, &turn, &harness_descriptor,
                                         acknowledgement_id, acp_session_id, transition, context,
                                     ).await?;
                                 }
                                 mews_protocol::AcpEvent::ContextDispatched { acknowledgement_id, session_id: acp_session_id, .. } => {
                                     persist_remote_acp_dispatch(
-                                        &self.store, host, session, &run,
+                                        &self.store, host, session, &turn,
                                         acknowledgement_id, acp_session_id,
                                     ).await?;
                                 }
@@ -659,6 +809,7 @@ impl Mews {
             };
             while let Ok(event) = event_rx.try_recv() {
                 match event {
+                    mews_protocol::AcpEvent::PromptDispatched { .. } => {}
                     mews_protocol::AcpEvent::SessionBound {
                         acknowledgement_id,
                         session_id: acp_session_id,
@@ -670,7 +821,7 @@ impl Mews {
                             &self.store,
                             host,
                             session,
-                            &run,
+                            &turn,
                             &harness_descriptor,
                             acknowledgement_id,
                             acp_session_id,
@@ -688,7 +839,7 @@ impl Mews {
                             &self.store,
                             host,
                             session,
-                            &run,
+                            &turn,
                             acknowledgement_id,
                             acp_session_id,
                         )
@@ -697,13 +848,19 @@ impl Mews {
                     event => on_event(event)?,
                 }
             }
-            reasoning.persist(&self.store, session, &run)?;
+            self.store.finish_effect(
+                &session.id,
+                &turn,
+                &operation_id,
+                acp_effect_outcome(&outcome, &cancellation, prompt_dispatched),
+            )?;
+            reasoning.persist(&self.store, session, &turn)?;
             match outcome {
                 Ok(outcome) => {
-                    return finish_acp_run(
+                    return finish_acp_turn(
                         &self.store,
                         session,
-                        &run,
+                        &turn,
                         &harness_descriptor,
                         Ok(outcome),
                         event_notify,
@@ -712,12 +869,12 @@ impl Mews {
                 Err(error) => {
                     let cancelled = cancellation.is_cancelled() || mews_acp::is_cancelled(&error);
                     let error = format!("{error:#}");
-                    self.store.finish_run(
-                        &run,
+                    self.store.finish_turn(
+                        &turn,
                         if cancelled {
-                            RunStatus::Cancelled
+                            TurnStatus::Cancelled
                         } else {
-                            RunStatus::Failed
+                            TurnStatus::Failed
                         },
                         (!cancelled).then_some(error.as_str()),
                     )?;
@@ -729,35 +886,263 @@ impl Mews {
             }
         }
         let provider = mews_router::RouterClient::new(&self.root);
-        match run_id {
-            Some(run_id) => {
-                super::native::run_started(
-                    &self.store,
-                    &provider,
-                    environment,
-                    session,
-                    system,
-                    super::native::StartedRun {
-                        id: run_id,
-                        event_notify: event_notify
-                            .context("started Run requires an event notifier")?,
-                        harness: harness_descriptor.clone(),
-                        cancellation: cancellation.clone(),
-                    },
-                )
-                .await
-            }
-            None => {
-                super::native::run(
-                    &self.store,
-                    &provider,
-                    environment,
-                    session,
-                    system,
-                    harness_descriptor,
-                )
-                .await
-            }
+            super::native::turn_started(
+                &self.store,
+                &provider,
+                environment,
+                session,
+                &revision,
+                super::native::StartedTurn {
+                    id: accepted_turn.clone(),
+                    event_notify,
+                    harness: harness_descriptor,
+                    cancellation: cancellation.clone(),
+                },
+            )
+            .await
         }
+        .await;
+        if let Err(error) = &result {
+            let cancelled = cancellation.is_cancelled()
+                || mews_agent::is_turn_cancelled(error)
+                || mews_acp::is_cancelled(error);
+            let detail = format!("{error:#}");
+            let _ = self.store.finish_turn(
+                &accepted_turn,
+                if cancelled {
+                    TurnStatus::Cancelled
+                } else {
+                    TurnStatus::Failed
+                },
+                (!cancelled).then_some(detail.as_str()),
+            );
+        }
+        result
+    }
+}
+
+fn acp_effect_outcome(
+    outcome: &Result<mews_acp::AcpSessionOutcome>,
+    cancellation: &mews_agent::CancellationToken,
+    prompt_dispatched: bool,
+) -> mews_store::EffectOutcome {
+    match outcome {
+        Ok(outcome) => mews_store::EffectOutcome::Succeeded(Some(serde_json::json!({
+            "session_id": outcome.session_id,
+            "stop_reason": format!("{:?}", outcome.stop_reason),
+        }))),
+        Err(error) if mews_agent::effect_uncertainty(error).is_some() => {
+            mews_store::EffectOutcome::Uncertain(format!("{error:#}"))
+        }
+        Err(error)
+            if prompt_dispatched
+                && (cancellation.is_cancelled() || mews_acp::is_cancelled(error)) =>
+        {
+            mews_store::EffectOutcome::Uncertain(
+                "ACP prompt was cancelled after dispatch; remote effects may have occurred".into(),
+            )
+        }
+        Err(error) if cancellation.is_cancelled() || mews_acp::is_cancelled(error) => {
+            mews_store::EffectOutcome::Failed("ACP prompt was cancelled".into())
+        }
+        Err(error) => mews_store::EffectOutcome::Failed(format!("{error:#}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(mews: &mut Mews, root: &Path) -> Session {
+        let agent = mews.create_agent("turn-test").unwrap();
+        mews.store
+            .create_session(&agent.id, &mews.installation().unwrap().hub_host_id, root)
+            .unwrap()
+    }
+
+    fn source() -> MessageSource {
+        MessageSource {
+            kind: SourceKind::Client,
+            id: "test".into(),
+            channel_origin: None,
+        }
+    }
+
+    #[test]
+    fn turn_replay_does_not_duplicate_input_or_create_another_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let mut mews = Mews::setup(root.path(), "laptop").unwrap();
+        let session = session(&mut mews, root.path());
+
+        let (first, first_message, created) = mews
+            .accept_turn_idempotent(
+                &session.id,
+                "same-turn",
+                "/template value".into(),
+                "expanded version one".into(),
+                serde_json::json!({"source":"test"}),
+                source(),
+            )
+            .unwrap();
+        assert!(created);
+        assert!(matches!(
+            first_message.content,
+            MessageContent::Text { text } if text == "expanded version one"
+        ));
+        assert!(
+            mews.replay_turn_idempotent(
+                &session.id,
+                "same-turn",
+                "/template value",
+                &serde_json::json!({"source":"test"}),
+                &source(),
+            )
+            .unwrap()
+            .is_some()
+        );
+        let (replayed, _, created) = mews
+            .accept_turn_idempotent(
+                &session.id,
+                "same-turn",
+                "/template value".into(),
+                "expanded version two".into(),
+                serde_json::json!({"source":"test"}),
+                source(),
+            )
+            .unwrap();
+
+        assert!(!created);
+        assert_eq!(replayed.id, first.id);
+        assert_eq!(mews.store.session_entries(&session.id).unwrap().len(), 1);
+        let consumer = crate::ConsumerId::new();
+        mews.subscribe_session(
+            &consumer,
+            &session.id,
+            mews_protocol::ConsumerKind::Ephemeral,
+        )
+        .unwrap();
+        emit_runtime_signal(
+            &mews.store,
+            &session.id,
+            &first.id,
+            mews_protocol::RuntimeSignalPayload::AssistantDelta {
+                delta: "chunk".into(),
+                message_id: None,
+            },
+        )
+        .unwrap();
+        let signals = mews.client_events(&consumer, 10).unwrap().events;
+        assert!(matches!(
+            signals.as_slice(),
+            [event] if matches!(&event.kind, crate::ClientEventKind::AssistantDelta { delta, .. } if delta == "chunk")
+        ));
+        assert_eq!(mews.store.session_entries(&session.id).unwrap().len(), 1);
+        assert!(
+            mews.accept_turn_idempotent(
+                &session.id,
+                "same-turn",
+                "different prompt".into(),
+                "different prompt".into(),
+                serde_json::json!({"source":"test"}),
+                source(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn late_failures_and_terminal_guard_do_not_overwrite_outcomes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut mews = Mews::setup(root.path(), "laptop").unwrap();
+        let first_session = session(&mut mews, root.path());
+        let (cancelled, _, _) = mews
+            .accept_turn_idempotent(
+                &first_session.id,
+                "cancelled-turn",
+                "prompt".into(),
+                "prompt".into(),
+                Value::Null,
+                source(),
+            )
+            .unwrap();
+        mews.cancel_turn(&cancelled.id).unwrap();
+        assert!(mews.fail_turn(&cancelled.id, "late failure").is_err());
+        assert_eq!(
+            mews.turn(&cancelled.id).unwrap().status,
+            TurnStatus::Cancelled
+        );
+
+        let second_session = mews
+            .store
+            .create_session(&first_session.agent_id, &first_session.host_id, root.path())
+            .unwrap();
+        let (failed, _, _) = mews
+            .accept_turn_idempotent(
+                &second_session.id,
+                "failed-turn",
+                "prompt".into(),
+                "prompt".into(),
+                Value::Null,
+                source(),
+            )
+            .unwrap();
+        {
+            let _guard = TurnTerminalGuard {
+                store: &mews.store,
+                turn_id: failed.id.clone(),
+                cancellation: mews_agent::CancellationToken::new(),
+            };
+            mews.fail_turn(&failed.id, "provider returned the real failure")
+                .unwrap();
+        }
+        let failed = mews.turn(&failed.id).unwrap();
+        assert_eq!(failed.status, TurnStatus::Failed);
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("provider returned the real failure")
+        );
+    }
+
+    #[test]
+    fn ambiguous_acp_outcome_wins_over_local_cancellation_state() {
+        let cancellation = mews_agent::CancellationToken::new();
+        cancellation.cancel();
+        let outcome =
+            Err(mews_agent::EffectUncertain::new("Host disconnected after ACP dispatch").into());
+
+        assert!(matches!(
+            acp_effect_outcome(&outcome, &cancellation, true),
+            mews_store::EffectOutcome::Uncertain(reason)
+                if reason.contains("Host disconnected after ACP dispatch")
+        ));
+    }
+
+    #[test]
+    fn definitive_acp_errors_are_not_recorded_as_uncertain() {
+        let outcome = Err(anyhow::anyhow!("adapter rejected the prompt"));
+
+        assert!(matches!(
+            acp_effect_outcome(&outcome, &mews_agent::CancellationToken::new(), true),
+            mews_store::EffectOutcome::Failed(reason)
+                if reason.contains("adapter rejected the prompt")
+        ));
+    }
+
+    #[test]
+    fn cancelled_acp_prompt_is_uncertain_only_after_dispatch() {
+        let cancellation = mews_agent::CancellationToken::new();
+        cancellation.cancel();
+        let outcome = Err(anyhow::anyhow!("cancelled"));
+
+        assert!(matches!(
+            acp_effect_outcome(&outcome, &cancellation, true),
+            mews_store::EffectOutcome::Uncertain(reason)
+                if reason.contains("after dispatch")
+        ));
+        assert!(matches!(
+            acp_effect_outcome(&outcome, &cancellation, false),
+            mews_store::EffectOutcome::Failed(reason)
+                if reason == "ACP prompt was cancelled"
+        ));
     }
 }

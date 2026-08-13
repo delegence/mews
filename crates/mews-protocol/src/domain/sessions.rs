@@ -4,7 +4,6 @@ use super::*;
 pub struct Session {
     pub id: SessionId,
     pub agent_id: AgentId,
-    pub agent_revision: u64,
     pub host_id: HostId,
     pub working_directory: PathBuf,
     pub model_override: Option<String>,
@@ -44,7 +43,10 @@ pub enum AcpInstructionChannel {
 #[serde(rename_all = "snake_case")]
 pub enum AcpReplacementReason {
     ResourceNotFound,
+    HarnessChanged,
     HarnessDefinitionChanged,
+    InstructionContextChanged,
+    HistoryDiverged,
     ContextNotDispatched,
 }
 

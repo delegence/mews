@@ -1,13 +1,13 @@
 use anyhow::{Context, Result};
 use mews_agent::{
-    AgentCapabilities, CancellationToken, MessageContent as ModelContent, MessageRole as ModelRole,
-    ModelMessage, Provider,
+    AgentCapabilities, AgentSignal, CancellationToken, MessageContent as ModelContent,
+    MessageRole as ModelRole, ModelMessage, Provider,
 };
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    AgentConfig, MessageContent, MessageRole, MessageSource, RunStatus, Session, SourceKind,
+    AgentConfig, MessageContent, MessageRole, MessageSource, Session, SourceKind, TurnStatus,
 };
 use mews_store::Store;
 
@@ -24,61 +24,21 @@ pub(crate) fn canonical_acp_prompt(store: &Store, session: &Session, soul: &str)
     Ok(mews_runtime::canonical_prompt(request.messages, soul))
 }
 
-pub async fn run(
-    store: &Store,
-    provider: &dyn Provider,
-    environment: &dyn AgentCapabilities,
-    session: &Session,
-    soul: String,
-    harness: mews_protocol::HarnessDescriptor,
-) -> Result<String> {
-    run_inner(
-        store,
-        provider,
-        environment,
-        session,
-        soul,
-        RunExecution::new(harness),
-    )
-    .await
-}
-
-pub struct StartedRun {
-    pub id: crate::RunId,
-    pub event_notify: Arc<tokio::sync::Notify>,
+pub struct StartedTurn {
+    pub id: crate::TurnId,
+    pub event_notify: Option<Arc<tokio::sync::Notify>>,
     pub harness: mews_protocol::HarnessDescriptor,
     pub cancellation: CancellationToken,
 }
 
-pub async fn run_started(
+pub async fn turn_started(
     store: &Store,
     provider: &dyn Provider,
     environment: &dyn AgentCapabilities,
     session: &Session,
-    soul: String,
-    started: StartedRun,
+    revision: &crate::AgentRevision,
+    started: StartedTurn,
 ) -> Result<String> {
-    let harness = started.harness.clone();
-    run_inner(
-        store,
-        provider,
-        environment,
-        session,
-        soul,
-        RunExecution::started(started, harness),
-    )
-    .await
-}
-
-async fn run_inner(
-    store: &Store,
-    provider: &dyn Provider,
-    environment: &dyn AgentCapabilities,
-    session: &Session,
-    soul: String,
-    execution: RunExecution,
-) -> Result<String> {
-    let revision = store.agent_revision(&session.agent_id, session.agent_revision)?;
     let agent_slug = store
         .agents()?
         .into_iter()
@@ -90,73 +50,45 @@ async fn run_inner(
     let scoped = SessionStore {
         store,
         session,
-        run: Mutex::new(RunState {
-            id: execution.started.as_ref().map(|started| started.id.clone()),
+        turn: Mutex::new(TurnState {
+            id: started.id,
             finished: false,
         }),
-        event_notify: execution
-            .started
-            .as_ref()
-            .map(|started| Arc::clone(&started.event_notify)),
-        harness: execution.harness,
+        event_notify: started.event_notify,
+        harness: started.harness,
     };
     if config.harness != mews_runtime::MEWS_HARNESS {
         anyhow::bail!("native runtime cannot execute Harness {}", config.harness);
     }
-    mews_runtime::Harness::run(
+    mews_runtime::Harness::execute_turn(
         &mews_runtime::MewsHarness,
-        mews_runtime::HarnessRun {
+        mews_runtime::HarnessTurn {
             provider,
             environment,
             store: &scoped,
+            agent_id: session.agent_id.clone(),
             agent_slug,
             agent: &config,
             model_override: session.model_override.clone(),
             default_model: defaults.model,
             default_reasoning: defaults.reasoning,
             cwd: session.working_directory.clone(),
-            soul,
-            cancellation: execution
-                .started
-                .as_ref()
-                .map_or_else(CancellationToken::new, |started| {
-                    started.cancellation.clone()
-                }),
+            soul: revision.soul.clone(),
+            cancellation: started.cancellation,
         },
     )
     .await
 }
 
-struct RunExecution {
-    started: Option<StartedRun>,
-    harness: mews_protocol::HarnessDescriptor,
-}
-
-impl RunExecution {
-    fn new(harness: mews_protocol::HarnessDescriptor) -> Self {
-        Self {
-            started: None,
-            harness,
-        }
-    }
-
-    fn started(started: StartedRun, harness: mews_protocol::HarnessDescriptor) -> Self {
-        Self {
-            started: Some(started),
-            harness,
-        }
-    }
-}
-
-struct RunState {
-    id: Option<crate::RunId>,
+struct TurnState {
+    id: crate::TurnId,
     finished: bool,
 }
 
 struct SessionStore<'a> {
     store: &'a Store,
     session: &'a Session,
-    run: Mutex<RunState>,
+    turn: Mutex<TurnState>,
     event_notify: Option<Arc<tokio::sync::Notify>>,
     harness: mews_protocol::HarnessDescriptor,
 }
@@ -171,28 +103,22 @@ impl SessionStore<'_> {
 
 impl Drop for SessionStore<'_> {
     fn drop(&mut self) {
-        let state = self.run.lock().expect("Run state poisoned");
-        if !state.finished
-            && let Some(run_id) = &state.id
-        {
-            let _ = self.store.finish_run(
-                run_id,
-                RunStatus::Cancelled,
-                Some("Run task was cancelled before completion"),
+        let state = self.turn.lock().expect("Turn state poisoned");
+        if !state.finished {
+            let _ = self.store.finish_turn(
+                &state.id,
+                TurnStatus::Cancelled,
+                Some("Turn task was cancelled before completion"),
             );
         }
     }
 }
 
 impl mews_runtime::ConversationStore for SessionStore<'_> {
-    fn begin_run(&self) -> Result<()> {
-        let mut state = self.run.lock().expect("Run state poisoned");
-        if state.id.is_none() {
-            state.id = Some(self.store.start_run(&self.session.id)?.id);
-        }
-        let run_id = state.id.as_ref().expect("Run was just started");
-        self.store.record_run_harness(
-            run_id,
+    fn begin_turn(&self) -> Result<()> {
+        let state = self.turn.lock().expect("Turn state poisoned");
+        self.store.record_turn_harness(
+            &state.id,
             &self.harness.name,
             &self.harness.definition_hash,
             self.harness.executable_version.as_deref(),
@@ -200,21 +126,23 @@ impl mews_runtime::ConversationStore for SessionStore<'_> {
         Ok(())
     }
 
-    fn finish_run(&self, error: Option<&str>) -> Result<()> {
-        let mut state = self.run.lock().expect("Run state poisoned");
-        let run_id = state
-            .id
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Run was not started"))?;
-        self.store.finish_run(
-            run_id,
-            if error.is_some() {
-                RunStatus::Failed
-            } else {
-                RunStatus::Completed
-            },
-            error,
-        )?;
+    fn finish_turn(&self, termination: mews_runtime::TurnTermination) -> Result<()> {
+        let mut state = self.turn.lock().expect("Turn state poisoned");
+        let turn_id = state.id.clone();
+        match termination {
+            mews_runtime::TurnTermination::Completed => {
+                self.store
+                    .finish_turn(&turn_id, TurnStatus::Completed, None)?;
+            }
+            mews_runtime::TurnTermination::Cancelled => {
+                self.store
+                    .finish_turn(&turn_id, TurnStatus::Cancelled, None)?;
+            }
+            mews_runtime::TurnTermination::Failed { error } => {
+                self.store
+                    .finish_turn(&turn_id, TurnStatus::Failed, Some(&error))?;
+            }
+        }
         state.finished = true;
         self.notify_event();
         Ok(())
@@ -269,18 +197,18 @@ impl mews_runtime::ConversationStore for SessionStore<'_> {
     }
 
     fn append_response(&self, response: mews_protocol::AssistantResponse) -> Result<()> {
-        let run_id = self.active_run_id()?;
+        let turn_id = self.active_turn_id()?;
         self.store
-            .append_assistant_response(&self.session.id, &run_id, response)?;
+            .append_assistant_response(&self.session.id, &turn_id, response)?;
         self.notify_event();
         Ok(())
     }
 
-    fn tool_started(&self, call: mews_agent::ToolCall) -> Result<()> {
-        let run_id = self.active_run_id()?;
-        self.store.append_tool_started(
+    fn tool_requested(&self, call: mews_agent::ToolCall) -> Result<()> {
+        let turn_id = self.active_turn_id()?;
+        self.store.append_tool_requested(
             &self.session.id,
-            &run_id,
+            &turn_id,
             mews_protocol::ToolCall {
                 call_id: call.id,
                 tool: call.name,
@@ -292,8 +220,66 @@ impl mews_runtime::ConversationStore for SessionStore<'_> {
         Ok(())
     }
 
+    fn tool_execution_started(&self, call: mews_agent::ToolCall) -> Result<()> {
+        let turn_id = self.active_turn_id()?;
+        self.store.start_tool_effect(
+            &self.session.id,
+            &turn_id,
+            mews_protocol::ToolCall {
+                call_id: call.id,
+                tool: call.name,
+                arguments: call.arguments,
+                thought_signature: call.thought_signature,
+            },
+        )?;
+        self.notify_event();
+        Ok(())
+    }
+
+    fn tool_execution_completed(
+        &self,
+        call: mews_agent::ToolCall,
+        result: mews_agent::ToolResult,
+    ) -> Result<()> {
+        let turn_id = self.active_turn_id()?;
+        self.store.complete_tool_execution(
+            &self.session.id,
+            &turn_id,
+            mews_protocol::ToolResult {
+                call_id: call.id,
+                tool: call.name,
+                result: result.value,
+                is_error: result.is_error,
+                uncertain: result.uncertain,
+            },
+        )?;
+        self.notify_event();
+        Ok(())
+    }
+
+    fn tool_result_recorded(
+        &self,
+        call: mews_agent::ToolCall,
+        result: mews_agent::ToolResult,
+    ) -> Result<()> {
+        let turn_id = self.active_turn_id()?;
+        self.store.append_tool_result(
+            &self.session.id,
+            &turn_id,
+            mews_protocol::ToolResult {
+                call_id: call.id,
+                tool: call.name,
+                result: result.value,
+                is_error: result.is_error,
+                uncertain: result.uncertain,
+            },
+        )?;
+        self.notify_event();
+        Ok(())
+    }
+
     fn append(&self, message: ModelMessage) -> Result<()> {
-        let run_id = self.active_run_id()?;
+        let turn_id = self.active_turn_id()?;
         let role = match message.role {
             ModelRole::User => MessageRole::User,
             ModelRole::Assistant => MessageRole::Assistant,
@@ -317,11 +303,13 @@ impl mews_runtime::ConversationStore for SessionStore<'_> {
                 tool,
                 result,
                 is_error,
+                uncertain,
             } => MessageContent::ToolResult {
                 call_id,
                 tool,
                 result,
                 is_error,
+                uncertain,
             },
             ModelContent::ProviderState {
                 provider,
@@ -363,16 +351,18 @@ impl mews_runtime::ConversationStore for SessionStore<'_> {
                     tool,
                     result,
                     is_error,
+                    uncertain,
                 },
             ) => {
                 self.store.append_tool_result(
                     &self.session.id,
-                    &run_id,
+                    &turn_id,
                     mews_protocol::ToolResult {
                         call_id,
                         tool,
                         result,
                         is_error,
+                        uncertain,
                     },
                 )?;
             }
@@ -385,9 +375,9 @@ impl mews_runtime::ConversationStore for SessionStore<'_> {
                     ..
                 },
             ) => {
-                self.store.append_tool_started(
+                self.store.append_tool_requested(
                     &self.session.id,
-                    &run_id,
+                    &turn_id,
                     mews_protocol::ToolCall {
                         call_id,
                         tool,
@@ -406,7 +396,7 @@ impl mews_runtime::ConversationStore for SessionStore<'_> {
             ) => {
                 self.store.append_harness_observation(
                     &self.session.id,
-                    &run_id,
+                    &turn_id,
                     None,
                     "provider_state",
                     serde_json::json!({"provider": provider, "model": model, "data": data}),
@@ -416,7 +406,7 @@ impl mews_runtime::ConversationStore for SessionStore<'_> {
             (MessageRole::Assistant, MessageContent::Text { text }) => {
                 self.store.append_assistant_response(
                     &self.session.id,
-                    &run_id,
+                    &turn_id,
                     mews_protocol::AssistantResponse {
                         provider: "mews".into(),
                         model: "injected".into(),
@@ -434,21 +424,69 @@ impl mews_runtime::ConversationStore for SessionStore<'_> {
         Ok(())
     }
 
-    fn assistant_delta(&self, delta: String) -> Result<()> {
-        let run_id = self
-            .run
-            .lock()
-            .expect("Run state poisoned")
-            .id
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Run was not started"))?;
-        self.store.append_client_event(
+    fn signal(&self, signal: AgentSignal) -> Result<()> {
+        let payload = match signal {
+            AgentSignal::AssistantStarted => return Ok(()),
+            AgentSignal::AssistantTextDelta(delta) => {
+                mews_protocol::RuntimeSignalPayload::AssistantDelta {
+                    delta,
+                    message_id: None,
+                }
+            }
+            AgentSignal::ToolProgress(progress) => {
+                mews_protocol::RuntimeSignalPayload::ToolActivity {
+                    activity: mews_protocol::ToolActivity {
+                        call_id: progress.call_id,
+                        title: "Tool progress".into(),
+                        kind: Some("progress".into()),
+                        status: Some("in_progress".into()),
+                        input: progress.value,
+                    },
+                }
+            }
+        };
+        super::turns::emit_runtime_signal(
+            self.store,
             &self.session.id,
-            crate::ClientEventKind::AssistantDelta {
-                run_id,
-                delta,
-                message_id: None,
-            },
+            &self.active_turn_id()?,
+            payload,
+        )?;
+        self.notify_event();
+        Ok(())
+    }
+
+    fn start_effect(
+        &self,
+        effect: mews_protocol::EffectRequest,
+    ) -> Result<mews_protocol::OperationId> {
+        let operation_id =
+            self.store
+                .start_effect(&self.session.id, &self.active_turn_id()?, effect)?;
+        self.notify_event();
+        Ok(operation_id)
+    }
+
+    fn finish_effect(
+        &self,
+        operation_id: &mews_protocol::OperationId,
+        outcome: mews_runtime::EffectTermination,
+    ) -> Result<()> {
+        let outcome = match outcome {
+            mews_runtime::EffectTermination::Succeeded(result) => {
+                mews_store::EffectOutcome::Succeeded(result)
+            }
+            mews_runtime::EffectTermination::Failed(error) => {
+                mews_store::EffectOutcome::Failed(error)
+            }
+            mews_runtime::EffectTermination::Uncertain(reason) => {
+                mews_store::EffectOutcome::Uncertain(reason)
+            }
+        };
+        self.store.finish_effect(
+            &self.session.id,
+            &self.active_turn_id()?,
+            operation_id,
+            outcome,
         )?;
         self.notify_event();
         Ok(())
@@ -456,13 +494,8 @@ impl mews_runtime::ConversationStore for SessionStore<'_> {
 }
 
 impl SessionStore<'_> {
-    fn active_run_id(&self) -> Result<crate::RunId> {
-        self.run
-            .lock()
-            .expect("Run state poisoned")
-            .id
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Run was not started"))
+    fn active_turn_id(&self) -> Result<crate::TurnId> {
+        Ok(self.turn.lock().expect("Turn state poisoned").id.clone())
     }
 }
 
@@ -544,11 +577,13 @@ fn native_replay(entries: &[mews_protocol::SessionEntry], target: &str) -> Vec<M
                             tool,
                             result,
                             is_error,
+                            uncertain,
                         } => ModelContent::ToolResult {
                             call_id,
                             tool,
                             result,
                             is_error,
+                            uncertain,
                         },
                         MessageContent::ProviderState {
                             provider,
@@ -630,6 +665,7 @@ fn native_replay(entries: &[mews_protocol::SessionEntry], target: &str) -> Vec<M
                         tool: result.tool.clone(),
                         result: result.result.clone(),
                         is_error: result.is_error,
+                        uncertain: result.uncertain,
                     },
                 });
             }
@@ -641,12 +677,12 @@ fn native_replay(entries: &[mews_protocol::SessionEntry], target: &str) -> Vec<M
                     },
                 })
             }
-            mews_protocol::SessionEntryPayload::RunStarted { .. }
+            mews_protocol::SessionEntryPayload::TurnStarted { .. }
             | mews_protocol::SessionEntryPayload::ToolStarted { .. }
             | mews_protocol::SessionEntryPayload::Reasoning { .. }
-            | mews_protocol::SessionEntryPayload::RunCompleted { .. }
-            | mews_protocol::SessionEntryPayload::RunFailed { .. }
-            | mews_protocol::SessionEntryPayload::RunCancelled { .. }
+            | mews_protocol::SessionEntryPayload::TurnCompleted { .. }
+            | mews_protocol::SessionEntryPayload::TurnFailed { .. }
+            | mews_protocol::SessionEntryPayload::TurnCancelled { .. }
             | mews_protocol::SessionEntryPayload::HarnessObservation { .. } => {}
         }
     }
@@ -703,11 +739,13 @@ fn provider_messages(messages: Vec<crate::Message>) -> Vec<ModelMessage> {
                     tool,
                     result,
                     is_error,
+                    uncertain,
                 } => ModelContent::ToolResult {
                     call_id,
                     tool,
                     result,
                     is_error,
+                    uncertain,
                 },
                 MessageContent::ProviderState {
                     provider,
@@ -731,10 +769,17 @@ mod tests {
     fn canonical_acp_prompt_keeps_linear_history_in_order() {
         let mut store = Store::open_in_memory().unwrap();
         let installation = store
-            .initialize("laptop", "key", "noise-key", "installation-key")
+            .initialize(
+                &mews_store::CommandContext::system(),
+                "laptop",
+                "key",
+                "noise-key",
+                "installation-key",
+            )
             .unwrap();
         let (agent, _) = store
             .create_agent(
+                &mews_store::CommandContext::system(),
                 "timeline-prompt",
                 "Soul",
                 "harness = \"mews\"\n",
@@ -753,10 +798,13 @@ mod tests {
             id: "cli".into(),
             channel_origin: None,
         };
-        store
-            .append_message(
+        let (turn, _, _) = store
+            .accept_turn_idempotent(
                 &session.id,
-                MessageRole::User,
+                "canonical-prompt",
+                MessageContent::Text {
+                    text: "hello".into(),
+                },
                 MessageContent::Text {
                     text: "hello".into(),
                 },
@@ -767,7 +815,7 @@ mod tests {
         store
             .append_assistant_response(
                 &session.id,
-                &crate::RunId::new(),
+                &turn.id,
                 mews_protocol::AssistantResponse {
                     provider: "test".into(),
                     model: "test".into(),

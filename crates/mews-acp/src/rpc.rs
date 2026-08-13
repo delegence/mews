@@ -8,7 +8,7 @@ use tokio::{
 };
 
 use crate::{
-    mcp::{RunMcpBridge, RunMcpHttp},
+    mcp::{TurnMcpBridge, TurnMcpHttp},
     permissions::{AcpPermissionDecision, AcpPermissionHandler, AcpPermissionRequest},
 };
 
@@ -37,7 +37,7 @@ pub struct AcpCancelled;
 
 impl fmt::Display for AcpCancelled {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("ACP harness run cancelled")
+        formatter.write_str("ACP harness Turn cancelled")
     }
 }
 
@@ -106,12 +106,41 @@ impl<'a, W: AsyncWriteExt + Unpin> RpcClient<'a, W> {
         method: &str,
         params: Value,
         cancellation: &mews_agent::CancellationToken,
-        mcp: Option<&RunMcpBridge<'_>>,
-        mcp_http: Option<&RunMcpHttp>,
+        mcp: Option<&TurnMcpBridge<'_>>,
+        mcp_http: Option<&TurnMcpHttp>,
+        on_update: F,
+    ) -> Result<Value>
+    where
+        F: FnMut(&Value) -> Result<()>,
+    {
+        self.request_with_dispatch(
+            method,
+            params,
+            cancellation,
+            mcp,
+            mcp_http,
+            || Ok(()),
+            on_update,
+        )
+        .await
+    }
+
+    /// Sends a request and reports the precise external-effect boundary after
+    /// its bytes have been flushed to the Harness stdin.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn request_with_dispatch<F, D>(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancellation: &mews_agent::CancellationToken,
+        mcp: Option<&TurnMcpBridge<'_>>,
+        mcp_http: Option<&TurnMcpHttp>,
+        mut on_dispatched: D,
         mut on_update: F,
     ) -> Result<Value>
     where
         F: FnMut(&Value) -> Result<()>,
+        D: FnMut() -> Result<()>,
     {
         let id = self.next_id;
         self.next_id += 1;
@@ -125,6 +154,7 @@ impl<'a, W: AsyncWriteExt + Unpin> RpcClient<'a, W> {
             .await?;
         self.writer.write_all(b"\n").await?;
         self.writer.flush().await?;
+        on_dispatched()?;
 
         let deadline = time::Instant::now() + self.timeout;
 
@@ -135,7 +165,7 @@ impl<'a, W: AsyncWriteExt + Unpin> RpcClient<'a, W> {
                         self.cancel_with_grace(session_id.as_deref()).await;
                         return Err(anyhow!(AcpCancelled));
                     }
-                    result = http.accept_and_handle(mcp.context("MCP endpoint requires a Run bridge")?, deadline) => {
+                    result = http.accept_and_handle(mcp.context("MCP endpoint requires a Turn bridge")?, deadline) => {
                         result?;
                         continue;
                     }

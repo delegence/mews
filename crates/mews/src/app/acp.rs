@@ -33,19 +33,19 @@ impl AcpReasoningAggregate {
         self,
         store: &mews_store::Store,
         session: &crate::Session,
-        run: &crate::RunId,
+        turn: &crate::TurnId,
     ) -> Result<()> {
         for (index, (message_id, text)) in self.items.into_iter().enumerate() {
             store.append_reasoning(
                 &session.id,
-                run,
+                turn,
                 text,
                 mews_protocol::ReasoningVisibility::Visible,
                 mews_protocol::ReasoningProvenance::Harness {
                     harness: "acp".into(),
                     message_id,
                 },
-                Some(format!("reasoning_completed:{run}:{index}")),
+                Some(format!("reasoning_completed:{turn}:{index}")),
             )?;
         }
         Ok(())
@@ -56,12 +56,19 @@ pub(super) fn checked_acp_binding(
     binding: Option<mews_protocol::AcpSessionBinding>,
     session: &crate::Session,
     harness: &mews_protocol::HarnessDescriptor,
+    context: Option<&mews_protocol::AcpBindingContext>,
+    previous_turn_harness: Option<&str>,
 ) -> Result<mews_protocol::AcpBindingTransition> {
     let Some(binding) = binding else {
         return Ok(mews_protocol::AcpBindingTransition::New);
     };
-    if binding.host_id != session.host_id || binding.harness != harness.name {
-        bail!("ACP Session binding does not match this Session's Host and Harness");
+    if binding.host_id != session.host_id {
+        bail!("ACP Session binding does not match this Session's Host");
+    }
+    if binding.harness != harness.name {
+        return Ok(mews_protocol::AcpBindingTransition::Replace {
+            reason: mews_protocol::AcpReplacementReason::HarnessChanged,
+        });
     }
     if !binding.context_dispatched {
         return Ok(mews_protocol::AcpBindingTransition::Replace {
@@ -75,6 +82,20 @@ pub(super) fn checked_acp_binding(
             reason: mews_protocol::AcpReplacementReason::HarnessDefinitionChanged,
         });
     }
+    if let Some(context) = context
+        && (binding.context_version != context.version
+            || binding.context_hash != context.hash
+            || binding.context_channel != context.channel)
+    {
+        return Ok(mews_protocol::AcpBindingTransition::Replace {
+            reason: mews_protocol::AcpReplacementReason::InstructionContextChanged,
+        });
+    }
+    if previous_turn_harness != Some(harness.name.as_str()) {
+        return Ok(mews_protocol::AcpBindingTransition::Replace {
+            reason: mews_protocol::AcpReplacementReason::HistoryDiverged,
+        });
+    }
     Ok(mews_protocol::AcpBindingTransition::Resume {
         acp_session_id: binding.acp_session_id,
     })
@@ -83,7 +104,7 @@ pub(super) fn checked_acp_binding(
 pub(super) fn persist_local_acp_event(
     store: &mews_store::Store,
     session: &crate::Session,
-    run_id: &crate::RunId,
+    turn_id: &crate::TurnId,
     _harness: &mews_protocol::HarnessDescriptor,
     event: &mews_acp::AcpStreamEvent,
     notify: Option<&Arc<tokio::sync::Notify>>,
@@ -93,24 +114,20 @@ pub(super) fn persist_local_acp_event(
         .acp_session_binding(&session.id)?
         .map(|binding| binding.acp_session_id);
     match event {
+        mews_acp::AcpStreamEvent::PromptDispatched { .. } => {
+            // The caller owns the operation ID and records this effect boundary.
+        }
         mews_acp::AcpStreamEvent::AssistantDelta {
-            event_key,
+            event_key: _,
             delta,
             message_id,
-            raw,
+            raw: _,
         } => {
-            store.append_acp_observation_with_client_event(
+            super::turns::emit_runtime_signal(
+                store,
                 &session.id,
-                run_id.clone(),
-                acp_session_id.clone(),
-                Some(event_key.clone()),
-                mews_protocol::AcpObservation::AssistantDelta {
-                    delta: delta.clone(),
-                    message_id: message_id.clone(),
-                    raw: raw.clone(),
-                },
-                crate::ClientEventKind::AssistantDelta {
-                    run_id: run_id.clone(),
+                turn_id,
+                mews_protocol::RuntimeSignalPayload::AssistantDelta {
                     delta: delta.clone(),
                     message_id: message_id.clone(),
                 },
@@ -119,7 +136,7 @@ pub(super) fn persist_local_acp_event(
         mews_acp::AcpStreamEvent::ProviderState { event_key, data } => {
             store.append_acp_observation(
                 &session.id,
-                run_id.clone(),
+                turn_id.clone(),
                 acp_session_id.clone(),
                 Some(event_key.clone()),
                 mews_protocol::AcpObservation::ProviderUpdate { data: data.clone() },
@@ -133,10 +150,11 @@ pub(super) fn persist_local_acp_event(
         } => {
             let _ = (event_key, raw);
             reasoning.push(message_id.clone(), delta);
-            store.append_client_event(
+            super::turns::emit_runtime_signal(
+                store,
                 &session.id,
-                crate::ClientEventKind::ReasoningDelta {
-                    run_id: run_id.clone(),
+                turn_id,
+                mews_protocol::RuntimeSignalPayload::ReasoningDelta {
                     delta: delta.clone(),
                     message_id: message_id.clone(),
                 },
@@ -157,18 +175,20 @@ pub(super) fn persist_local_acp_event(
                 status: status.clone(),
                 input: input.clone(),
             };
-            store.append_acp_observation_with_client_event(
+            store.append_acp_observation(
                 &session.id,
-                run_id.clone(),
+                turn_id.clone(),
                 acp_session_id.clone(),
                 Some(event_key.clone()),
                 mews_protocol::AcpObservation::ToolActivity {
                     activity: activity.clone(),
                 },
-                crate::ClientEventKind::ToolActivity {
-                    run_id: run_id.clone(),
-                    activity,
-                },
+            )?;
+            super::turns::emit_runtime_signal(
+                store,
+                &session.id,
+                turn_id,
+                mews_protocol::RuntimeSignalPayload::ToolActivity { activity },
             )?;
         }
         mews_acp::AcpStreamEvent::SessionBound {
@@ -182,7 +202,7 @@ pub(super) fn persist_local_acp_event(
         mews_acp::AcpStreamEvent::ContextDispatched { session_id, .. } => {
             store.mark_acp_context_dispatched_with_observation(
                 &session.id,
-                run_id.clone(),
+                turn_id.clone(),
                 session_id,
             )?;
         }
@@ -196,7 +216,7 @@ pub(super) fn persist_local_acp_event(
         } => {
             store.append_acp_observation(
                 &session.id,
-                run_id.clone(),
+                turn_id.clone(),
                 acp_session_id.clone(),
                 Some(event_key.clone()),
                 mews_protocol::AcpObservation::HookOutcome {
@@ -220,7 +240,7 @@ pub(super) async fn persist_remote_acp_binding(
     store: &mews_store::Store,
     host: &dyn crate::host::HostControl,
     session: &crate::Session,
-    run: &crate::RunId,
+    turn: &crate::TurnId,
     harness: &mews_protocol::HarnessDescriptor,
     acknowledgement_id: String,
     acp_session_id: String,
@@ -249,7 +269,7 @@ pub(super) async fn persist_remote_acp_binding(
         &context.text,
         context.channel,
         context.channel != mews_protocol::AcpInstructionChannel::FirstPrompt,
-        run.clone(),
+        turn.clone(),
     )?;
     host.acknowledge_acp_session_binding(acknowledgement_id)
         .await
@@ -259,7 +279,7 @@ pub(super) async fn persist_remote_acp_dispatch(
     store: &mews_store::Store,
     host: &dyn crate::host::HostControl,
     session: &crate::Session,
-    run: &crate::RunId,
+    turn: &crate::TurnId,
     acknowledgement_id: String,
     acp_session_id: String,
 ) -> Result<()> {
@@ -271,17 +291,17 @@ pub(super) async fn persist_remote_acp_dispatch(
     }
     store.mark_acp_context_dispatched_with_observation(
         &session.id,
-        run.clone(),
+        turn.clone(),
         &acp_session_id,
     )?;
     host.acknowledge_acp_session_binding(acknowledgement_id)
         .await
 }
 
-pub(super) fn finish_acp_run(
+pub(super) fn finish_acp_turn(
     store: &mews_store::Store,
     session: &crate::Session,
-    run: &crate::RunId,
+    turn: &crate::TurnId,
     harness: &mews_protocol::HarnessDescriptor,
     outcome: Result<mews_acp::AcpSessionOutcome>,
     notify: Option<Arc<tokio::sync::Notify>>,
@@ -290,14 +310,14 @@ pub(super) fn finish_acp_run(
         Ok(outcome) => outcome,
         Err(error) => {
             if mews_acp::is_cancelled(&error) {
-                store.finish_run(run, RunStatus::Cancelled, None)?;
+                store.finish_turn(turn, TurnStatus::Cancelled, None)?;
                 if let Some(notify) = notify {
                     notify.notify_waiters();
                 }
                 return Err(error);
             }
             let error = format!("{error:#}");
-            store.finish_run(run, RunStatus::Failed, Some(&error))?;
+            store.finish_turn(turn, TurnStatus::Failed, Some(&error))?;
             if let Some(notify) = notify {
                 notify.notify_waiters();
             }
@@ -309,7 +329,7 @@ pub(super) fn finish_acp_run(
         outcome.timings.spawn_ms, outcome.timings.initialize_ms, outcome.timings.continuation_ms
     );
     if outcome.stop_reason == mews_acp::AcpStopReason::Cancelled {
-        store.finish_run(run, RunStatus::Cancelled, None)?;
+        store.finish_turn(turn, TurnStatus::Cancelled, None)?;
         if let Some(notify) = notify {
             notify.notify_waiters();
         }
@@ -324,7 +344,7 @@ pub(super) fn finish_acp_run(
     if !outcome.answer.is_empty() {
         store.append_assistant_response(
             &session.id,
-            run,
+            turn,
             mews_protocol::AssistantResponse {
                 provider: harness.name.clone(),
                 model: harness
@@ -341,9 +361,9 @@ pub(super) fn finish_acp_run(
             },
         )?;
     }
-    store.finish_run_with_stop_reason(
-        run,
-        RunStatus::Completed,
+    store.finish_turn_with_stop_reason(
+        turn,
+        TurnStatus::Completed,
         None,
         Some(&format!("{:?}", outcome.stop_reason)),
     )?;

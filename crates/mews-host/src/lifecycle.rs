@@ -15,12 +15,12 @@ use mews_protocol::{
 use mews_store::Store;
 use mews_transport::{HostIdentity, NoiseIdentity};
 
-const MAX_CONCURRENT_ACP_RUNS: usize = 8;
+const MAX_CONCURRENT_ACP_TURNS: usize = 8;
 
 fn acp_capacity() -> Arc<tokio::sync::Semaphore> {
     static CAPACITY: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     Arc::clone(
-        CAPACITY.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ACP_RUNS))),
+        CAPACITY.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ACP_TURNS))),
     )
 }
 
@@ -164,7 +164,7 @@ pub async fn handle_host_request_streaming(
                 },
             }
         }
-        HubToHost::RunAcp {
+        HubToHost::ExecuteAcpTurn {
             request_id,
             harness,
             harness_options,
@@ -172,10 +172,11 @@ pub async fn handle_host_request_streaming(
             canonical_cwd,
             prompt,
             recovery_prompt,
+            agent_id,
             agent_slug,
             soul,
             mews_session_id,
-            run_id,
+            turn_id,
             transition,
             context,
         } => {
@@ -209,7 +210,8 @@ pub async fn handle_host_request_streaming(
                     catalog.launch(root, &harness)?
                 };
                 let skills = crate::resources::snapshot_agent_skills(root, &agent_slug)?;
-                match (transition.clone(), context) {
+                let stored_context = context;
+                match (&transition, &stored_context) {
                     (mews_protocol::AcpBindingTransition::Resume { .. }, Some(_)) => {}
                     (mews_protocol::AcpBindingTransition::Resume { .. }, None) => bail!("compatible ACP Resume requires its stored context"),
                     (mews_protocol::AcpBindingTransition::New | mews_protocol::AcpBindingTransition::Replace { .. }, Some(_)) => bail!("new or replacement ACP Session must not receive stored resume context"),
@@ -218,6 +220,7 @@ pub async fn handle_host_request_streaming(
                 // This is intentionally rendered even for Resume: it is held
                 // unused on success, but is the fresh boundary for typed
                 // resource_not_found replacement.
+                let extension_agent_slug = agent_slug.clone();
                 let context = mews_protocol::AcpBindingContext::from_snapshot(
                     &mews_protocol::AcpContextSnapshot {
                         version: mews_protocol::ACP_CONTEXT_VERSION,
@@ -229,6 +232,20 @@ pub async fn handle_host_request_streaming(
                     },
                     launch.instruction_channel,
                 ).map_err(anyhow::Error::msg)?;
+                let transition = match (&transition, &stored_context) {
+                    (mews_protocol::AcpBindingTransition::Resume { .. }, current)
+                        if current.as_ref().is_some_and(|stored| {
+                            stored.version != context.version
+                                || stored.hash != context.hash
+                                || stored.channel != context.channel
+                        }) =>
+                    {
+                        mews_protocol::AcpBindingTransition::Replace {
+                            reason: mews_protocol::AcpReplacementReason::InstructionContextChanged,
+                        }
+                    }
+                    _ => transition,
+                };
                 let skills = skills.into_iter().map(|skill| mews_acp::AcpSkill {
                     name: skill.name, description: skill.description, hash: skill.hash, content: skill.content,
                 }).collect::<Vec<_>>();
@@ -238,7 +255,7 @@ pub async fn handle_host_request_streaming(
                 // runtime. Run the capability bridge on its own current-thread
                 // runtime so Host extension implementations may retain their
                 // existing non-Send async boundary without widening authority.
-                // Each run needs a dedicated current-thread runtime (and may need
+                // Each Turn needs a dedicated current-thread runtime (and may need
                 // an event-forwarding thread), so bound that OS resource explicitly.
                 let acp_permit = acp_capacity()
                     .acquire_owned()
@@ -252,7 +269,7 @@ pub async fn handle_host_request_streaming(
                 let failed_harness = harness.clone();
                 let binding_waiters = binding_waiters.clone();
                 std::thread::Builder::new()
-                    .name("mews-acp-run".into())
+                    .name("mews-acp-turn".into())
                     .spawn(move || {
                         let _acp_permit = acp_permit;
                         // ACP's stream callback is synchronous. A bounded sync
@@ -285,11 +302,13 @@ pub async fn handle_host_request_streaming(
                                     Arc::new(registry),
                                 );
                                 runtime.block_on(
-                                    mews_acp::run_acp_session(mews_acp::AcpRunRequest {
+                                    mews_acp::execute_acp_turn(mews_acp::AcpTurnRequest {
                                         config,
                                         cwd: canonical_cwd,
                                         harness_options,
                                         session: mews_acp::AcpSessionRequest {
+                                            agent_id,
+                                            agent_slug: extension_agent_slug,
                                             transition,
                                             prompt,
                                             recovery_prompt,
@@ -298,11 +317,11 @@ pub async fn handle_host_request_streaming(
                                             skills,
                                             hook_metadata: Some(mews_acp::AcpHookMetadata {
                                                 mews_session_id,
-                                                run_id,
+                                                turn_id,
                                                 harness: harness.clone(),
                                                 context_hash: context.hash.clone(),
                                                 context_channel: context.channel,
-                                                invoke_run_start: true,
+                                                invoke_turn_start: true,
                                             }),
                                         },
                                         environment: &environment,
@@ -330,7 +349,7 @@ pub async fn handle_host_request_streaming(
                                                             transition,
                                                             context: context.clone(),
                                                         },
-                                                    }).map_err(|_| anyhow::anyhow!("Hub disconnected during ACP run"))?;
+                                                    }).map_err(|_| anyhow::anyhow!("Hub disconnected during ACP Turn"))?;
                                                 }
                                                 if binding_waiters.is_some() {
                                                     let acknowledgement = acknowledged.recv_timeout(
@@ -361,7 +380,7 @@ pub async fn handle_host_request_streaming(
                                                             acknowledgement_id: acknowledgement_id.clone(),
                                                             session_id,
                                                         },
-                                                    }).map_err(|_| anyhow::anyhow!("Hub disconnected during ACP run"))?;
+                                                    }).map_err(|_| anyhow::anyhow!("Hub disconnected during ACP Turn"))?;
                                                 }
                                                 if binding_waiters.is_some() {
                                                     let acknowledgement = acknowledged.recv_timeout(std::time::Duration::from_secs(30));
@@ -373,6 +392,10 @@ pub async fn handle_host_request_streaming(
                                                 return Ok(());
                                             }
                                             let events = match event {
+                                                mews_acp::AcpStreamEvent::PromptDispatched { event_key, session_id } => vec![mews_protocol::AcpEvent::PromptDispatched {
+                                                    event_key,
+                                                    session_id,
+                                                }],
                                                 mews_acp::AcpStreamEvent::AssistantDelta {
                                                     event_key,
                                                     delta,
@@ -437,7 +460,7 @@ pub async fn handle_host_request_streaming(
                                                         })
                                                         .map_err(|_| {
                                                             anyhow::anyhow!(
-                                                                "Hub disconnected during ACP run"
+                                                                "Hub disconnected during ACP Turn"
                                                             )
                                                         })?;
                                                 }
@@ -963,15 +986,14 @@ fn materialize_agent(
     std::fs::write(staged.join("SOUL.md"), &revision.soul)?;
     std::fs::write(staged.join("agent.toml"), &revision.config_toml)?;
     std::fs::write(staged.join(".revision"), revision.revision.to_string())?;
+    std::fs::write(staged.join(".agent-id"), revision.agent_id.as_str())?;
     let previous_directory = root.join("agents").join(observed_slug);
     let backup = if previous_directory.exists() {
         let backup = agents.join(format!(".{observed_slug}.previous-{unique}"));
         std::fs::rename(&previous_directory, &backup)?;
-        if backup.join("skills").exists()
-            && let Err(error) = std::fs::rename(backup.join("skills"), staged.join("skills"))
-        {
+        if let Err(error) = move_local_agent_resources(&backup, &staged) {
             let _ = std::fs::rename(&backup, &previous_directory);
-            return Err(error.into());
+            return Err(error);
         }
         Some(backup)
     } else {
@@ -979,14 +1001,32 @@ fn materialize_agent(
     };
     if let Err(error) = std::fs::rename(&staged, &directory) {
         if let Some(backup) = &backup {
-            if staged.join("skills").exists() {
-                let _ = std::fs::rename(staged.join("skills"), backup.join("skills"));
-            }
+            let _ = move_local_agent_resources(&staged, backup);
             let _ = std::fs::rename(backup, &previous_directory);
         }
         return Err(error.into());
     }
     retain_previous_agent_directories(&agents, observed_slug)?;
+    Ok(())
+}
+
+/// These directories are Host-local Agent resources and are intentionally not
+/// part of the synchronized Agent revision.
+fn move_local_agent_resources(from: &Path, to: &Path) -> Result<()> {
+    let mut moved = Vec::new();
+    for name in ["skills", "extensions"] {
+        let source = from.join(name);
+        if !source.exists() {
+            continue;
+        }
+        if let Err(error) = std::fs::rename(&source, to.join(name)) {
+            for moved_name in moved.into_iter().rev() {
+                let _ = std::fs::rename(to.join(moved_name), from.join(moved_name));
+            }
+            return Err(error.into());
+        }
+        moved.push(name);
+    }
     Ok(())
 }
 

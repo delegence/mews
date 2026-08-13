@@ -1,16 +1,18 @@
 use super::*;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Run {
-    pub id: RunId,
+pub struct Turn {
+    pub id: TurnId,
     pub session_id: SessionId,
-    /// Exact Host-local Harness definition selected for this Run. These are
+    /// Exact Agent revision selected atomically when this Turn was accepted.
+    pub agent_revision: u64,
+    /// Exact Host-local Harness definition selected for this Turn. These are
     /// filled before execution begins and remain stable even if the Host
-    /// catalog changes while the Run is active.
+    /// catalog changes while the Turn is active.
     pub harness: Option<String>,
     pub harness_definition_hash: Option<String>,
     pub harness_version: Option<String>,
-    pub status: RunStatus,
+    pub status: TurnStatus,
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
@@ -18,7 +20,7 @@ pub struct Run {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RunStatus {
+pub enum TurnStatus {
     Running,
     Completed,
     Failed,
@@ -31,6 +33,10 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub schema: Value,
+    /// Present only in Host catalogs. Model requests contain tools already
+    /// filtered to the selected Agent and clear this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<AgentId>,
 }
 
 /// The wire-level protocol used by a Host Harness. Agent configuration keeps

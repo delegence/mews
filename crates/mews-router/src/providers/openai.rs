@@ -514,7 +514,7 @@ fn messages(messages: &[crate::ModelMessage], provider: &str, model: &str) -> Re
             Some(Ok(match &message.content {
                 MessageContent::Text { text } => json!({"role":match message.role { MessageRole::User => "user", _ => "assistant" },"content":[{"type":if message.role == MessageRole::User {"input_text"} else {"output_text"},"text":text}]}),
                 MessageContent::ToolCall { call_id, tool, arguments, .. } => json!({"type":"function_call","call_id":call_id,"name":tool,"arguments":serde_json::to_string(arguments).ok()?}),
-                MessageContent::ToolResult { call_id, result, .. } => json!({"type":"function_call_output","call_id":call_id,"output":serde_json::to_string(result).ok()?}),
+                MessageContent::ToolResult { call_id, result, is_error, uncertain, .. } => json!({"type":"function_call_output","call_id":call_id,"output":serde_json::to_string(&mews_agent::tool_result_for_model(result, *is_error, *uncertain)).ok()?}),
                 MessageContent::ProviderState { provider: state_provider, model: state_model, data }
                     if state_provider == provider && state_model == model => data.clone(),
                 MessageContent::ProviderState { .. } => return None,
@@ -1086,6 +1086,7 @@ mod tests {
                     tool: "read".into(),
                     result: json!({"content":"hello"}),
                     is_error: false,
+                    uncertain: false,
                 },
             },
         ], "openai-codex", "gpt-test")
@@ -1093,6 +1094,30 @@ mod tests {
         assert_eq!(input[0]["encrypted_content"], "opaque");
         assert_eq!(input[1]["type"], "function_call");
         assert_eq!(input[2]["type"], "function_call_output");
+
+        let uncertain = messages(
+            &[ModelMessage {
+                role: MessageRole::Tool,
+                content: MessageContent::ToolResult {
+                    call_id: "call-uncertain".into(),
+                    tool: "write".into(),
+                    result: json!("reply lost"),
+                    is_error: true,
+                    uncertain: true,
+                },
+            }],
+            "openai-codex",
+            "gpt-test",
+        )
+        .unwrap();
+        let output: Value = serde_json::from_str(uncertain[0]["output"].as_str().unwrap()).unwrap();
+        assert_eq!(output["outcome"], "uncertain");
+        assert!(
+            output["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("Do not retry automatically")
+        );
 
         let response = parse(json!({"output":[
             {"type":"reasoning","id":"rs_2","encrypted_content":"next-opaque","summary":[]},
@@ -1105,6 +1130,7 @@ mod tests {
             matches!(&response.parts[1], ModelPart::ToolCall { id, name, arguments, .. } if id == "call-2" && name == "write" && arguments["path"] == "b")
         );
         let _ = ToolDefinition {
+            agent_id: None,
             name: "read".into(),
             description: "read".into(),
             schema: json!({}),

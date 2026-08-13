@@ -56,17 +56,23 @@ pub async fn agents(root: &Path, args: Vec<String>) -> Result<()> {
             client.archive_agent(slug.clone()).await?;
             println!("Deleted Agent {slug}.");
         }
-        [slug, option, prompt @ ..] if option == "-p" && !prompt.is_empty() => {
+        [slug, prompt_args @ ..] if !prompt_args.is_empty() => {
+            let prompt = parse_prompt_args(prompt_args)?;
             let session = start_session(&mut client, slug).await?;
-            let answer = send(&mut client, &session, prompt.join(" ")).await?;
-            println!("{answer}\n\nsession: {}", session.id);
+            if prompt.detach {
+                let turn = start_detached(&mut client, &session, prompt.message).await?;
+                println!("session: {}\nturn: {}", session.id, turn.id);
+            } else {
+                let answer = send(&mut client, &session, prompt.message).await?;
+                println!("{answer}\n\nsession: {}", session.id);
+            }
         }
         [slug] => {
             let session = start_session(&mut client, slug).await?;
             mews_tui::chat(&mut client, session).await?;
         }
         _ => bail!(
-            "usage: mews agents list | mews agents new [name] [--harness <name>] [--option <key=value>]... | mews agents rename <slug> <new-slug> | mews agents delete <slug> | mews agents <slug> [-p <message>]"
+            "usage: mews agents list | mews agents new [name] [--harness <name>] [--option <key=value>]... | mews agents rename <slug> <new-slug> | mews agents delete <slug> | mews agents <slug> [-p <message> [--detach]]"
         ),
     }
     Ok(())
@@ -286,17 +292,27 @@ fn external_option_choices(
     descriptors: &[(&mews_protocol::HarnessDescriptor, &str)],
     config_id: &str,
 ) -> Vec<OptionChoice> {
-    let mut choices = BTreeMap::<String, (Option<String>, Vec<String>)>::new();
+    let mut choices = Vec::<(String, Option<String>, Vec<String>)>::new();
     for (descriptor, host) in descriptors {
         for option in descriptor.config_options.iter().filter(|option| {
             option.get("id").and_then(serde_json::Value::as_str) == Some(config_id)
         }) {
             collect_option_entries(option.get("options"), &mut |value, name| {
-                let entry = choices.entry(value.to_owned()).or_default();
-                if entry.0.is_none() {
-                    entry.0 = name.map(str::to_owned);
+                if let Some((_, existing_name, hosts)) = choices
+                    .iter_mut()
+                    .find(|(existing, _, _)| existing == value)
+                {
+                    if existing_name.is_none() {
+                        *existing_name = name.map(str::to_owned);
+                    }
+                    hosts.push((*host).to_owned());
+                } else {
+                    choices.push((
+                        value.to_owned(),
+                        name.map(str::to_owned),
+                        vec![(*host).to_owned()],
+                    ));
                 }
-                entry.1.push((*host).to_owned());
             });
         }
     }
@@ -304,7 +320,7 @@ fn external_option_choices(
         label: "Harness default".into(),
         value: String::new(),
     }];
-    result.extend(choices.into_iter().map(|(value, (name, mut hosts))| {
+    result.extend(choices.into_iter().map(|(value, name, mut hosts)| {
         hosts.sort();
         hosts.dedup();
         let display = name
@@ -430,15 +446,16 @@ pub async fn sessions(root: &Path, id: Option<String>, args: Vec<String>) -> Res
     let session = client
         .session(id.parse().map_err(anyhow::Error::msg)?)
         .await?;
-    if let [command, prompt @ ..] = args.as_slice()
-        && command == "ask"
-        && !prompt.is_empty()
-    {
-        println!("{}", send(&mut client, &session, prompt.join(" ")).await?);
-    } else if args.is_empty() {
+    if args.is_empty() {
         mews_tui::chat(&mut client, session).await?;
     } else {
-        bail!("usage: mews sessions list | mews sessions <id> [ask <message>]");
+        let prompt = parse_prompt_args(&args)?;
+        if prompt.detach {
+            let turn = start_detached(&mut client, &session, prompt.message).await?;
+            println!("session: {}\nturn: {}", session.id, turn.id);
+        } else {
+            println!("{}", send(&mut client, &session, prompt.message).await?);
+        }
     }
     Ok(())
 }
@@ -475,13 +492,72 @@ async fn send(client: &mut MewsClient, session: &Session, prompt: String) -> Res
         .await
 }
 
+async fn start_detached(
+    client: &mut MewsClient,
+    session: &Session,
+    prompt: String,
+) -> Result<mews_protocol::Turn> {
+    client
+        .start_turn(
+            session.id.clone(),
+            prompt,
+            serde_json::Value::Null,
+            MessageSource {
+                kind: SourceKind::Client,
+                id: "cli".into(),
+                channel_origin: None,
+            },
+        )
+        .await
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PromptArgs {
+    message: String,
+    detach: bool,
+}
+
+fn parse_prompt_args(args: &[String]) -> Result<PromptArgs> {
+    let Some((option, rest)) = args.split_first() else {
+        bail!("-p requires a message");
+    };
+    if option != "-p" {
+        bail!("expected -p <message> [--detach]");
+    }
+    let detach = rest.iter().any(|argument| argument == "--detach");
+    let message = rest
+        .iter()
+        .filter(|argument| argument.as_str() != "--detach")
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if message.is_empty() {
+        bail!("-p requires a message");
+    }
+    Ok(PromptArgs { message, detach })
+}
+
 #[cfg(test)]
 mod tests {
     use mews_protocol::{
         HarnessAvailability, HarnessDescriptor, HarnessProtocol, HarnessReadiness,
     };
 
-    use super::{external_option_choices, parse_create_agent_args};
+    use super::{external_option_choices, parse_create_agent_args, parse_prompt_args};
+
+    #[test]
+    fn parses_prompt_and_optional_detach_flag() {
+        let attached = parse_prompt_args(&["-p".into(), "do".into(), "work".into()]).unwrap();
+        assert_eq!(attached.message, "do work");
+        assert!(!attached.detach);
+
+        let detached =
+            parse_prompt_args(&["-p".into(), "do".into(), "work".into(), "--detach".into()])
+                .unwrap();
+        assert_eq!(detached.message, "do work");
+        assert!(detached.detach);
+        assert!(parse_prompt_args(&["ask".into(), "do work".into()]).is_err());
+    }
 
     #[test]
     fn parses_a_harness_and_opaque_options() {
@@ -558,6 +634,58 @@ mod tests {
         assert_eq!(choices[0].label, "Harness default");
         assert_eq!(choices[1].label, "GPT Test (gpt-test)  [laptop]");
         assert_eq!(choices[1].value, "gpt-test");
+    }
+
+    #[test]
+    fn preserves_acp_option_order_while_merging_hosts() {
+        let first = HarnessDescriptor {
+            name: "codex".into(),
+            protocol: HarnessProtocol::Acp,
+            definition_hash: "first".into(),
+            availability: HarnessAvailability {
+                runtime: HarnessReadiness::Ready,
+                adapter: HarnessReadiness::Ready,
+                authentication: HarnessReadiness::Ready,
+                catalog: HarnessReadiness::Ready,
+                detail: None,
+            },
+            executable_version: None,
+            native_tools: Vec::new(),
+            modes: Vec::new(),
+            supports_mcp: true,
+            supports_continuation: false,
+            models: Vec::new(),
+            config_options: vec![serde_json::json!({
+                "id": "reasoning_effort",
+                "options": [
+                    { "value": "low" },
+                    { "value": "medium" },
+                    { "value": "high" },
+                    { "value": "xhigh" }
+                ]
+            })],
+            probed_at: None,
+        };
+        let mut second = first.clone();
+        second.definition_hash = "second".into();
+        second.config_options = vec![serde_json::json!({
+            "id": "reasoning_effort",
+            "options": [{ "value": "high" }, { "value": "max" }]
+        })];
+
+        let choices = external_option_choices(
+            &[(&first, "laptop"), (&second, "desktop")],
+            "reasoning_effort",
+        );
+
+        assert_eq!(
+            choices
+                .iter()
+                .map(|choice| choice.value.as_str())
+                .collect::<Vec<_>>(),
+            ["", "low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(choices[3].label, "high  [desktop, laptop]");
     }
 
     #[test]

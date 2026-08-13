@@ -1,11 +1,12 @@
-//! Hub protocol server and transient request/run coordination.
+//! Hub protocol server and transient request/Turn coordination.
 
 #[cfg(not(unix))]
 compile_error!("the MEWS Hub transport requires Unix sockets");
 
-mod active_runs;
+mod active_turns;
 mod dispatch;
 mod handoff;
+mod journal;
 
 use std::{
     collections::HashMap,
@@ -38,11 +39,12 @@ pub(crate) struct HubControl {
     pub moving: Arc<AtomicBool>,
     pub handoff_gate: Arc<tokio::sync::RwLock<()>>,
     pub session_locks: Arc<Mutex<HashMap<crate::SessionId, Arc<Mutex<()>>>>>,
-    pub run_tasks: Arc<Mutex<HashMap<crate::RunId, RunTask>>>,
+    pub turn_tasks: Arc<Mutex<HashMap<crate::TurnId, TurnTask>>>,
     pub event_notify: Arc<tokio::sync::Notify>,
+    pub journal_notify: Arc<tokio::sync::Notify>,
 }
 
-pub(crate) struct RunTask {
+pub(crate) struct TurnTask {
     pub cancellation: mews_agent::CancellationToken,
     pub abort: tokio::task::AbortHandle,
     pub finished: Arc<tokio::sync::Notify>,
@@ -121,11 +123,12 @@ async fn serve_local(root: PathBuf, recovering_handoff: bool) -> Result<bool> {
     }
     let listener = UnixListener::bind(&path).with_context(|| format!("bind {}", path.display()))?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    let initial = if recovering_handoff {
+    let mut initial_state = if recovering_handoff {
         Mews::open_handoff(&root)?
     } else {
         Mews::open(&root)?
     };
+    let initial = initial_state.commands(mews_store::CommandContext::system());
     if root.join("hub-promote").exists() {
         let state = root.join("hub.json");
         if state.exists() {
@@ -154,7 +157,7 @@ async fn serve_local(root: PathBuf, recovering_handoff: bool) -> Result<bool> {
     let local_host = Arc::new(
         ConnectedHost::in_process(
             initial.installation()?.hub_host_id,
-            mews_host::ToolRegistry::with_host_extensions(&root)?,
+            mews_host::ToolRegistry::with_agent_extensions(&root)?,
         )
         .await?,
     );
@@ -163,12 +166,17 @@ async fn serve_local(root: PathBuf, recovering_handoff: bool) -> Result<bool> {
     // coarse service mutex.
     let mews = initial;
     let remote_hosts: RemoteHosts = Arc::new(Mutex::new(HashMap::new()));
+    // Session delivery and the canonical journal are backed by the same
+    // commits, so one wake primitive reliably covers both readers. The
+    // dedicated field keeps their request paths independent.
+    let journal_notify = Arc::new(tokio::sync::Notify::new());
     let control = HubControl {
         moving: Arc::new(AtomicBool::new(recovering_handoff)),
         handoff_gate: Arc::new(tokio::sync::RwLock::new(())),
         session_locks: Arc::new(Mutex::new(HashMap::new())),
-        run_tasks: Arc::new(Mutex::new(HashMap::new())),
-        event_notify: Arc::new(tokio::sync::Notify::new()),
+        turn_tasks: Arc::new(Mutex::new(HashMap::new())),
+        event_notify: Arc::clone(&journal_notify),
+        journal_notify,
     };
     let runtime = Arc::new(HubRuntime {
         remote_hosts: Arc::clone(&remote_hosts),
@@ -280,7 +288,9 @@ async fn connection(
         } else {
             let request: HubRequest = serde_json::from_value(frame.body)?;
             let result = match resolve_request_location(RequestOrigin::Local, request) {
-                Ok(request) => dispatch(&runtime, &root, RequestOrigin::Local, request).await,
+                Ok(request) => {
+                    dispatch(&runtime, &root, RequestOrigin::Local, &request_id, request).await
+                }
                 Err(error) => Err(error),
             };
             match result {
@@ -312,6 +322,8 @@ pub(crate) fn protocol_error(error: &anyhow::Error) -> ProtocolError {
             StoreError::NotFound { .. } => ProtocolErrorCode::NotFound,
             StoreError::DuplicateAgent(_)
             | StoreError::RevisionConflict { .. }
+            | StoreError::ActiveTurnConflict { .. }
+            | StoreError::CommandConflict { .. }
             | StoreError::LeafConflict { .. } => ProtocolErrorCode::Conflict,
             StoreError::InvalidAgent(_) | StoreError::InvalidData(_) => {
                 ProtocolErrorCode::InvalidRequest

@@ -6,7 +6,8 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::app::Mews;
-use crate::app::StartedRun;
+use crate::app::StartedTurn;
+use crate::host::HostExecutor;
 
 use super::HubRuntime;
 
@@ -52,22 +53,71 @@ pub(super) async fn start_turn(
     prompt: String,
     metadata: Value,
     source: Option<MessageSource>,
-) -> Result<mews_protocol::Run> {
-    let mews = Mews::open_connection(root)?;
+) -> Result<mews_protocol::Turn> {
+    let mut mews = Mews::open_connection(root)?;
     let source = source.unwrap_or(MessageSource {
         kind: SourceKind::Client,
         id: "client".into(),
         channel_origin: None,
     });
-    let (run, created) = mews.start_run_idempotent(
+    if source.id.is_empty() || source.id.len() > 256 {
+        anyhow::bail!("message source ID must contain 1 to 256 bytes");
+    }
+    if !matches!(source.kind, SourceKind::Client | SourceKind::Channel) {
+        anyhow::bail!("user messages may only be attributed to a client or channel");
+    }
+    if let Some((turn, _)) =
+        mews.replay_turn_idempotent(&session_id, &idempotency_key, &prompt, &metadata, &source)?
+    {
+        return Ok(turn);
+    }
+    let request_prompt = prompt.clone();
+    let session = mews.session(&session_id)?;
+    let agent_slug = mews
+        .agents()?
+        .into_iter()
+        .find(|agent| agent.id == session.agent_id)
+        .context("Session Agent no longer exists")?
+        .slug;
+    let installation = mews.installation()?;
+    let prompt = if session.host_id == installation.hub_host_id {
+        mews.commands(mews_store::CommandContext::system())
+            .synchronize_agent_on(&agent_slug, runtime.local_host.as_ref())
+            .await?;
+        Mews::expand_prompt(
+            runtime.local_host.agent_capabilities(),
+            &session.working_directory,
+            &prompt,
+        )
+        .await?
+    } else {
+        let host = runtime
+            .remote_hosts
+            .lock()
+            .await
+            .get(&session.host_id)
+            .cloned()
+            .with_context(|| format!("Session Host {} is offline", session.host_id))?;
+        mews.commands(mews_store::CommandContext::system())
+            .synchronize_agent_on(&agent_slug, host.as_ref())
+            .await?;
+        Mews::expand_prompt(
+            host.agent_capabilities(),
+            &session.working_directory,
+            &prompt,
+        )
+        .await?
+    };
+    let (turn, _, created) = mews.accept_turn_idempotent(
         &session_id,
         &idempotency_key,
-        source.channel_origin.as_ref(),
+        request_prompt,
+        prompt.clone(),
+        metadata.clone(),
+        source.clone(),
     )?;
-    let session = mews.session(&session_id)?;
-    let installation = mews.installation()?;
     if !created {
-        return Ok(run);
+        return Ok(turn);
     }
     runtime.control.event_notify.notify_waiters();
 
@@ -75,13 +125,17 @@ pub(super) async fn start_turn(
     let remote_hosts = Arc::clone(&runtime.remote_hosts);
     let local_host = Arc::clone(&runtime.local_host);
     let locks = Arc::clone(&runtime.control.session_locks);
-    let run_task = run.clone();
-    let tasks = Arc::clone(&runtime.control.run_tasks);
+    let turn_task = turn.clone();
+    let tasks = Arc::clone(&runtime.control.turn_tasks);
+    let task_registry = Arc::clone(&tasks);
     let notify = Arc::clone(&runtime.control.event_notify);
     let finished = Arc::new(tokio::sync::Notify::new());
-    let run_finished = Arc::clone(&finished);
+    let turn_finished = Arc::clone(&finished);
     let cancellation = mews_agent::CancellationToken::new();
-    let run_cancellation = cancellation.clone();
+    let turn_cancellation = cancellation.clone();
+    // Register while holding the map lock so a very fast task cannot remove
+    // itself before its handle has been published.
+    let mut registered_tasks = tasks.lock().await;
     let task = tokio::task::spawn_local(async move {
         let lock = {
             let mut locks = locks.lock().await;
@@ -101,10 +155,10 @@ pub(super) async fn start_turn(
                     metadata,
                     local_host.as_ref(),
                     source,
-                    StartedRun {
-                        id: run_task.id.clone(),
+                    StartedTurn {
+                        id: turn_task.id.clone(),
                         event_notify: Arc::clone(&notify),
-                        cancellation: run_cancellation.clone(),
+                        cancellation: turn_cancellation.clone(),
                     },
                 )
                 .await?;
@@ -121,10 +175,10 @@ pub(super) async fn start_turn(
                     metadata,
                     host.as_ref(),
                     source,
-                    StartedRun {
-                        id: run_task.id.clone(),
+                    StartedTurn {
+                        id: turn_task.id.clone(),
                         event_notify: Arc::clone(&notify),
-                        cancellation: run_cancellation.clone(),
+                        cancellation: turn_cancellation.clone(),
                     },
                 )
                 .await?;
@@ -133,28 +187,33 @@ pub(super) async fn start_turn(
         }
         .await;
         if let Err(error) = result
-            && !run_cancellation.is_cancelled()
+            && !turn_cancellation.is_cancelled()
             && let Ok(mews) = Mews::open_connection(&root)
         {
-            let _ = mews.fail_run(&run_task.id, &format!("{error:#}"));
+            let _ = mews.fail_turn(&turn_task.id, &format!("{error:#}"));
         }
-        tasks.lock().await.remove(&run_task.id);
+        task_registry.lock().await.remove(&turn_task.id);
         notify.notify_waiters();
-        run_finished.notify_waiters();
+        turn_finished.notify_waiters();
     });
-    runtime.control.run_tasks.lock().await.insert(
-        run.id.clone(),
-        super::RunTask {
+    registered_tasks.insert(
+        turn.id.clone(),
+        super::TurnTask {
             cancellation,
             abort: task.abort_handle(),
             finished,
         },
     );
-    Ok(run)
+    drop(registered_tasks);
+    Ok(turn)
 }
 
-pub(crate) async fn cancel_run(control: &super::HubControl, _root: &Path, run_id: &crate::RunId) {
-    let task = control.run_tasks.lock().await.remove(run_id);
+pub(crate) async fn cancel_turn(
+    control: &super::HubControl,
+    _root: &Path,
+    turn_id: &crate::TurnId,
+) {
+    let task = control.turn_tasks.lock().await.remove(turn_id);
     if let Some(task) = task {
         let finished = task.finished.notified();
         tokio::pin!(finished);

@@ -4,22 +4,23 @@ use futures_util::StreamExt;
 use serde_json::Value;
 
 use crate::{
-    AgentEvent, AgentLoopConfig, AgentRuntime, CancellationToken, MessageContent, MessageRole,
-    ModelMessage, ModelRequest, ModelStreamEvent, NextTurnUpdate, ProgressReporter, Provider,
-    ToolCall, ToolCatalog, ToolDecision, ToolExecutionMode, ToolProgress, ToolResult, TurnDecision,
-    apply_context_budget,
+    AgentEvent, AgentLoopConfig, AgentRuntime, AgentSignal, CancellationToken, EffectUncertain,
+    MessageContent, MessageRole, ModelMessage, ModelRequest, ModelStream, ModelStreamEvent,
+    NextStepUpdate, ProgressReporter, Provider, ProviderCallOutcome, ProviderError, StepDecision,
+    ToolCall, ToolCatalog, ToolDecision, ToolExecutionMode, ToolProgress, ToolResult,
+    TurnCancelled, apply_context_budget, effect_uncertainty,
 };
-use mews_protocol::{AssistantResponse, AssistantResponseBlock};
+use mews_protocol::{AssistantResponse, AssistantResponseBlock, OperationId};
 
-const MAX_TOOL_CALLS_PER_TURN: usize = 64;
+const MAX_TOOL_CALLS_PER_STEP: usize = 64;
 const MAX_CONCURRENT_TOOLS: usize = 8;
 
-pub async fn run(
+pub async fn execute_turn(
     provider: &dyn Provider,
     runtime: &dyn AgentRuntime,
     max_steps: usize,
 ) -> Result<String> {
-    run_with_config(
+    execute_turn_with_config(
         provider,
         runtime,
         AgentLoopConfig {
@@ -30,14 +31,16 @@ pub async fn run(
     .await
 }
 
-pub async fn run_with_config(
+pub async fn execute_turn_with_config(
     provider: &dyn Provider,
     runtime: &dyn AgentRuntime,
     config: AgentLoopConfig,
 ) -> Result<String> {
-    runtime.event(AgentEvent::RunStart).await?;
-    let outcome = run_inner(provider, runtime, &config).await;
-    let ended = runtime.event(AgentEvent::RunEnd).await;
+    let outcome = match runtime.turn_started().await {
+        Ok(()) => execute_turn_inner(provider, runtime, &config).await,
+        Err(error) => Err(error),
+    };
+    let ended = runtime.turn_finished().await;
     match (outcome, ended) {
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
@@ -45,7 +48,7 @@ pub async fn run_with_config(
     }
 }
 
-async fn run_inner(
+async fn execute_turn_inner(
     provider: &dyn Provider,
     runtime: &dyn AgentRuntime,
     config: &AgentLoopConfig,
@@ -65,22 +68,20 @@ async fn run_inner(
     }
     let mut final_text = String::new();
 
-    for turn in 0..config.max_steps {
+    for step in 0..config.max_steps {
         config.cancellation.check()?;
-        if turn > 0 {
+        if step > 0 {
             request.tools = runtime.tools().await?;
         }
         inject(runtime, &mut request, runtime.steering_messages().await?).await?;
-        runtime.event(AgentEvent::TurnStart { index: turn }).await?;
         runtime.transform_context(&mut request).await?;
         runtime.before_model(&mut request).await?;
         apply_context_budget(&mut request)?;
         let tools = ToolCatalog::compile(request.tools.clone())?;
-        runtime.event(AgentEvent::BeforeModel).await?;
 
         let (response, calls) =
             stream_response(provider, runtime, &request, &config.cancellation).await?;
-        // A response cursor identifies the response that was current when this run began. Once
+        // A response cursor identifies the response that was current when this Turn began. Once
         // the provider has produced a new response, reusing that cursor would branch subsequent
         // tool-loop steps from stale state. The accumulated messages are the canonical fallback.
         request.continuation = None;
@@ -134,9 +135,34 @@ async fn run_inner(
             .event(AgentEvent::AssistantResponse(response))
             .await?;
 
-        let mut results = prepare_and_execute(runtime, calls, &tools, config).await?;
-        for (call, result) in &mut results {
-            runtime.after_tool(call, result).await?;
+        let BatchOutcome {
+            mut completed,
+            mut terminal_error,
+        } = prepare_and_execute(runtime, calls, &tools, config).await?;
+        for (call, result) in &mut completed {
+            if let Err(error) = runtime.after_tool(call, result).await {
+                let replay_result = match effect_uncertainty(&error) {
+                    Some(uncertain) => ToolResult::uncertain(format!(
+                        "after_tool outcome is uncertain: {}",
+                        uncertain.reason()
+                    )),
+                    None => ToolResult::error(format!("after_tool failed: {error:#}")),
+                };
+                runtime
+                    .event(AgentEvent::ToolResultRecorded {
+                        call: call.clone(),
+                        result: replay_result,
+                    })
+                    .await?;
+                terminal_error.get_or_insert(error);
+                continue;
+            }
+            runtime
+                .event(AgentEvent::ToolResultRecorded {
+                    call: call.clone(),
+                    result: result.clone(),
+                })
+                .await?;
             request.messages.push(ModelMessage {
                 role: MessageRole::Tool,
                 content: MessageContent::ToolResult {
@@ -144,26 +170,44 @@ async fn run_inner(
                     tool: call.name.clone(),
                     result: result.value.clone(),
                     is_error: result.is_error,
+                    uncertain: result.uncertain,
                 },
             });
-            runtime
-                .event(AgentEvent::ToolResult {
-                    call: call.clone(),
-                    result: result.clone(),
-                })
-                .await?;
+        }
+        if let Some(error) = terminal_error {
+            return Err(error);
         }
 
-        runtime.event(AgentEvent::TurnEnd { index: turn }).await?;
-        if results.iter().any(|(_, result)| result.terminate) {
+        let uncertain = completed.iter().find_map(|(_, result)| {
+            result.uncertain.then(|| {
+                result
+                    .value
+                    .as_str()
+                    .unwrap_or("tool outcome is uncertain")
+                    .to_owned()
+            })
+        });
+        let after_step = runtime.after_step(&request).await;
+        if let Some(reason) = uncertain {
+            let error = anyhow::Error::from(EffectUncertain::new(reason));
+            return match after_step {
+                Ok(_) => Err(error),
+                Err(after_step) => Err(error.context(format!(
+                    "after_step also failed after the uncertain effect: {after_step:#}"
+                ))),
+            };
+        }
+
+        let step_decision = after_step?;
+        if completed.iter().any(|(_, result)| result.terminate) {
             return Ok(final_text);
         }
-        let update = runtime.prepare_next_turn(&request).await?;
+        if step_decision == StepDecision::Stop {
+            return Ok(final_text);
+        }
+        let update = runtime.prepare_next_step(&request).await?;
         apply_update(&mut request, update);
-        if runtime.after_turn(&request).await? == TurnDecision::Stop {
-            return Ok(final_text);
-        }
-        if results.is_empty() {
+        if completed.is_empty() {
             let follow_ups = runtime.follow_up_messages().await?;
             if follow_ups.is_empty() {
                 return Ok(final_text);
@@ -185,10 +229,17 @@ async fn stream_response(
     cancellation: &CancellationToken,
 ) -> Result<(AssistantResponse, Vec<ToolCall>)> {
     let mut cursor_active = request.continuation.is_some();
-    let mut stream = match provider.stream(request.clone()).await {
-        Err(crate::ProviderError::CursorRejected(_)) if request.continuation.is_some() => {
+    let initial = start_provider_stream(provider, runtime, request.clone()).await;
+    let (mut stream, mut provider_operation) = match initial {
+        Err(error)
+            if request.continuation.is_some()
+                && matches!(
+                    error.downcast_ref::<ProviderError>(),
+                    Some(ProviderError::CursorRejected(_))
+                ) =>
+        {
             cursor_active = false;
-            provider.stream(full_replay(request)?).await?
+            start_provider_stream(provider, runtime, full_replay(request)?).await?
         }
         result => result?,
     };
@@ -211,30 +262,60 @@ async fn stream_response(
     let mut completed = false;
     loop {
         let event = tokio::select! {
-            _ = cancellation.cancelled() => bail!("agent run cancelled"),
+            _ = cancellation.cancelled() => {
+                finish_provider_call(
+                    runtime,
+                    &mut provider_operation,
+                    ProviderCallOutcome::Uncertain("provider call was cancelled after dispatch".into()),
+                ).await?;
+                return Err(TurnCancelled.into());
+            },
             event = stream.next() => event,
         };
         let Some(event) = event else {
             if !completed {
+                finish_provider_call(
+                    runtime,
+                    &mut provider_operation,
+                    ProviderCallOutcome::Uncertain(
+                        "provider stream ended before response completion".into(),
+                    ),
+                )
+                .await?;
                 bail!("provider stream ended before response completion");
             }
             break;
         };
         let event = match event {
             Ok(event) => event,
-            Err(crate::ProviderError::CursorRejected(_))
+            Err(error @ ProviderError::CursorRejected(_))
                 if cursor_active && !provider_execution_observed =>
             {
+                finish_provider_call(
+                    runtime,
+                    &mut provider_operation,
+                    provider_error_outcome(&error),
+                )
+                .await?;
                 cursor_active = false;
-                stream = provider.stream(full_replay(request)?).await?;
+                (stream, provider_operation) =
+                    start_provider_stream(provider, runtime, full_replay(request)?).await?;
                 continue;
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                finish_provider_call(
+                    runtime,
+                    &mut provider_operation,
+                    provider_error_outcome(&error),
+                )
+                .await?;
+                return Err(error.into());
+            }
         };
         match event {
             ModelStreamEvent::Start => {
                 if !started {
-                    runtime.event(AgentEvent::AssistantStart).await?;
+                    runtime.signal(AgentSignal::AssistantStarted).await?;
                     started = true;
                 }
             }
@@ -253,7 +334,7 @@ async fn stream_response(
             ModelStreamEvent::TextDelta(delta) => {
                 provider_execution_observed = true;
                 if !started {
-                    runtime.event(AgentEvent::AssistantStart).await?;
+                    runtime.signal(AgentSignal::AssistantStarted).await?;
                     started = true;
                 }
                 if let Some(AssistantResponseBlock::Text { text }) = response.blocks.last_mut() {
@@ -263,7 +344,9 @@ async fn stream_response(
                         text: delta.clone(),
                     });
                 }
-                runtime.event(AgentEvent::AssistantTextDelta(delta)).await?;
+                runtime
+                    .signal(AgentSignal::AssistantTextDelta(delta))
+                    .await?;
             }
             ModelStreamEvent::Reasoning { text, signature } => {
                 provider_execution_observed = true;
@@ -279,7 +362,7 @@ async fn stream_response(
             } => {
                 provider_execution_observed = true;
                 if !started {
-                    runtime.event(AgentEvent::AssistantStart).await?;
+                    runtime.signal(AgentSignal::AssistantStarted).await?;
                     started = true;
                 }
                 calls.push(ToolCall {
@@ -316,13 +399,65 @@ async fn stream_response(
             }
             ModelStreamEvent::Done => {
                 if !completed {
+                    finish_provider_call(
+                        runtime,
+                        &mut provider_operation,
+                        ProviderCallOutcome::Uncertain(
+                            "provider stream ended before response completion".into(),
+                        ),
+                    )
+                    .await?;
                     bail!("provider stream ended before response completion");
                 }
                 break;
             }
         }
     }
+    finish_provider_call(
+        runtime,
+        &mut provider_operation,
+        ProviderCallOutcome::Succeeded,
+    )
+    .await?;
     Ok((response, calls))
+}
+
+async fn start_provider_stream(
+    provider: &dyn Provider,
+    runtime: &dyn AgentRuntime,
+    request: ModelRequest,
+) -> Result<(ModelStream, Option<OperationId>)> {
+    let mut operation_id = runtime.provider_call_started(&request).await?;
+    match provider.stream(request).await {
+        Ok(stream) => Ok((stream, operation_id)),
+        Err(error) => {
+            finish_provider_call(runtime, &mut operation_id, provider_error_outcome(&error))
+                .await?;
+            Err(error.into())
+        }
+    }
+}
+
+async fn finish_provider_call(
+    runtime: &dyn AgentRuntime,
+    operation_id: &mut Option<OperationId>,
+    outcome: ProviderCallOutcome,
+) -> Result<()> {
+    if let Some(operation_id) = operation_id.take() {
+        runtime
+            .provider_call_finished(operation_id, outcome)
+            .await?;
+    }
+    Ok(())
+}
+
+fn provider_error_outcome(error: &ProviderError) -> ProviderCallOutcome {
+    match error {
+        ProviderError::Http(_) | ProviderError::InvalidResponse(_) | ProviderError::Cancelled => {
+            ProviderCallOutcome::Uncertain(error.to_string())
+        }
+        _ => ProviderCallOutcome::Failed(error.to_string()),
+    }
 }
 
 fn full_replay(request: &ModelRequest) -> Result<ModelRequest> {
@@ -339,15 +474,20 @@ enum Prepared {
     Execute(ToolCall),
 }
 
+struct BatchOutcome {
+    completed: Vec<(ToolCall, ToolResult)>,
+    terminal_error: Option<anyhow::Error>,
+}
+
 async fn prepare_and_execute(
     runtime: &dyn AgentRuntime,
     calls: Vec<ToolCall>,
     tools: &ToolCatalog,
     config: &AgentLoopConfig,
-) -> Result<Vec<(ToolCall, ToolResult)>> {
-    if calls.len() > MAX_TOOL_CALLS_PER_TURN {
+) -> Result<BatchOutcome> {
+    if calls.len() > MAX_TOOL_CALLS_PER_STEP {
         bail!(
-            "provider returned {} tool calls; the per-turn limit is {MAX_TOOL_CALLS_PER_TURN}",
+            "provider returned {} tool calls; the per-step limit is {MAX_TOOL_CALLS_PER_STEP}",
             calls.len()
         );
     }
@@ -368,19 +508,43 @@ async fn prepare_and_execute(
 
     match config.tool_execution {
         ToolExecutionMode::Sequential => {
-            let mut results = Vec::new();
+            let mut completed = Vec::new();
             for item in prepared {
-                results.push(execute_prepared(runtime, item, &config.cancellation).await?);
+                match execute_prepared(runtime, item, &config.cancellation).await {
+                    Ok(result) => completed.push(result),
+                    Err(error) => {
+                        return Ok(BatchOutcome {
+                            completed,
+                            terminal_error: Some(error),
+                        });
+                    }
+                }
             }
-            Ok(results)
+            Ok(BatchOutcome {
+                completed,
+                terminal_error: None,
+            })
         }
-        ToolExecutionMode::Parallel => futures_util::stream::iter(prepared)
-            .map(|item| execute_prepared(runtime, item, &config.cancellation))
-            .buffered(MAX_CONCURRENT_TOOLS)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect(),
+        ToolExecutionMode::Parallel => {
+            let outcomes = futures_util::stream::iter(prepared)
+                .map(|item| execute_prepared(runtime, item, &config.cancellation))
+                .buffered(MAX_CONCURRENT_TOOLS)
+                .collect::<Vec<_>>()
+                .await;
+            let mut completed = Vec::new();
+            let mut terminal_error = None;
+            for outcome in outcomes {
+                match outcome {
+                    Ok(result) => completed.push(result),
+                    Err(error) if terminal_error.is_none() => terminal_error = Some(error),
+                    Err(_) => {}
+                }
+            }
+            Ok(BatchOutcome {
+                completed,
+                terminal_error,
+            })
+        }
     }
 }
 
@@ -389,20 +553,41 @@ async fn execute_prepared(
     prepared: Prepared,
     cancellation: &CancellationToken,
 ) -> Result<(ToolCall, ToolResult)> {
-    let call = match prepared {
-        Prepared::Immediate(call, result) => return Ok((call, result)),
-        Prepared::Execute(call) => call,
-    };
-    let reporter = RuntimeProgress {
-        runtime,
-        call_id: call.id.clone(),
-    };
-    let result = tokio::select! {
-        _ = cancellation.cancelled() => bail!("agent run cancelled"),
-        result = runtime.execute(&call, cancellation, &reporter) => {
-            match result { Ok(result) => result, Err(error) => ToolResult::error(error) }
+    let (call, result, executed) = match prepared {
+        Prepared::Immediate(call, result) => (call, result, false),
+        Prepared::Execute(call) => {
+            let reporter = RuntimeProgress {
+                runtime,
+                call_id: call.id.clone(),
+            };
+            runtime
+                .event(AgentEvent::ToolExecutionStarted(call.clone()))
+                .await?;
+            let result = tokio::select! {
+                _ = cancellation.cancelled() => return Err(TurnCancelled.into()),
+                result = runtime.execute(&call, cancellation, &reporter) => {
+                    match result {
+                        Ok(result) => result,
+                        Err(error) => match effect_uncertainty(&error) {
+                            Some(uncertain) => ToolResult::uncertain(uncertain.reason()),
+                            None => ToolResult::error(error),
+                        },
+                    }
+                }
+            };
+            (call, result, true)
         }
     };
+
+    if executed {
+        // Persist the raw effect outcome before batching or transformation.
+        runtime
+            .event(AgentEvent::ToolExecutionCompleted {
+                call: call.clone(),
+                result: result.clone(),
+            })
+            .await?;
+    }
     Ok((call, result))
 }
 
@@ -415,7 +600,7 @@ struct RuntimeProgress<'a> {
 impl ProgressReporter for RuntimeProgress<'_> {
     async fn report(&self, value: Value) -> Result<()> {
         self.runtime
-            .event(AgentEvent::ToolProgress(ToolProgress {
+            .signal(AgentSignal::ToolProgress(ToolProgress {
                 call_id: self.call_id.clone(),
                 value,
             }))
@@ -437,7 +622,7 @@ async fn inject(
     Ok(())
 }
 
-fn apply_update(request: &mut ModelRequest, update: NextTurnUpdate) {
+fn apply_update(request: &mut ModelRequest, update: NextStepUpdate) {
     if let Some(model) = update.model {
         request.model = model;
     }
@@ -456,7 +641,7 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
-    use crate::{ModelPart, ModelResponse, ProviderError, ToolDefinition};
+    use crate::{EffectUncertain, ModelPart, ModelResponse, ProviderError, ToolDefinition};
     use serde_json::json;
 
     use super::*;
@@ -503,32 +688,54 @@ mod tests {
 
     struct Runtime {
         events: Mutex<Vec<AgentEvent>>,
+        signals: Mutex<Vec<AgentSignal>>,
+        provider_outcomes: Mutex<Vec<ProviderCallOutcome>>,
         executed: AtomicUsize,
         active: AtomicUsize,
         max_active: AtomicUsize,
         tool_snapshots: AtomicUsize,
         follow_up: AtomicBool,
         terminate_tools: AtomicBool,
-        after_turns: AtomicUsize,
+        uncertain_tools: AtomicBool,
+        cancel_after_first_tool: AtomicBool,
+        fail_after_tool: AtomicBool,
+        transform_after_tool: AtomicBool,
+        after_steps: AtomicUsize,
+        turns_finished: AtomicUsize,
+        fail_turn_start: AtomicBool,
     }
 
     impl Runtime {
         fn new() -> Self {
             Self {
                 events: Mutex::new(Vec::new()),
+                signals: Mutex::new(Vec::new()),
+                provider_outcomes: Mutex::new(Vec::new()),
                 executed: AtomicUsize::new(0),
                 active: AtomicUsize::new(0),
                 max_active: AtomicUsize::new(0),
                 tool_snapshots: AtomicUsize::new(0),
                 follow_up: AtomicBool::new(false),
                 terminate_tools: AtomicBool::new(false),
-                after_turns: AtomicUsize::new(0),
+                uncertain_tools: AtomicBool::new(false),
+                cancel_after_first_tool: AtomicBool::new(false),
+                fail_after_tool: AtomicBool::new(false),
+                transform_after_tool: AtomicBool::new(false),
+                after_steps: AtomicUsize::new(0),
+                turns_finished: AtomicUsize::new(0),
+                fail_turn_start: AtomicBool::new(false),
             }
         }
     }
 
     #[async_trait(?Send)]
     impl AgentRuntime for Runtime {
+        async fn turn_started(&self) -> Result<()> {
+            if self.fail_turn_start.load(Ordering::SeqCst) {
+                bail!("turn-start hook failed");
+            }
+            Ok(())
+        }
         async fn request(&self, tools: Vec<ToolDefinition>) -> Result<ModelRequest> {
             Ok(ModelRequest {
                 model: "test".into(),
@@ -545,6 +752,7 @@ mod tests {
                 name: "work".into(),
                 description: "work".into(),
                 schema: json!({"type":"object","properties":{"value":{"type":"integer"}},"required":["value"]}),
+                agent_id: None,
             }])
         }
         async fn execute(
@@ -560,12 +768,37 @@ mod tests {
             progress.report(json!({"running":call.id})).await?;
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             self.active.fetch_sub(1, Ordering::SeqCst);
+            if self.uncertain_tools.load(Ordering::SeqCst) {
+                return Err(EffectUncertain::new("remote reply was lost").into());
+            }
             let mut result = ToolResult::success(json!({"id":call.id}));
             result.terminate = self.terminate_tools.load(Ordering::SeqCst);
+            if call.id == "a" && self.cancel_after_first_tool.load(Ordering::SeqCst) {
+                cancellation.cancel();
+            }
             Ok(result)
         }
         async fn event(&self, event: AgentEvent) -> Result<()> {
             self.events.lock().unwrap().push(event);
+            Ok(())
+        }
+        async fn signal(&self, signal: AgentSignal) -> Result<()> {
+            self.signals.lock().unwrap().push(signal);
+            Ok(())
+        }
+        async fn provider_call_started(&self, _: &ModelRequest) -> Result<Option<OperationId>> {
+            Ok(Some(OperationId::new()))
+        }
+        async fn provider_call_finished(
+            &self,
+            _: OperationId,
+            outcome: ProviderCallOutcome,
+        ) -> Result<()> {
+            self.provider_outcomes.lock().unwrap().push(outcome);
+            Ok(())
+        }
+        async fn turn_finished(&self) -> Result<()> {
+            self.turns_finished.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         async fn follow_up_messages(&self) -> Result<Vec<ModelMessage>> {
@@ -580,10 +813,36 @@ mod tests {
                 Ok(Vec::new())
             }
         }
-        async fn after_turn(&self, _: &ModelRequest) -> Result<TurnDecision> {
-            self.after_turns.fetch_add(1, Ordering::SeqCst);
-            Ok(TurnDecision::Continue)
+        async fn after_step(&self, _: &ModelRequest) -> Result<StepDecision> {
+            self.after_steps.fetch_add(1, Ordering::SeqCst);
+            Ok(StepDecision::Continue)
         }
+        async fn after_tool(&self, _: &ToolCall, result: &mut ToolResult) -> Result<()> {
+            if self.fail_after_tool.load(Ordering::SeqCst) {
+                bail!("after-tool hook failed");
+            }
+            if self.transform_after_tool.load(Ordering::SeqCst) {
+                result.value = json!({"transformed":true});
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_finish_runs_when_turn_start_fails() {
+        let runtime = Runtime::new();
+        runtime.fail_turn_start.store(true, Ordering::SeqCst);
+        let provider = TestProvider {
+            turn: AtomicUsize::new(0),
+            first: text_events(),
+            later: text_events(),
+        };
+
+        let error = execute_turn(&provider, &runtime, 1).await.unwrap_err();
+
+        assert!(error.to_string().contains("turn-start hook failed"));
+        assert_eq!(runtime.turns_finished.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.turn.load(Ordering::SeqCst), 0);
     }
 
     fn tool_events() -> Vec<ModelStreamEvent> {
@@ -640,7 +899,7 @@ mod tests {
             later: text_events(),
         };
 
-        let error = run(&provider, &runtime, 1).await.unwrap_err();
+        let error = execute_turn(&provider, &runtime, 1).await.unwrap_err();
         assert!(
             error
                 .to_string()
@@ -654,6 +913,10 @@ mod tests {
                 .iter()
                 .all(|event| !matches!(event, AgentEvent::AssistantResponse(_)))
         );
+        assert!(matches!(
+            runtime.provider_outcomes.lock().unwrap().as_slice(),
+            [ProviderCallOutcome::Uncertain(_)]
+        ));
     }
 
     struct CursorProvider {
@@ -858,6 +1121,9 @@ mod tests {
         async fn event(&self, _: AgentEvent) -> Result<()> {
             Ok(())
         }
+        async fn signal(&self, _: AgentSignal) -> Result<()> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -867,7 +1133,7 @@ mod tests {
             requests: Mutex::new(Vec::new()),
         };
 
-        run(&provider, &CursorRuntime, 1).await.unwrap();
+        execute_turn(&provider, &CursorRuntime, 1).await.unwrap();
 
         let requests = provider.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
@@ -888,7 +1154,7 @@ mod tests {
             requests: Mutex::new(Vec::new()),
         };
 
-        run(&provider, &CursorRuntime, 1).await.unwrap();
+        execute_turn(&provider, &CursorRuntime, 1).await.unwrap();
 
         let requests = provider.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
@@ -1035,6 +1301,7 @@ mod tests {
 
     #[tokio::test]
     async fn premature_stream_eof_is_rejected() {
+        let runtime = Runtime::new();
         let provider = TestProvider {
             turn: AtomicUsize::new(0),
             first: vec![
@@ -1045,13 +1312,17 @@ mod tests {
         };
         let error = stream_response(
             &provider,
-            &Runtime::new(),
+            &runtime,
             &cursor_request(),
             &CancellationToken::new(),
         )
         .await
         .unwrap_err();
         assert!(error.to_string().contains("before response completion"));
+        assert!(matches!(
+            runtime.provider_outcomes.lock().unwrap().as_slice(),
+            [ProviderCallOutcome::Uncertain(_)]
+        ));
     }
 
     #[tokio::test]
@@ -1062,7 +1333,7 @@ mod tests {
             first: tool_events(),
             later: text_events(),
         };
-        let answer = run_with_config(&provider, &runtime, AgentLoopConfig::default())
+        let answer = execute_turn_with_config(&provider, &runtime, AgentLoopConfig::default())
             .await
             .unwrap();
         assert_eq!(answer, "done");
@@ -1074,18 +1345,16 @@ mod tests {
                 if response.blocks.iter().any(|block| matches!(block,
                     AssistantResponseBlock::OpaqueState { data, .. } if data["opaque"] == "state")))
         }));
-        assert!(
-            runtime.events.lock().unwrap().iter().any(
-                |event| matches!(event, AgentEvent::AssistantTextDelta(delta) if delta == "do")
-            )
-        );
+        assert!(runtime.signals.lock().unwrap().iter().any(
+            |signal| matches!(signal, AgentSignal::AssistantTextDelta(delta) if delta == "do")
+        ));
         assert_eq!(
             runtime
-                .events
+                .signals
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|event| matches!(event, AgentEvent::ToolProgress(_)))
+                .filter(|signal| matches!(signal, AgentSignal::ToolProgress(_)))
                 .count(),
             2
         );
@@ -1099,7 +1368,7 @@ mod tests {
             first: tool_events(),
             later: text_events(),
         };
-        run_with_config(
+        execute_turn_with_config(
             &provider,
             &runtime,
             AgentLoopConfig {
@@ -1113,7 +1382,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminating_tool_skips_next_turn_hooks() {
+    async fn terminating_tool_still_completes_its_step_hook() {
         let runtime = Runtime::new();
         runtime.terminate_tools.store(true, Ordering::SeqCst);
         let provider = TestProvider {
@@ -1122,11 +1391,105 @@ mod tests {
             later: text_events(),
         };
 
-        run_with_config(&provider, &runtime, AgentLoopConfig::default())
+        execute_turn_with_config(&provider, &runtime, AgentLoopConfig::default())
             .await
             .unwrap();
 
-        assert_eq!(runtime.after_turns.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.after_steps.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn completed_tool_is_recorded_before_a_later_batch_cancellation() {
+        let runtime = Runtime::new();
+        runtime
+            .cancel_after_first_tool
+            .store(true, Ordering::SeqCst);
+        let provider = TestProvider {
+            turn: AtomicUsize::new(0),
+            first: tool_events(),
+            later: text_events(),
+        };
+
+        let error = execute_turn_with_config(
+            &provider,
+            &runtime,
+            AgentLoopConfig {
+                tool_execution: ToolExecutionMode::Sequential,
+                ..AgentLoopConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(crate::is_turn_cancelled(&error));
+        assert!(
+            runtime.events.lock().unwrap().iter().any(
+                |event| matches!(event, AgentEvent::ToolExecutionCompleted { call, .. } if call.id == "a")
+            )
+        );
+        assert!(runtime.events.lock().unwrap().iter().any(
+            |event| matches!(event, AgentEvent::ToolResultRecorded { call, .. } if call.id == "a")
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_tool_is_recorded_before_after_tool_hook_runs() {
+        let runtime = Runtime::new();
+        runtime.fail_after_tool.store(true, Ordering::SeqCst);
+        let provider = TestProvider {
+            turn: AtomicUsize::new(0),
+            first: tool_events(),
+            later: text_events(),
+        };
+
+        let error = execute_turn(&provider, &runtime, 4).await.unwrap_err();
+
+        assert!(error.to_string().contains("after-tool hook failed"));
+        assert_eq!(
+            runtime
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolExecutionCompleted { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            runtime
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolResultRecorded { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_completion_is_distinct_from_transformed_replay_result() {
+        let runtime = Runtime::new();
+        runtime.transform_after_tool.store(true, Ordering::SeqCst);
+        let provider = TestProvider {
+            turn: AtomicUsize::new(0),
+            first: tool_events(),
+            later: text_events(),
+        };
+
+        execute_turn(&provider, &runtime, 4).await.unwrap();
+
+        let events = runtime.events.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolExecutionCompleted { result, .. }
+                if result.value.get("id").is_some()
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResultRecorded { result, .. }
+                if result.value == json!({"transformed":true})
+        )));
     }
 
     #[tokio::test]
@@ -1153,7 +1516,7 @@ mod tests {
             later: text_events(),
         };
 
-        run_with_config(&provider, &runtime, AgentLoopConfig::default())
+        execute_turn_with_config(&provider, &runtime, AgentLoopConfig::default())
             .await
             .unwrap();
 
@@ -1167,7 +1530,7 @@ mod tests {
             .unwrap()
             .iter()
             .filter_map(|event| match event {
-                AgentEvent::ToolResult { call, .. } => Some(call.id.clone()),
+                AgentEvent::ToolResultRecorded { call, .. } => Some(call.id.clone()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1198,11 +1561,55 @@ mod tests {
             ],
             later: text_events(),
         };
-        assert_eq!(run(&provider, &runtime, 4).await.unwrap(), "done");
+        assert_eq!(execute_turn(&provider, &runtime, 4).await.unwrap(), "done");
         assert_eq!(runtime.executed.load(Ordering::SeqCst), 0);
+        assert!(
+            runtime
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| !matches!(event, AgentEvent::ToolExecutionStarted(_)))
+        );
         assert!(runtime.events.lock().unwrap().iter().any(
-            |event| matches!(event, AgentEvent::ToolResult { result, .. } if result.is_error)
+            |event| matches!(event, AgentEvent::ToolResultRecorded { result, .. } if result.is_error)
         ));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_execution_errors_remain_uncertain_tool_results() {
+        let runtime = Runtime::new();
+        runtime.uncertain_tools.store(true, Ordering::SeqCst);
+        let provider = TestProvider {
+            turn: AtomicUsize::new(0),
+            first: tool_events(),
+            later: text_events(),
+        };
+
+        let error = execute_turn(&provider, &runtime, 4).await.unwrap_err();
+
+        let events = runtime.events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolExecutionStarted(_)))
+                .count(),
+            2
+        );
+        assert!(effect_uncertainty(&error).is_some());
+        assert_eq!(runtime.after_steps.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.turn.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AgentEvent::ToolResultRecorded { result, .. }
+                        if result.is_error && result.uncertain
+                ))
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -1222,7 +1629,7 @@ mod tests {
             ],
             later: text_events(),
         };
-        assert_eq!(run(&provider, &runtime, 4).await.unwrap(), "done");
+        assert_eq!(execute_turn(&provider, &runtime, 4).await.unwrap(), "done");
         assert!(
             runtime
                 .events
@@ -1259,7 +1666,7 @@ mod tests {
             tokio::task::yield_now().await;
             trigger.cancel();
         });
-        let error = run_with_config(
+        let error = execute_turn_with_config(
             &PendingProvider,
             &runtime,
             AgentLoopConfig {
@@ -1269,11 +1676,8 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(error.to_string().contains("cancelled"));
-        assert!(matches!(
-            runtime.events.lock().unwrap().last(),
-            Some(AgentEvent::RunEnd)
-        ));
+        assert!(crate::is_turn_cancelled(&error));
+        assert_eq!(runtime.turns_finished.load(Ordering::SeqCst), 1);
     }
 
     struct RecordingProvider(Mutex<Vec<ModelRequest>>);
@@ -1341,6 +1745,9 @@ mod tests {
         async fn event(&self, _: AgentEvent) -> Result<()> {
             Ok(())
         }
+        async fn signal(&self, _: AgentSignal) -> Result<()> {
+            Ok(())
+        }
         async fn steering_messages(&self) -> Result<Vec<ModelMessage>> {
             if self.turns.load(Ordering::SeqCst) == 0 {
                 Ok(vec![ModelMessage {
@@ -1357,19 +1764,19 @@ mod tests {
             request.system.push_str("+transform");
             Ok(())
         }
-        async fn prepare_next_turn(&self, _: &ModelRequest) -> Result<NextTurnUpdate> {
-            Ok(NextTurnUpdate {
+        async fn prepare_next_step(&self, _: &ModelRequest) -> Result<NextStepUpdate> {
+            Ok(NextStepUpdate {
                 model: Some("second".into()),
                 system: Some("updated".into()),
                 ..Default::default()
             })
         }
-        async fn after_turn(&self, _: &ModelRequest) -> Result<TurnDecision> {
+        async fn after_step(&self, _: &ModelRequest) -> Result<StepDecision> {
             let turn = self.turns.fetch_add(1, Ordering::SeqCst);
             Ok(if turn == 1 {
-                TurnDecision::Stop
+                StepDecision::Stop
             } else {
-                TurnDecision::Continue
+                StepDecision::Continue
             })
         }
         async fn follow_up_messages(&self) -> Result<Vec<ModelMessage>> {
@@ -1393,7 +1800,7 @@ mod tests {
             follow_up: AtomicBool::new(true),
             turns: AtomicUsize::new(0),
         };
-        assert_eq!(run(&provider, &runtime, 4).await.unwrap(), "done");
+        assert_eq!(execute_turn(&provider, &runtime, 4).await.unwrap(), "done");
         let requests = provider.0.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].system, "base+transform");

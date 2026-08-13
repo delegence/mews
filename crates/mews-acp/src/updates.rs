@@ -26,9 +26,9 @@ pub(crate) struct UpdateState {
 }
 
 impl UpdateState {
-    pub(crate) fn for_run(run_id: &str) -> Self {
+    pub(crate) fn for_turn(turn_id: &str) -> Self {
         Self {
-            event_key_prefix: run_id.into(),
+            event_key_prefix: turn_id.into(),
             ..Self::default()
         }
     }

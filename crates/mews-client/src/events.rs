@@ -1,8 +1,30 @@
-use anyhow::{Result, bail};
-use mews_protocol::{ConsumerId, ConsumerKind, EventBatch, HubRequest, MessageSource, SessionId};
+use anyhow::{Context, Result, bail};
+use mews_protocol::{
+    AssistantResponseBlock, ConsumerId, ConsumerKind, EventBatch, HubRequest, JournalPage,
+    JournalQuery, MessageSource, SessionEntry, SessionEntryPayload, SessionId, Turn, TurnId,
+    TurnStatus,
+};
 use serde_json::Value;
 
 use crate::{MewsClient, response};
+
+fn answer_from_entries(entries: Vec<SessionEntry>, turn_id: &TurnId) -> String {
+    entries
+        .into_iter()
+        .filter_map(|entry| match entry.payload {
+            SessionEntryPayload::AssistantResponse {
+                turn_id: entry_turn,
+                response,
+            } if &entry_turn == turn_id => Some(response.blocks),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|block| match block {
+            AssistantResponseBlock::Text { text } => Some(text),
+            _ => None,
+        })
+        .collect()
+}
 
 impl MewsClient {
     pub async fn send_message(
@@ -12,78 +34,30 @@ impl MewsClient {
         metadata: Value,
         source: MessageSource,
     ) -> Result<String> {
-        let consumer = ConsumerId::new();
-        let subscribed = self
-            .subscribe_as(
-                consumer.clone(),
-                session_id.clone(),
-                ConsumerKind::Ephemeral,
-            )
-            .await;
-        if let Err(error) = subscribed {
-            let _ = self.delete_consumer(consumer).await;
-            return Err(error);
-        }
-        let result = self
-            .send_message_subscribed(consumer.clone(), session_id, prompt, metadata, source)
-            .await;
-        // Cleanup must not replace the Run result when the Hub is disconnecting.
-        let _ = self.delete_consumer(consumer).await;
-        result
+        let turn = self
+            .start_turn(session_id, prompt, metadata, source)
+            .await?;
+        let turn = self.wait_for_turn(turn.id).await?;
+        self.terminal_turn_answer(&turn)
+            .await?
+            .context("terminal Turn has no outcome")
     }
 
-    async fn send_message_subscribed(
-        &mut self,
-        consumer: ConsumerId,
-        session_id: SessionId,
-        prompt: String,
-        metadata: Value,
-        source: MessageSource,
-    ) -> Result<String> {
-        let run = self
-            .start_turn(session_id.clone(), prompt, metadata, source)
-            .await?;
-        let mut answer = String::new();
-        loop {
-            let batch = self.poll_events(consumer.clone(), 30_000).await?;
-            let mut finished = false;
-            let mut failure = None;
-            for event in &batch.events {
-                match &event.kind {
-                    mews_protocol::ClientEventKind::AssistantMessage { message, .. }
-                        if message.session_id == session_id =>
-                    {
-                        if let mews_protocol::MessageContent::Text { text } = &message.content {
-                            answer.push_str(text);
-                        }
-                    }
-                    mews_protocol::ClientEventKind::RunCompleted { run_id }
-                        if *run_id == run.id =>
-                    {
-                        finished = true
-                    }
-                    mews_protocol::ClientEventKind::RunFailed { run_id, error }
-                        if *run_id == run.id =>
-                    {
-                        failure = Some(error.clone())
-                    }
-                    mews_protocol::ClientEventKind::RunCancelled { run_id }
-                        if *run_id == run.id =>
-                    {
-                        failure = Some("Run cancelled".into())
-                    }
-                    _ => {}
-                }
-            }
-            if batch.advanced {
-                self.acknowledge(consumer.clone(), batch.checkpoint).await?;
-            }
-            if let Some(error) = failure {
-                bail!("Run failed: {error}");
-            }
-            if finished {
-                return Ok(answer);
-            }
+    /// Returns the durable answer for a terminal Turn. Event delivery is only a
+    /// wake-up/streaming mechanism and may be compacted before a live observer
+    /// sees the terminal event.
+    pub async fn terminal_turn_answer(&mut self, turn: &Turn) -> Result<Option<String>> {
+        match &turn.status {
+            TurnStatus::Running => Ok(None),
+            TurnStatus::Completed => Ok(Some(answer_from_entries(
+                self.session_entries(turn.session_id.clone()).await?,
+                &turn.id,
+            ))),
+            TurnStatus::Failed => bail!(
+                "Turn failed: {}",
+                turn.error.as_deref().unwrap_or("unknown error")
+            ),
+            TurnStatus::Cancelled => bail!("Turn cancelled"),
         }
     }
 
@@ -148,5 +122,68 @@ impl MewsClient {
             checkpoint,
         })
         .await
+    }
+
+    pub async fn query_journal_entries(&mut self, query: JournalQuery) -> Result<JournalPage> {
+        response::journal_entries(
+            self.request(HubRequest::QueryJournalEntries { query })
+                .await?,
+        )
+    }
+
+    pub async fn poll_journal_entries(
+        &mut self,
+        query: JournalQuery,
+        wait_ms: u32,
+    ) -> Result<JournalPage> {
+        response::journal_entries(
+            self.request(HubRequest::PollJournalEntries { query, wait_ms })
+                .await?,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mews_protocol::{AssistantResponse, MessageId};
+
+    use super::*;
+
+    fn assistant_entry(session_id: SessionId, turn_id: TurnId, text: &str) -> SessionEntry {
+        SessionEntry {
+            id: MessageId::new(),
+            session_id,
+            sequence: 1,
+            parent_id: None,
+            payload: SessionEntryPayload::AssistantResponse {
+                turn_id,
+                response: AssistantResponse {
+                    provider: "test".into(),
+                    model: "test".into(),
+                    api: "test".into(),
+                    response_id: None,
+                    blocks: vec![AssistantResponseBlock::Text { text: text.into() }],
+                    usage: None,
+                    stop_reason: None,
+                },
+            },
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn durable_answer_uses_only_entries_from_the_requested_turn() {
+        let session_id = SessionId::new();
+        let requested_turn = TurnId::new();
+        assert_eq!(
+            answer_from_entries(
+                vec![
+                    assistant_entry(session_id.clone(), TurnId::new(), "other"),
+                    assistant_entry(session_id, requested_turn.clone(), "answer"),
+                ],
+                &requested_turn,
+            ),
+            "answer"
+        );
     }
 }

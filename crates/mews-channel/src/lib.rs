@@ -89,7 +89,7 @@ pub trait ChannelOutbound: Send + Sync {
     async fn send(&self, conversation: &str, message: OutboundMessage) -> DeliveryOutcome;
 }
 
-/// Splitting platform I/O lets inbound intake continue while outbound work runs.
+/// Splitting platform I/O lets inbound intake continue while outbound work turns.
 pub trait Channel: Send + Sized + 'static {
     type Inbound: ChannelInbound;
     type Outbound: ChannelOutbound + 'static;
