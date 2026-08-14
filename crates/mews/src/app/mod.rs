@@ -30,6 +30,7 @@ const DATABASE_FILE: &str = "mews.db";
 pub struct Mews {
     root: PathBuf,
     store: Store,
+    acp_pool: mews_acp::AcpRuntimePool,
 }
 
 /// A short-lived mutation capability with immutable command provenance.

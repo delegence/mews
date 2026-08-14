@@ -59,13 +59,21 @@ impl Mews {
         validate_installation_authority(&root, &store)?;
         validate_hub_assignment(&root, &store)?;
         store.recover_interrupted_work()?;
-        Ok(Self { root, store })
+        Ok(Self {
+            root,
+            store,
+            acp_pool: mews_acp::AcpRuntimePool::default(),
+        })
     }
 
     pub(crate) fn open_connection(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         let store = Store::open_existing(root.join(DATABASE_FILE))?;
-        Ok(Self { root, store })
+        Ok(Self {
+            root,
+            store,
+            acp_pool: mews_acp::AcpRuntimePool::default(),
+        })
     }
 
     pub(crate) fn open_handoff(root: impl Into<PathBuf>) -> Result<Self> {
@@ -73,7 +81,11 @@ impl Mews {
         let store = Store::open_hub(root.join(DATABASE_FILE), root.join("hub.lock"))?;
         NoiseIdentity::load(&root.join("secrets/hub-noise.key"))?;
         validate_installation_authority(&root, &store)?;
-        Ok(Self { root, store })
+        Ok(Self {
+            root,
+            store,
+            acp_pool: mews_acp::AcpRuntimePool::default(),
+        })
     }
 
     pub fn setup(root: impl Into<PathBuf>, host_name: &str) -> Result<Self> {

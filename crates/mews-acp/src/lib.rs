@@ -12,6 +12,7 @@ pub use mews_protocol::{AcpStopReason, AcpTimings};
 pub use process::AcpHarnessConfig;
 pub use rpc::{AcpErrorKind, classify_error, is_cancelled};
 pub use session::{
-    AcpEventSink, AcpHookMetadata, AcpProbe, AcpProbeTimings, AcpSessionOutcome, AcpSessionRequest,
-    AcpStreamEvent, AcpTurnRequest, execute_acp_turn, probe_acp,
+    AcpEventSink, AcpHookMetadata, AcpProbe, AcpProbeTimings, AcpRuntimePool, AcpSessionOutcome,
+    AcpSessionRequest, AcpStreamEvent, AcpTurnRequest, PersistentAcpTurnRequest, execute_acp_turn,
+    probe_acp,
 };

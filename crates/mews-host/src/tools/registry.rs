@@ -38,6 +38,7 @@ struct RegistryInner {
     catalog: tokio::sync::watch::Sender<Vec<mews_protocol::ToolDefinition>>,
     root: Option<PathBuf>,
     hooks: RwLock<Vec<ExternalHook>>,
+    acp_pool: mews_acp::AcpRuntimePool,
 }
 
 /// Native tools are shared; extension tools and hooks are owned by one Agent.
@@ -56,12 +57,17 @@ impl Default for ToolRegistry {
                 catalog,
                 root: None,
                 hooks: RwLock::new(Vec::new()),
+                acp_pool: mews_acp::AcpRuntimePool::default(),
             }),
         }
     }
 }
 
 impl ToolRegistry {
+    pub(crate) fn acp_pool(&self) -> &mews_acp::AcpRuntimePool {
+        &self.inner.acp_pool
+    }
+
     pub fn with_defaults() -> Self {
         let registry = Self::default();
         for name in ["read", "write", "edit", "bash"] {

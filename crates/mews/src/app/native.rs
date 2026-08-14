@@ -162,7 +162,7 @@ impl mews_runtime::ConversationStore for SessionStore<'_> {
         let Some((provider, provider_model)) = model.split_once('/') else {
             return Ok(None);
         };
-        if !matches!(provider, "openai" | "openai-codex") {
+        if provider != "openai" {
             return Ok(None);
         }
         let entries = self.store.active_entries(&self.session.id)?;
@@ -501,7 +501,7 @@ impl SessionStore<'_> {
 
 fn continuation_anchor(entries: &[mews_protocol::SessionEntry], model: &str) -> Option<usize> {
     let (provider, provider_model) = model.split_once('/')?;
-    if !matches!(provider, "openai" | "openai-codex") {
+    if provider != "openai" {
         return None;
     }
     entries

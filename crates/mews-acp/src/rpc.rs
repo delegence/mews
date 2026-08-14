@@ -1,3 +1,7 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::{fmt, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -17,7 +21,7 @@ pub(crate) struct RpcClient<'a, W> {
     reader: &'a mut BufReader<tokio::process::ChildStdout>,
     timeout: Duration,
     permission_handler: &'a dyn AcpPermissionHandler,
-    next_id: u64,
+    next_id: Arc<AtomicU64>,
 }
 
 const MAX_ACP_LINE_BYTES: usize = 1024 * 1024;
@@ -97,7 +101,23 @@ impl<'a, W: AsyncWriteExt + Unpin> RpcClient<'a, W> {
             reader,
             timeout,
             permission_handler,
-            next_id: 1,
+            next_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    pub(crate) fn new_with_next_id(
+        writer: &'a mut W,
+        reader: &'a mut BufReader<tokio::process::ChildStdout>,
+        timeout: Duration,
+        permission_handler: &'a dyn AcpPermissionHandler,
+        next_id: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            writer,
+            reader,
+            timeout,
+            permission_handler,
+            next_id,
         }
     }
 
@@ -142,8 +162,7 @@ impl<'a, W: AsyncWriteExt + Unpin> RpcClient<'a, W> {
         F: FnMut(&Value) -> Result<()>,
         D: FnMut() -> Result<()>,
     {
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let session_id = params
             .get("sessionId")
             .and_then(Value::as_str)
@@ -186,6 +205,7 @@ impl<'a, W: AsyncWriteExt + Unpin> RpcClient<'a, W> {
             let message: Value = serde_json::from_str(&line)
                 .with_context(|| format!("invalid ACP JSON-RPC message: {line}"))?;
             if message.get("method").and_then(Value::as_str) == Some("session/update") {
+                validate_inbound_session(&message, session_id.as_deref())?;
                 if let Some(update) = message
                     .get("params")
                     .and_then(|params| params.get("update"))
@@ -195,8 +215,14 @@ impl<'a, W: AsyncWriteExt + Unpin> RpcClient<'a, W> {
                 continue;
             }
             if message.get("method").is_some() && message.get("id").is_some() {
-                self.handle_client_request(&message, cancellation, deadline, &mut on_update)
-                    .await?;
+                self.handle_client_request(
+                    &message,
+                    session_id.as_deref(),
+                    cancellation,
+                    deadline,
+                    &mut on_update,
+                )
+                .await?;
                 continue;
             }
             if message.get("id") != Some(&json!(id)) {
@@ -221,6 +247,7 @@ impl<'a, W: AsyncWriteExt + Unpin> RpcClient<'a, W> {
     async fn handle_client_request<F>(
         &mut self,
         message: &Value,
+        expected_session_id: Option<&str>,
         cancellation: &mews_agent::CancellationToken,
         deadline: time::Instant,
         on_update: &mut F,
@@ -237,6 +264,7 @@ impl<'a, W: AsyncWriteExt + Unpin> RpcClient<'a, W> {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let response = if method == "session/request_permission" {
+            validate_inbound_session(message, expected_session_id)?;
             let params = message.get("params").cloned().unwrap_or(Value::Null);
             on_update(&json!({
                 "sessionUpdate": "permission_request",
@@ -299,6 +327,18 @@ impl<'a, W: AsyncWriteExt + Unpin> RpcClient<'a, W> {
         self.writer.flush().await?;
         Ok(())
     }
+}
+
+fn validate_inbound_session(message: &Value, expected_session_id: Option<&str>) -> Result<()> {
+    let actual_session_id = message.pointer("/params/sessionId").and_then(Value::as_str);
+    if actual_session_id != expected_session_id || expected_session_id.is_none() {
+        bail!(
+            "ACP message belongs to unexpected Session {:?}; expected {:?}",
+            actual_session_id,
+            expected_session_id
+        );
+    }
+    Ok(())
 }
 
 async fn request_permission(

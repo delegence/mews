@@ -1,6 +1,12 @@
 //! Persistent ACP session execution and recovery.
 
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    ffi::OsString,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, Weak, mpsc as std_mpsc},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -144,7 +150,160 @@ struct InitializeResult {
     agent_capabilities: Value,
 }
 
-#[derive(Debug, Deserialize)]
+/// One initialized ACP transport. Sessions are resumed on every Turn so their
+/// Turn-scoped MCP server can be refreshed, but the expensive agent process is
+/// kept alive between Turns.
+struct LiveAcpProcess {
+    process: AcpProcess,
+    cwd: PathBuf,
+    child: Child,
+    writer: tokio::process::ChildStdin,
+    reader: BufReader<tokio::process::ChildStdout>,
+    initialize: InitializeResult,
+    next_request_id: Arc<std::sync::atomic::AtomicU64>,
+    session_ids: BTreeSet<String>,
+}
+
+impl LiveAcpProcess {
+    async fn start(
+        config: AcpHarnessConfig,
+        cwd: &Path,
+        cancellation: &mews_agent::CancellationToken,
+    ) -> Result<(Self, AcpTimings)> {
+        let process = AcpProcess::new(config);
+        let spawn_started = tokio::time::Instant::now();
+        let mut child = process.spawn(&cwd.to_path_buf())?;
+        let spawn_ms = spawn_started.elapsed().as_millis() as u64;
+        let writer = child
+            .stdin
+            .take()
+            .context("ACP Harness did not open stdin")?;
+        let reader = BufReader::new(
+            child
+                .stdout
+                .take()
+                .context("ACP Harness did not open stdout")?,
+        );
+        let mut live = Self {
+            process,
+            cwd: cwd.to_owned(),
+            child,
+            writer,
+            reader,
+            initialize: InitializeResult {
+                protocol_version: 0,
+                agent_capabilities: Value::Null,
+            },
+            next_request_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            session_ids: BTreeSet::new(),
+        };
+        let initialize_started = tokio::time::Instant::now();
+        let mut rpc = live.rpc();
+        let initialize = rpc
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": ACP_PROTOCOL_VERSION,
+                    "clientInfo": { "name": "mews", "version": env!("CARGO_PKG_VERSION") },
+                    "clientCapabilities": { "auth": { "terminal": true } },
+                }),
+                cancellation,
+                None,
+                None,
+                |_| Ok(()),
+            )
+            .await?;
+        drop(rpc);
+        let initialize_ms = initialize_started.elapsed().as_millis() as u64;
+        live.initialize =
+            serde_json::from_value(initialize).context("invalid ACP initialize result")?;
+        if live.initialize.protocol_version != ACP_PROTOCOL_VERSION {
+            bail!(
+                "ACP Harness negotiated unsupported protocol version {}",
+                live.initialize.protocol_version
+            );
+        }
+        Ok((
+            live,
+            AcpTimings {
+                queue_ms: 0,
+                spawn_ms,
+                initialize_ms,
+                continuation_ms: 0,
+                prompt_to_first_update_ms: None,
+                prompt_to_first_token_ms: None,
+                prompt_ms: 0,
+                total_ms: 0,
+            },
+        ))
+    }
+
+    fn rpc(&mut self) -> RpcClient<'_, tokio::process::ChildStdin> {
+        RpcClient::new_with_next_id(
+            &mut self.writer,
+            &mut self.reader,
+            self.process.config.request_timeout,
+            self.process.config.permission_handler.as_ref(),
+            self.next_request_id.clone(),
+        )
+    }
+
+    fn is_compatible_with(&self, config: &AcpHarnessConfig, cwd: &Path) -> bool {
+        self.cwd == cwd
+            && self.process.config.command == config.command
+            && self.process.config.environment == config.environment
+            && self.process.config.request_timeout == config.request_timeout
+    }
+
+    async fn shutdown(mut self) {
+        if self
+            .initialize
+            .agent_capabilities
+            .pointer("/sessionCapabilities/close")
+            .is_some_and(Value::is_object)
+            && !self.session_ids.is_empty()
+        {
+            let cancellation = mews_agent::CancellationToken::new();
+            let session_ids = std::mem::take(&mut self.session_ids);
+            let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                let mut rpc = self.rpc();
+                for session_id in session_ids {
+                    let _ = rpc
+                        .request(
+                            "session/close",
+                            json!({ "sessionId": session_id }),
+                            &cancellation,
+                            None,
+                            None,
+                            |_| Ok(()),
+                        )
+                        .await;
+                }
+            })
+            .await;
+        }
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut self.writer).await;
+        if tokio::time::timeout(Duration::from_secs(2), self.child.wait())
+            .await
+            .is_err()
+        {
+            terminate_process_tree(&mut self.child).await;
+        }
+    }
+}
+
+impl Drop for LiveAcpProcess {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(process_id) = self.child.id() {
+            // SAFETY: ACP children are spawned in their own process group.
+            unsafe { libc::kill(-(process_id as i32), libc::SIGKILL) };
+        }
+        let _ = self.child.start_kill();
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PromptResult {
     stop_reason: AcpStopReason,
@@ -180,6 +339,659 @@ pub struct AcpTurnRequest<'a> {
     pub events: &'a mut dyn AcpEventSink,
 }
 
+/// A Turn executed through a warm process shared by compatible ACP Sessions.
+/// The callback remains on the caller's thread so binding acknowledgements
+/// keep their existing ordering and durability guarantees.
+pub struct PersistentAcpTurnRequest<'a> {
+    /// Stable logical Session identity used for sticky pool routing.
+    pub session_key: String,
+    pub config: AcpHarnessConfig,
+    pub cwd: PathBuf,
+    pub harness_options: BTreeMap<String, String>,
+    pub session: AcpSessionRequest,
+    pub environment: Arc<dyn mews_agent::AgentCapabilities>,
+    pub allowed_tools: Vec<String>,
+    pub cancellation: mews_agent::CancellationToken,
+    pub events: &'a mut dyn AcpEventSink,
+}
+
+/// Immutable process-start inputs. Only Sessions with the same fingerprint
+/// may share a warm ACP process.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct AcpLaunchFingerprint {
+    command: Vec<OsString>,
+    environment: Vec<(OsString, OsString)>,
+    cwd: PathBuf,
+    request_timeout: Duration,
+}
+
+impl AcpLaunchFingerprint {
+    fn new(config: &AcpHarnessConfig, cwd: &Path, session: &AcpSessionRequest) -> Self {
+        // Fingerprint the effective launch configuration, not the recipe
+        // input. Preparation errors are handled inside the Turn lifecycle.
+        let mut config = config.clone();
+        let _ = prepare_instruction_channel(&mut config, session);
+        Self {
+            command: config.command,
+            environment: config.environment.into_iter().collect(),
+            cwd: cwd.to_owned(),
+            request_timeout: config.request_timeout,
+        }
+    }
+}
+
+struct PersistentEvent {
+    event: AcpStreamEvent,
+    acknowledged: std_mpsc::Sender<std::result::Result<(), String>>,
+}
+
+struct PersistentJob {
+    state: Arc<std::sync::atomic::AtomicU8>,
+    enqueued_at: std::time::Instant,
+    config: AcpHarnessConfig,
+    cwd: PathBuf,
+    harness_options: BTreeMap<String, String>,
+    session: AcpSessionRequest,
+    environment: Arc<dyn mews_agent::AgentCapabilities>,
+    allowed_tools: Vec<String>,
+    cancellation: mews_agent::CancellationToken,
+    events: tokio::sync::mpsc::UnboundedSender<PersistentEvent>,
+    result: tokio::sync::oneshot::Sender<Result<AcpSessionOutcome>>,
+}
+
+const JOB_QUEUED: u8 = 0;
+const JOB_RUNNING: u8 = 1;
+const JOB_CANCELLED: u8 = 2;
+
+enum PersistentCommand {
+    Execute(Box<PersistentJob>),
+    Shutdown,
+}
+
+/// Cancels worker-owned execution if its caller stops awaiting the Turn.
+struct CancelOnDrop {
+    cancellation: mews_agent::CancellationToken,
+    job_state: Arc<std::sync::atomic::AtomicU8>,
+    armed: bool,
+}
+
+impl CancelOnDrop {
+    fn new(
+        cancellation: mews_agent::CancellationToken,
+        job_state: Arc<std::sync::atomic::AtomicU8>,
+    ) -> Self {
+        Self {
+            cancellation,
+            job_state,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.job_state.compare_exchange(
+                JOB_QUEUED,
+                JOB_CANCELLED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            );
+            self.cancellation.cancel();
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PersistentWorker {
+    generation: u64,
+    sender: std_mpsc::Sender<PersistentCommand>,
+    accepting: Arc<Mutex<bool>>,
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl PersistentWorker {
+    fn send(&self, job: Box<PersistentJob>) -> std::result::Result<(), Box<PersistentJob>> {
+        let accepting = self.accepting.lock().expect("ACP worker state poisoned");
+        if !*accepting {
+            return Err(job);
+        }
+        self.pending
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.sender
+            .send(PersistentCommand::Execute(job))
+            .map_err(|error| {
+                self.pending
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                match error.0 {
+                    PersistentCommand::Execute(job) => job,
+                    PersistentCommand::Shutdown => unreachable!("sent an execute command"),
+                }
+            })
+    }
+
+    fn stop_accepting(&self) {
+        let mut accepting = self.accepting.lock().expect("ACP worker state poisoned");
+        if std::mem::replace(&mut *accepting, false) {
+            let _ = self.sender.send(PersistentCommand::Shutdown);
+        }
+    }
+
+    fn is_accepting(&self) -> bool {
+        *self.accepting.lock().expect("ACP worker state poisoned")
+    }
+
+    fn pending(&self) -> usize {
+        self.pending.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+const ACP_PROCESS_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+const ACP_MAX_PROCESSES_PER_FINGERPRINT: usize = 4;
+const ACP_MAX_TOTAL_PROCESSES: usize = 8;
+
+#[derive(Clone)]
+pub struct AcpRuntimePool {
+    inner: Arc<AcpRuntimePoolInner>,
+}
+
+struct AcpRuntimePoolInner {
+    groups: Mutex<HashMap<AcpLaunchFingerprint, ProcessGroup>>,
+    next_generation: std::sync::atomic::AtomicU64,
+    idle_timeout: Duration,
+    max_processes_per_fingerprint: usize,
+    max_total_processes: usize,
+    capacity_changed: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct ProcessGroup {
+    workers: Vec<PersistentWorker>,
+    session_bindings: HashMap<String, u64>,
+}
+
+impl Default for AcpRuntimePool {
+    fn default() -> Self {
+        Self::new(ACP_PROCESS_IDLE_TIMEOUT)
+    }
+}
+
+impl AcpRuntimePool {
+    pub fn new(idle_timeout: Duration) -> Self {
+        Self::with_limits(
+            idle_timeout,
+            ACP_MAX_PROCESSES_PER_FINGERPRINT,
+            ACP_MAX_TOTAL_PROCESSES,
+        )
+    }
+
+    pub fn with_max_processes(idle_timeout: Duration, max_processes: usize) -> Self {
+        Self::with_limits(idle_timeout, max_processes, max_processes)
+    }
+
+    fn with_limits(
+        idle_timeout: Duration,
+        max_processes_per_fingerprint: usize,
+        max_total_processes: usize,
+    ) -> Self {
+        Self {
+            inner: Arc::new(AcpRuntimePoolInner {
+                groups: Mutex::new(HashMap::new()),
+                next_generation: std::sync::atomic::AtomicU64::new(1),
+                idle_timeout,
+                max_processes_per_fingerprint: max_processes_per_fingerprint.max(1),
+                max_total_processes: max_total_processes.max(1),
+                capacity_changed: tokio::sync::Notify::new(),
+            }),
+        }
+    }
+
+    async fn worker(
+        &self,
+        fingerprint: &AcpLaunchFingerprint,
+        session_key: &str,
+    ) -> Result<PersistentWorker> {
+        loop {
+            // Register before checking capacity so a completion between the
+            // check and await cannot strand this request.
+            let notified = self.inner.capacity_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let selection = self.try_worker(fingerprint, session_key)?;
+            if let Some(worker) = selection {
+                return Ok(worker);
+            }
+            notified.await;
+        }
+    }
+
+    fn try_worker(
+        &self,
+        fingerprint: &AcpLaunchFingerprint,
+        session_key: &str,
+    ) -> Result<Option<PersistentWorker>> {
+        let mut groups = self.inner.groups.lock().expect("ACP pool poisoned");
+        for group in groups.values_mut() {
+            group.workers.retain(PersistentWorker::is_accepting);
+            let live_generations = group
+                .workers
+                .iter()
+                .map(|worker| worker.generation)
+                .collect::<Vec<_>>();
+            group
+                .session_bindings
+                .retain(|_, generation| live_generations.contains(generation));
+        }
+        groups.retain(|_, group| !group.workers.is_empty());
+
+        if let Some(group) = groups.get_mut(fingerprint) {
+            if let Some(generation) = group.session_bindings.get(session_key)
+                && let Some(worker) = group
+                    .workers
+                    .iter()
+                    .find(|worker| worker.generation == *generation)
+            {
+                return Ok(Some(worker.clone()));
+            }
+            group.session_bindings.remove(session_key);
+            let least_loaded = group
+                .workers
+                .iter()
+                .min_by_key(|worker| worker.pending())
+                .cloned();
+            if let Some(worker) = &least_loaded
+                && (worker.pending() == 0
+                    || group.workers.len() >= self.inner.max_processes_per_fingerprint)
+            {
+                group
+                    .session_bindings
+                    .insert(session_key.to_owned(), worker.generation);
+                return Ok(Some(worker.clone()));
+            }
+        }
+
+        let process_count = groups
+            .values()
+            .map(|group| group.workers.len())
+            .sum::<usize>();
+        if process_count >= self.inner.max_total_processes {
+            let idle = groups.iter().find_map(|(key, group)| {
+                group
+                    .workers
+                    .iter()
+                    .find(|worker| worker.pending() == 0)
+                    .map(|worker| (key.clone(), worker.clone()))
+            });
+            let Some((idle_fingerprint, idle_worker)) = idle else {
+                // A compatible busy worker can queue this Turn without
+                // increasing the resident process count. A new fingerprint
+                // waits until an existing worker becomes idle.
+                if let Some(worker) = groups.get_mut(fingerprint).and_then(|group| {
+                    group
+                        .workers
+                        .iter()
+                        .min_by_key(|worker| worker.pending())
+                        .cloned()
+                }) {
+                    groups
+                        .get_mut(fingerprint)
+                        .expect("compatible group exists")
+                        .session_bindings
+                        .insert(session_key.to_owned(), worker.generation);
+                    return Ok(Some(worker));
+                }
+                return Ok(None);
+            };
+            idle_worker.stop_accepting();
+            if let Some(group) = groups.get_mut(&idle_fingerprint) {
+                group
+                    .workers
+                    .retain(|worker| worker.generation != idle_worker.generation);
+                group
+                    .session_bindings
+                    .retain(|_, generation| *generation != idle_worker.generation);
+            }
+            groups.retain(|_, group| !group.workers.is_empty());
+            return Ok(None);
+        }
+
+        let worker = self.spawn_worker(fingerprint)?;
+        let group = groups.entry(fingerprint.clone()).or_default();
+        group.workers.push(worker.clone());
+        group
+            .session_bindings
+            .insert(session_key.to_owned(), worker.generation);
+        Ok(Some(worker))
+    }
+
+    fn spawn_worker(&self, fingerprint: &AcpLaunchFingerprint) -> Result<PersistentWorker> {
+        let generation = self
+            .inner
+            .next_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        spawn_persistent_worker(
+            fingerprint.clone(),
+            generation,
+            self.inner.idle_timeout,
+            Arc::downgrade(&self.inner),
+        )
+    }
+
+    pub async fn execute_turn(
+        &self,
+        request: PersistentAcpTurnRequest<'_>,
+    ) -> Result<AcpSessionOutcome> {
+        execute_persistent_acp_turn(self, request).await
+    }
+
+    #[cfg(test)]
+    fn process_count(&self) -> usize {
+        self.inner
+            .groups
+            .lock()
+            .expect("ACP pool poisoned")
+            .values()
+            .map(|group| group.workers.len())
+            .sum()
+    }
+}
+
+fn spawn_persistent_worker(
+    fingerprint: AcpLaunchFingerprint,
+    generation: u64,
+    idle_timeout: Duration,
+    pool: Weak<AcpRuntimePoolInner>,
+) -> Result<PersistentWorker> {
+    let (sender, receiver) = std_mpsc::channel::<PersistentCommand>();
+    let (startup_sender, startup_receiver) = std_mpsc::sync_channel(1);
+    let accepting = Arc::new(Mutex::new(true));
+    let worker_accepting = accepting.clone();
+    let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let worker_pending = pending.clone();
+    std::thread::Builder::new()
+        .name(format!("mews-acp-{generation}"))
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = startup_sender.send(Err(error.to_string()));
+                    return;
+                }
+            };
+            if startup_sender.send(Ok(())).is_err() {
+                return;
+            }
+            let mut live: Option<LiveAcpProcess> = None;
+            loop {
+                let command = match receiver.recv_timeout(idle_timeout) {
+                    Ok(command) => command,
+                    Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                        // Serialize the idle transition with enqueueing. A job
+                        // accepted just as the timer fires must be observed;
+                        // later callers are redirected to a new generation.
+                        let mut accepting =
+                            worker_accepting.lock().expect("ACP worker state poisoned");
+                        match receiver.try_recv() {
+                            Ok(command) => {
+                                drop(accepting);
+                                command
+                            }
+                            Err(std_mpsc::TryRecvError::Empty) => {
+                                *accepting = false;
+                                break;
+                            }
+                            Err(std_mpsc::TryRecvError::Disconnected) => break,
+                        }
+                    }
+                    Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                let job = match command {
+                    PersistentCommand::Execute(job) => job,
+                    PersistentCommand::Shutdown => break,
+                };
+                let PersistentJob {
+                    state,
+                    enqueued_at,
+                    config,
+                    cwd,
+                    harness_options,
+                    session,
+                    environment,
+                    allowed_tools,
+                    cancellation,
+                    events,
+                    result,
+                } = *job;
+                if state
+                    .compare_exchange(
+                        JOB_QUEUED,
+                        JOB_RUNNING,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    worker_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    pool.upgrade()
+                        .iter()
+                        .for_each(|pool| pool.capacity_changed.notify_waiters());
+                    let _ = result.send(Err(anyhow::anyhow!(AcpCancelled)));
+                    continue;
+                }
+                let cancelled_before_start = cancellation.is_cancelled();
+                let queue_ms = enqueued_at.elapsed().as_millis() as u64;
+                let mut outcome = runtime.block_on(execute_acp_turn_inner_cached(
+                    config,
+                    cwd,
+                    harness_options,
+                    session,
+                    environment.as_ref(),
+                    &allowed_tools,
+                    cancellation,
+                    &mut |event| {
+                        let (acknowledge, acknowledged) = std_mpsc::channel();
+                        let sent = events.send(PersistentEvent {
+                            event,
+                            acknowledged: acknowledge,
+                        });
+                        if sent.is_err() && cancelled_before_start {
+                            return Ok(());
+                        }
+                        sent.map_err(|_| anyhow::anyhow!("ACP event receiver unavailable"))?;
+                        acknowledged
+                            .recv()
+                            .map_err(|_| anyhow::anyhow!("ACP event acknowledgement closed"))?
+                            .map_err(anyhow::Error::msg)
+                    },
+                    Some(&mut live),
+                ));
+                if let Ok(outcome) = &mut outcome {
+                    outcome.timings.queue_ms = queue_ms;
+                } else if !cancelled_before_start
+                    || !outcome.as_ref().is_err_and(crate::rpc::is_cancelled)
+                {
+                    live.take();
+                }
+                worker_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                pool.upgrade()
+                    .iter()
+                    .for_each(|pool| pool.capacity_changed.notify_waiters());
+                let _ = result.send(outcome);
+            }
+            *worker_accepting.lock().expect("ACP worker state poisoned") = false;
+            let pool = pool.upgrade();
+            if let Some(pool) = &pool {
+                let mut groups = pool.groups.lock().expect("ACP pool poisoned");
+                let remove_group = if let Some(group) = groups.get_mut(&fingerprint) {
+                    group
+                        .workers
+                        .retain(|worker| worker.generation != generation);
+                    group
+                        .session_bindings
+                        .retain(|_, bound| *bound != generation);
+                    group.workers.is_empty()
+                } else {
+                    false
+                };
+                if remove_group {
+                    groups.remove(&fingerprint);
+                }
+            }
+            if let Some(live) = live.take() {
+                runtime.block_on(live.shutdown());
+            }
+            if let Some(pool) = pool {
+                pool.capacity_changed.notify_waiters();
+            }
+        })
+        .context("start persistent ACP worker")?;
+    // Do not publish a sender until the worker has a live runtime and receiver.
+    startup_receiver
+        .recv()
+        .context("persistent ACP worker stopped during startup")?
+        .map_err(anyhow::Error::msg)?;
+    Ok(PersistentWorker {
+        generation,
+        sender,
+        accepting,
+        pending,
+    })
+}
+
+async fn execute_persistent_acp_turn(
+    pool: &AcpRuntimePool,
+    request: PersistentAcpTurnRequest<'_>,
+) -> Result<AcpSessionOutcome> {
+    let PersistentAcpTurnRequest {
+        session_key,
+        config,
+        cwd,
+        harness_options,
+        session,
+        environment,
+        allowed_tools,
+        cancellation,
+        events,
+    } = request;
+    if session_key.is_empty() {
+        bail!("ACP pool Session key must not be empty");
+    }
+    let job_state = Arc::new(std::sync::atomic::AtomicU8::new(JOB_QUEUED));
+    let mut cancel_on_drop = CancelOnDrop::new(cancellation.clone(), job_state.clone());
+    let wait_cancellation = cancellation.clone();
+    let cancellation_environment = environment.clone();
+    let cancellation_agent_id = session.agent_id.clone();
+    let cancellation_metadata = session.hook_metadata.clone();
+    let cancellation_cwd = cwd.clone();
+    let fingerprint = AcpLaunchFingerprint::new(&config, &cwd, &session);
+    let (event_sender, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (result_sender, mut result_receiver) = tokio::sync::oneshot::channel();
+    let job = Box::new(PersistentJob {
+        state: job_state.clone(),
+        enqueued_at: std::time::Instant::now(),
+        config,
+        cwd,
+        harness_options,
+        session,
+        environment,
+        allowed_tools,
+        cancellation: cancellation.clone(),
+        events: event_sender,
+        result: result_sender,
+    });
+    let mut job = job;
+    loop {
+        let worker = tokio::select! {
+            worker = pool.worker(&fingerprint, &session_key) => worker?,
+            _ = wait_cancellation.cancelled() => {
+                cancel_on_drop.disarm();
+                finalize_cancelled_before_start(
+                    cancellation_environment.as_ref(),
+                    &cancellation_agent_id,
+                    cancellation_metadata.as_ref(),
+                    &cancellation_cwd,
+                    &wait_cancellation,
+                    events,
+                ).await?;
+                return Err(anyhow::anyhow!(AcpCancelled));
+            },
+        };
+        match worker.send(job) {
+            Ok(()) => break,
+            Err(returned) => job = returned,
+        }
+    }
+    let mut events_open = true;
+    let mut observe_cancellation = true;
+    loop {
+        tokio::select! {
+            result = &mut result_receiver => {
+                cancel_on_drop.disarm();
+                return result.context("persistent ACP worker stopped")?;
+            }
+            _ = wait_cancellation.cancelled(), if observe_cancellation => {
+                if job_state.compare_exchange(
+                    JOB_QUEUED,
+                    JOB_CANCELLED,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                ).is_ok() {
+                    cancel_on_drop.disarm();
+                    finalize_cancelled_before_start(
+                        cancellation_environment.as_ref(),
+                        &cancellation_agent_id,
+                        cancellation_metadata.as_ref(),
+                        &cancellation_cwd,
+                        &wait_cancellation,
+                        events,
+                    ).await?;
+                    return Err(anyhow::anyhow!(AcpCancelled));
+                }
+                // Once running, the worker owns cleanup. Keep the event sink
+                // alive until it has emitted the terminal hook observations.
+                observe_cancellation = false;
+            }
+            event = event_receiver.recv(), if events_open => {
+                if let Some(event) = event {
+                    let outcome = events.emit(event.event).map_err(|error| error.to_string());
+                    let _ = event.acknowledged.send(outcome);
+                } else {
+                    events_open = false;
+                }
+            }
+        }
+    }
+}
+
+async fn finalize_cancelled_before_start(
+    environment: &dyn mews_agent::AgentCapabilities,
+    agent_id: &mews_protocol::AgentId,
+    metadata: Option<&AcpHookMetadata>,
+    cwd: &Path,
+    cancellation: &mews_agent::CancellationToken,
+    events: &mut dyn AcpEventSink,
+) -> Result<()> {
+    let result = Err(anyhow::anyhow!(AcpCancelled));
+    finalize_turn_hooks(
+        environment,
+        agent_id,
+        metadata,
+        &result,
+        Vec::new(),
+        cwd,
+        cancellation,
+        &mut |event| events.emit(event),
+    )
+    .await
+}
+
 pub async fn execute_acp_turn(request: AcpTurnRequest<'_>) -> Result<AcpSessionOutcome> {
     let AcpTurnRequest {
         config,
@@ -207,7 +1019,7 @@ pub async fn execute_acp_turn(request: AcpTurnRequest<'_>) -> Result<AcpSessionO
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_acp_turn_inner(
-    mut config: AcpHarnessConfig,
+    config: AcpHarnessConfig,
     cwd: PathBuf,
     harness_options: BTreeMap<String, String>,
     session: AcpSessionRequest,
@@ -216,131 +1028,70 @@ async fn execute_acp_turn_inner(
     cancellation: mews_agent::CancellationToken,
     events: &mut dyn FnMut(AcpStreamEvent) -> Result<()>,
 ) -> Result<AcpSessionOutcome> {
+    execute_acp_turn_inner_cached(
+        config,
+        cwd,
+        harness_options,
+        session,
+        environment,
+        allowed_tools,
+        cancellation,
+        events,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_acp_turn_inner_cached(
+    mut config: AcpHarnessConfig,
+    cwd: PathBuf,
+    harness_options: BTreeMap<String, String>,
+    session: AcpSessionRequest,
+    environment: &dyn mews_agent::AgentCapabilities,
+    allowed_tools: &[String],
+    cancellation: mews_agent::CancellationToken,
+    events: &mut dyn FnMut(AcpStreamEvent) -> Result<()>,
+    mut live_cache: Option<&mut Option<LiveAcpProcess>>,
+) -> Result<AcpSessionOutcome> {
+    let total_started = tokio::time::Instant::now();
     let replacement_config = config.clone();
     let replacement_session = session.clone();
     let agent_id = session.agent_id.clone();
     let hook_metadata = session.hook_metadata.clone();
-    if let Some(metadata) = hook_metadata
-        .as_ref()
-        .filter(|metadata| metadata.invoke_turn_start)
-    {
-        let payload = json!({
-            "session_id": metadata.mews_session_id, "turn_id": metadata.turn_id,
-            "harness": metadata.harness, "cwd": cwd, "binding": session.transition,
-            "context_hash": metadata.context_hash, "context_channel": metadata.context_channel,
-        });
-        match environment
-            .hook(
-                &agent_id,
-                mews_agent::LifecycleHook::TurnStart,
-                payload,
-                &cwd,
-                &cancellation,
-            )
-            .await
-        {
-            Ok(_) => events(AcpStreamEvent::HookOutcome {
-                event_key: accepted_event_key(),
-                hook: "turn_start".into(),
-                ok: true,
-                detail: None,
-                tool: None,
-                call_id: None,
-            })?,
-            Err(error) => {
-                let detail = bounded_detail(&error.to_string());
-                events(AcpStreamEvent::HookOutcome {
-                    event_key: accepted_event_key(),
-                    hook: "turn_start".into(),
-                    ok: false,
-                    detail: Some(detail.clone()),
-                    tool: None,
-                    call_id: None,
-                })?;
-                let _ = record_telemetry_hook(
-                    environment,
-                    &session.agent_id,
-                    mews_agent::LifecycleHook::TurnEnd,
-                    json!({"session_id": metadata.mews_session_id, "turn_id": metadata.turn_id,
-                        "status": "failed", "outcome": bounded_detail(&error.to_string())}),
+    let mut observed_activities = Vec::new();
+    let result = if cancellation.is_cancelled() {
+        Err(anyhow::anyhow!(AcpCancelled))
+    } else if let Err(error) = discard_exited_cached_process(live_cache.as_deref_mut()) {
+        Err(error)
+    } else {
+        match invoke_turn_start(environment, &session, &cwd, &cancellation, events).await {
+            Ok(()) => {
+                execute_acp_attempt(
+                    &mut config,
                     &cwd,
+                    &harness_options,
+                    session,
+                    environment,
+                    allowed_tools,
                     &cancellation,
                     events,
+                    live_cache.as_deref_mut(),
+                    &mut observed_activities,
                 )
-                .await;
-                return Err(error).context("ACP turn_start hook failed");
+                .await
             }
-        }
-    }
-    if let Err(error) = prepare_instruction_channel(&mut config, &session) {
-        if let Some(metadata) = &hook_metadata {
-            let _ = record_telemetry_hook(
-                environment,
-                &agent_id,
-                mews_agent::LifecycleHook::TurnEnd,
-                json!({"session_id": metadata.mews_session_id, "turn_id": metadata.turn_id,
-                    "status":"failed", "outcome": bounded_detail(&error.to_string())}),
-                &cwd,
-                &cancellation,
-                events,
-            )
-            .await;
-        }
-        return Err(error);
-    }
-    let harness = AcpProcess::new(config);
-    let spawn_started = tokio::time::Instant::now();
-    let mut child = match harness.spawn(&cwd) {
-        Ok(child) => child,
-        Err(error) => {
-            if let Some(metadata) = &hook_metadata {
-                let _ = record_telemetry_hook(
-                    environment,
-                    &session.agent_id,
-                    mews_agent::LifecycleHook::TurnEnd,
-                    json!({"session_id": metadata.mews_session_id, "turn_id": metadata.turn_id,
-                        "status":"failed", "outcome": bounded_detail(&error.to_string())}),
-                    &cwd,
-                    &cancellation,
-                    events,
-                )
-                .await;
-            }
-            return Err(error);
+            Err(error) => Err(error),
         }
     };
-    let mut process_guard = ProcessTreeGuard::new(&child);
-    let spawn = spawn_started.elapsed();
-    let mut observed_activities = Vec::new();
-    let result = harness
-        .run_session_with_extensions(
-            &mut child,
-            cwd.clone(),
-            harness_options.clone(),
-            session,
-            environment,
-            allowed_tools,
-            cancellation.clone(),
-            &mut |event| {
-                if observed_activities.len() < 64 {
-                    match &event {
-                        AcpStreamEvent::ProviderState { data, .. } => observed_activities.push(json!({"type":"provider_state","data": crate::updates::bounded_json(data)})),
-                        AcpStreamEvent::ToolActivity { call_id, title, status, .. } => observed_activities.push(json!({"type":"tool_activity","call_id":call_id,"title":title,"status":status})),
-                        _ => {}
-                    }
-                }
-                events(event)
-            },
-        )
-        .await;
     if result
         .as_ref()
         .err()
         .is_some_and(|error| error.to_string().contains(CODEX_RESTART_FOR_RECOVERY))
     {
-        terminate_process_tree(&mut child).await;
-        process_guard.disarm();
-        let _ = child.wait().await;
+        if let Some(cache) = live_cache.as_deref_mut() {
+            cache.take();
+        }
         let mut replacement = replacement_session;
         replacement.transition = AcpBindingTransition::Replace {
             reason: AcpReplacementReason::ResourceNotFound,
@@ -348,7 +1099,7 @@ async fn execute_acp_turn_inner(
         if let Some(metadata) = &mut replacement.hook_metadata {
             metadata.invoke_turn_start = false;
         }
-        return Box::pin(execute_acp_turn_inner(
+        let recovery = Box::pin(execute_acp_turn_inner_cached(
             replacement_config,
             cwd,
             harness_options,
@@ -357,63 +1108,235 @@ async fn execute_acp_turn_inner(
             allowed_tools,
             cancellation,
             events,
+            live_cache,
         ))
         .await;
+        return recovery.map(|mut outcome| {
+            outcome.timings.total_ms = total_started.elapsed().as_millis() as u64;
+            outcome
+        });
     }
-    if let Some(metadata) = &hook_metadata {
-        let after_step = if let Ok(outcome) = &result {
-            record_telemetry_hook(
-                environment,
-                &agent_id,
-                mews_agent::LifecycleHook::AfterStep,
-                json!({"session_id": metadata.mews_session_id, "turn_id": metadata.turn_id,
-                    "acp_session_id": outcome.session_id, "answer": bounded_detail(&outcome.answer),
-                    "stop_reason": outcome.stop_reason, "activities": observed_activities}),
-                &cwd,
-                &cancellation,
-                events,
-            )
-            .await
-        } else {
-            Ok(())
-        };
-        let (status, detail) = match &result {
-            Ok(outcome) => ("succeeded", Some(bounded_detail(&outcome.answer))),
-            Err(error) if crate::rpc::is_cancelled(error) => ("cancelled", None),
-            Err(error) => ("failed", Some(bounded_detail(&error.to_string()))),
-        };
-        let turn_end = record_telemetry_hook(
-            environment,
-            &agent_id,
-            mews_agent::LifecycleHook::TurnEnd,
-            json!({"session_id": metadata.mews_session_id, "turn_id": metadata.turn_id,
-                    "status": status, "outcome": detail}),
-            &cwd,
-            &cancellation,
-            events,
+    finalize_turn_hooks(
+        environment,
+        &agent_id,
+        hook_metadata.as_ref(),
+        &result,
+        observed_activities,
+        &cwd,
+        &cancellation,
+        events,
+    )
+    .await?;
+    if result.is_err()
+        && let Some(cache) = live_cache
+    {
+        cache.take();
+    }
+    result
+        .map(|mut outcome| {
+            outcome.timings.total_ms = total_started.elapsed().as_millis() as u64;
+            outcome
+        })
+        .context("ACP Harness failed")
+}
+
+fn discard_exited_cached_process(cache: Option<&mut Option<LiveAcpProcess>>) -> Result<()> {
+    let Some(cache) = cache else {
+        return Ok(());
+    };
+    let exited = cache
+        .as_mut()
+        .map(|live| live.child.try_wait())
+        .transpose()
+        .context("inspect cached ACP Harness")?
+        .flatten()
+        .is_some();
+    if exited {
+        cache.take();
+    }
+    Ok(())
+}
+
+async fn invoke_turn_start(
+    environment: &dyn mews_agent::AgentCapabilities,
+    session: &AcpSessionRequest,
+    cwd: &Path,
+    cancellation: &mews_agent::CancellationToken,
+    events: &mut dyn FnMut(AcpStreamEvent) -> Result<()>,
+) -> Result<()> {
+    let Some(metadata) = session
+        .hook_metadata
+        .as_ref()
+        .filter(|metadata| metadata.invoke_turn_start)
+    else {
+        return Ok(());
+    };
+    let payload = json!({
+        "session_id": metadata.mews_session_id, "turn_id": metadata.turn_id,
+        "harness": metadata.harness, "cwd": cwd, "binding": session.transition,
+        "context_hash": metadata.context_hash, "context_channel": metadata.context_channel,
+    });
+    match environment
+        .hook(
+            &session.agent_id,
+            mews_agent::LifecycleHook::TurnStart,
+            payload,
+            cwd,
+            cancellation,
         )
-        .await;
-        match (after_step, turn_end) {
-            (Err(after_step), Err(turn_end)) => {
-                return Err(after_step)
-                    .context(format!("turn_end telemetry also failed: {turn_end:#}"));
-            }
-            (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
-            (Ok(()), Ok(())) => {}
+        .await
+    {
+        Ok(_) => events(AcpStreamEvent::HookOutcome {
+            event_key: accepted_event_key(),
+            hook: "turn_start".into(),
+            ok: true,
+            detail: None,
+            tool: None,
+            call_id: None,
+        }),
+        Err(error) => {
+            events(AcpStreamEvent::HookOutcome {
+                event_key: accepted_event_key(),
+                hook: "turn_start".into(),
+                ok: false,
+                detail: Some(bounded_detail(&error.to_string())),
+                tool: None,
+                call_id: None,
+            })?;
+            Err(error).context("ACP turn_start hook failed")
         }
     }
-    if result.is_err() {
-        terminate_process_tree(&mut child).await;
-        process_guard.disarm();
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_acp_attempt(
+    config: &mut AcpHarnessConfig,
+    cwd: &Path,
+    harness_options: &BTreeMap<String, String>,
+    session: AcpSessionRequest,
+    environment: &dyn mews_agent::AgentCapabilities,
+    allowed_tools: &[String],
+    cancellation: &mews_agent::CancellationToken,
+    events: &mut dyn FnMut(AcpStreamEvent) -> Result<()>,
+    mut live_cache: Option<&mut Option<LiveAcpProcess>>,
+    observed_activities: &mut Vec<Value>,
+) -> Result<AcpSessionOutcome> {
+    prepare_instruction_channel(config, &session)?;
+    let incompatible = live_cache
+        .as_deref()
+        .and_then(|cache| cache.as_ref())
+        .is_some_and(|live| !live.is_compatible_with(config, cwd));
+    if incompatible && let Some(live) = live_cache.as_deref_mut().and_then(Option::take) {
+        live.shutdown().await;
     }
-    let mut result = result.context("ACP Harness failed")?;
-    result.timings.spawn_ms = spawn.as_millis() as u64;
-    let status = child.wait().await.context("wait for ACP Harness")?;
-    process_guard.disarm();
-    if !status.success() {
-        bail!("ACP Harness exited with {status}");
+
+    let owns_process = live_cache.is_none();
+    let mut owned_live = None;
+    let mut timings = AcpTimings {
+        queue_ms: 0,
+        spawn_ms: 0,
+        initialize_ms: 0,
+        continuation_ms: 0,
+        prompt_to_first_update_ms: None,
+        prompt_to_first_token_ms: None,
+        prompt_ms: 0,
+        total_ms: 0,
+    };
+    if let Some(cache) = live_cache.as_deref_mut()
+        && cache.is_none()
+    {
+        let (live, started) = LiveAcpProcess::start(config.clone(), cwd, cancellation).await?;
+        *cache = Some(live);
+        timings = started;
+    } else if live_cache.is_none() {
+        let (live, started) = LiveAcpProcess::start(config.clone(), cwd, cancellation).await?;
+        owned_live = Some(live);
+        timings = started;
     }
-    Ok(result)
+    let live = match live_cache {
+        Some(cache) => cache.as_mut().expect("live ACP process initialized"),
+        None => owned_live.as_mut().expect("turn owns its ACP process"),
+    };
+    let result = AcpProcess::run_session_with_extensions(
+        live,
+        timings,
+        cwd.to_path_buf(),
+        harness_options.clone(),
+        session,
+        environment,
+        allowed_tools,
+        cancellation.clone(),
+        &mut |event| {
+            if observed_activities.len() < 64 {
+                match &event {
+                    AcpStreamEvent::ProviderState { data, .. } => observed_activities.push(json!({"type":"provider_state","data": crate::updates::bounded_json(data)})),
+                    AcpStreamEvent::ToolActivity { call_id, title, status, .. } => observed_activities.push(json!({"type":"tool_activity","call_id":call_id,"title":title,"status":status})),
+                    _ => {}
+                }
+            }
+            events(event)
+        },
+    )
+    .await;
+    if owns_process && let Some(live) = owned_live.take() {
+        live.shutdown().await;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_turn_hooks(
+    environment: &dyn mews_agent::AgentCapabilities,
+    agent_id: &mews_protocol::AgentId,
+    metadata: Option<&AcpHookMetadata>,
+    result: &Result<AcpSessionOutcome>,
+    observed_activities: Vec<Value>,
+    cwd: &Path,
+    cancellation: &mews_agent::CancellationToken,
+    events: &mut dyn FnMut(AcpStreamEvent) -> Result<()>,
+) -> Result<()> {
+    let Some(metadata) = metadata else {
+        return Ok(());
+    };
+    let after_step = if let Ok(outcome) = result {
+        record_telemetry_hook(
+            environment,
+            agent_id,
+            mews_agent::LifecycleHook::AfterStep,
+            json!({"session_id": metadata.mews_session_id, "turn_id": metadata.turn_id,
+                "acp_session_id": outcome.session_id, "answer": bounded_detail(&outcome.answer),
+                "stop_reason": outcome.stop_reason, "activities": observed_activities}),
+            cwd,
+            cancellation,
+            events,
+        )
+        .await
+    } else {
+        Ok(())
+    };
+    let (status, detail) = match result {
+        Ok(outcome) => ("succeeded", Some(bounded_detail(&outcome.answer))),
+        Err(error) if crate::rpc::is_cancelled(error) => ("cancelled", None),
+        Err(error) => ("failed", Some(bounded_detail(&error.to_string()))),
+    };
+    let turn_end = record_telemetry_hook(
+        environment,
+        agent_id,
+        mews_agent::LifecycleHook::TurnEnd,
+        json!({"session_id": metadata.mews_session_id, "turn_id": metadata.turn_id,
+                "status": status, "outcome": detail}),
+        cwd,
+        cancellation,
+        events,
+    )
+    .await;
+    match (after_step, turn_end) {
+        (Err(after_step), Err(turn_end)) => {
+            Err(after_step).context(format!("turn_end telemetry also failed: {turn_end:#}"))
+        }
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 async fn record_telemetry_hook(
@@ -538,8 +1461,8 @@ pub async fn probe_acp(config: AcpHarnessConfig, cwd: PathBuf) -> Result<AcpProb
 impl AcpProcess {
     #[allow(clippy::too_many_arguments)]
     async fn run_session_with_extensions(
-        &self,
-        child: &mut Child,
+        live: &mut LiveAcpProcess,
+        mut timings: AcpTimings,
         cwd: PathBuf,
         harness_options: BTreeMap<String, String>,
         session: AcpSessionRequest,
@@ -548,46 +1471,8 @@ impl AcpProcess {
         cancellation: mews_agent::CancellationToken,
         events: &mut dyn FnMut(AcpStreamEvent) -> Result<()>,
     ) -> Result<AcpSessionOutcome> {
-        let stdin = child
-            .stdin
-            .take()
-            .context("ACP Harness did not open stdin")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("ACP Harness did not open stdout")?;
-        let mut writer = stdin;
-        let mut reader = BufReader::new(stdout);
-        let mut rpc = RpcClient::new(
-            &mut writer,
-            &mut reader,
-            self.config.request_timeout,
-            self.config.permission_handler.as_ref(),
-        );
-        let initialize_started = tokio::time::Instant::now();
-        let initialize = rpc
-            .request(
-                "initialize",
-                json!({
-                    "protocolVersion": ACP_PROTOCOL_VERSION,
-                    "clientInfo": { "name": "mews", "version": env!("CARGO_PKG_VERSION") },
-                    "clientCapabilities": { "auth": { "terminal": true } },
-                }),
-                &cancellation,
-                None,
-                None,
-                |_| Ok(()),
-            )
-            .await?;
-        let initialize_elapsed = initialize_started.elapsed();
-        let initialize: InitializeResult =
-            serde_json::from_value(initialize).context("invalid ACP initialize result")?;
-        if initialize.protocol_version != ACP_PROTOCOL_VERSION {
-            bail!(
-                "ACP Harness negotiated unsupported protocol version {}",
-                initialize.protocol_version
-            );
-        }
+        let initialize = live.initialize.clone();
+        let mut rpc = live.rpc();
         let mut mcp = TurnMcpBridge::for_extensions_and_skills(
             environment,
             &session.agent_id,
@@ -604,6 +1489,7 @@ impl AcpProcess {
                 acp_session_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
             });
         }
+        let mut active_session_id = None;
         let lifecycle = async {
         let mcp_http = if !mcp.needs_transport() {
             None
@@ -710,6 +1596,7 @@ impl AcpProcess {
                 )
             };
         let continuation_elapsed = continuation_started.elapsed();
+        active_session_id = Some(session_id.clone());
         if let Some(transition) = &binding_transition {
             events(AcpStreamEvent::SessionBound {
                 event_key: format!("binding:{session_id}"),
@@ -759,6 +1646,9 @@ impl AcpProcess {
             })?;
         }
         let event_sink = std::cell::RefCell::new(&mut *events);
+        let prompt_started = tokio::time::Instant::now();
+        let mut first_update_ms = None;
+        let mut first_token_ms = None;
         let prompt_result = rpc
             .request_with_dispatch(
                 "session/prompt",
@@ -772,9 +1662,20 @@ impl AcpProcess {
                         session_id: session_id.clone(),
                     })
                 },
-                |update| updates.apply(update, &mut **event_sink.borrow_mut()),
+                |update| {
+                    let elapsed = prompt_started.elapsed().as_millis() as u64;
+                    first_update_ms.get_or_insert(elapsed);
+                    if update.get("sessionUpdate").and_then(Value::as_str)
+                        == Some("agent_message_chunk")
+                    {
+                        first_token_ms.get_or_insert(elapsed);
+                    }
+                    updates.apply(update, &mut **event_sink.borrow_mut())
+                },
             )
             .await;
+        let prompt_ms = prompt_started.elapsed().as_millis() as u64;
+        drop(rpc);
         let prompt_result = match prompt_result {
             Ok(result) => result,
             Err(error) if crate::rpc::is_cancelled(&error) || classify_error(&error).is_some() => {
@@ -800,13 +1701,18 @@ impl AcpProcess {
             session_id,
             session_replaced,
             stop_reason: prompt_result.stop_reason,
-            timings: AcpTimings {
-                spawn_ms: 0,
-                initialize_ms: initialize_elapsed.as_millis() as u64,
-                continuation_ms: continuation_elapsed.as_millis() as u64,
+            timings: {
+                timings.continuation_ms = continuation_elapsed.as_millis() as u64;
+                timings.prompt_to_first_update_ms = first_update_ms;
+                timings.prompt_to_first_token_ms = first_token_ms;
+                timings.prompt_ms = prompt_ms;
+                timings
             },
         })
         }.await;
+        if let Some(session_id) = active_session_id {
+            live.session_ids.insert(session_id);
+        }
         let uncertain_effect = mcp.take_effect_uncertainty();
         let audit = drain_mcp_hook_outcomes(&mcp, events);
         mcp.revoke();
@@ -1001,11 +1907,10 @@ fn prepare_instruction_channel(
     config: &mut AcpHarnessConfig,
     session: &AcpSessionRequest,
 ) -> Result<()> {
-    // A successful resume must not inject initialization instructions into an
-    // existing provider conversation.  New/replacement paths own the channel.
-    if session.instruction_channel != AcpInstructionChannel::CodexDeveloper
-        || matches!(session.transition, AcpBindingTransition::Resume { .. })
-    {
+    // Codex ACP reads this process-scoped configuration at startup and applies
+    // it when starting or resuming the provider Session. It must therefore be
+    // present on every cold process start, including Resume after idle eviction.
+    if session.instruction_channel != AcpInstructionChannel::CodexDeveloper {
         return Ok(());
     }
     let key = std::ffi::OsString::from("CODEX_CONFIG");
@@ -1055,7 +1960,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        AcpHarnessConfig, AcpSessionRequest, AcpStopReason, AcpStreamEvent, execute_acp_turn_inner,
+        AcpEventSink, AcpHarnessConfig, AcpHookMetadata, AcpRuntimePool, AcpSessionRequest,
+        AcpStopReason, AcpStreamEvent, PersistentAcpTurnRequest, execute_acp_turn_inner,
         prepare_instruction_channel, probe_acp, session_new_params,
     };
     use crate::rpc::{AcpErrorKind, acp_rpc_error, classify_error, is_resource_not_found};
@@ -1110,7 +2016,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_instruction_channels_initialize_only_new_bindings() {
+    fn managed_instruction_channels_prepare_every_cold_process_start() {
         let mut config = AcpHarnessConfig::new(["fixture"]).unwrap();
         let codex_config = std::ffi::OsString::from("CODEX_CONFIG");
         config.environment.insert(
@@ -1150,7 +2056,10 @@ mod tests {
         };
         let mut resumed_config = AcpHarnessConfig::new(["fixture"]).unwrap();
         prepare_instruction_channel(&mut resumed_config, &resume).unwrap();
-        assert!(!resumed_config.environment.contains_key(&codex_config));
+        let resumed: Value =
+            serde_json::from_str(&resumed_config.environment[&codex_config].to_string_lossy())
+                .unwrap();
+        assert_eq!(resumed["developer_instructions"], "MEWS context");
     }
 
     #[cfg(unix)]
@@ -1242,7 +2151,7 @@ while IFS= read -r line; do
   case "$line" in
     *'"id":1'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{}}}' ;;
     *'"id":2'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"fixture"}}' ;;
-    *'"id":3'*) while true; do printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk","text":"busy"}}}'; sleep 0.01; done ;;
+    *'"id":3'*) while true; do printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture","update":{"sessionUpdate":"agent_thought_chunk","text":"busy"}}}'; sleep 0.01; done ;;
   esac
 done
 "#,
@@ -1406,6 +2315,66 @@ done
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn dropping_persistent_turn_terminates_the_active_process_tree() {
+        use std::{fs, os::unix::fs::PermissionsExt, sync::Arc};
+
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = directory.path().join("drop-persistent-acp");
+        let descendant_path = directory.path().join("persistent-descendant.pid");
+        fs::write(
+            &fixture,
+            format!(
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}\n' "$id" ;;
+    *'"method":"session/new"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"fixture"}}}}\n' "$id" ;;
+    *'"method":"session/prompt"'*) sleep 30 & child=$!; printf %s "$child" > {}; wait ;;
+  esac
+done
+"#,
+                descendant_path.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let pool = AcpRuntimePool::new(Duration::from_secs(30));
+        let mut events = |_| Ok(());
+        let mut execution = Box::pin(pool.execute_turn(persistent_fixture_request(
+            &fixture,
+            directory.path(),
+            Arc::new(NoCapabilities),
+            AcpBindingTransition::New,
+            "stable context",
+            &mut events,
+        )));
+        let descendant = loop {
+            tokio::select! {
+                result = &mut execution => {
+                    panic!("persistent ACP Turn exited before its caller was dropped: {result:?}");
+                }
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            if let Ok(pid) = fs::read_to_string(&descendant_path) {
+                break pid.parse::<i32>().unwrap();
+            }
+        };
+        drop(execution);
+
+        for _ in 0..100 {
+            // SAFETY: signal 0 only checks whether this test descendant exists.
+            if unsafe { libc::kill(descendant, 0) } == -1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("dropped persistent ACP descendant {descendant} is still running");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn resumes_existing_session_without_replaying_recovery_context() {
         use std::{fs, os::unix::fs::PermissionsExt};
         let directory = tempfile::tempdir().unwrap();
@@ -1417,7 +2386,7 @@ while IFS= read -r line; do
   case "$line" in
     *'"id":1'*) sleep 0.02; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"resume":{}}}}}' ;;
     *'"id":2'*'session/resume'*'native-1'*) sleep 0.02; printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}' ;;
-    *'"id":3'*'second turn'*) printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"resumed"}}}}'; printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'; exit 0 ;;
+    *'"id":3'*'second turn'*) printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"native-1","update":{"sessionUpdate":"agent_message_chunk","content":{"text":"resumed"}}}}'; printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'; exit 0 ;;
     *) exit 9 ;;
   esac
 done
@@ -1564,6 +2533,52 @@ done
         assert_eq!(bound, vec![("native-2".into(), true)]);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovery_timings_include_the_failed_resume_without_inflating_queue_time() {
+        use std::{fs, os::unix::fs::PermissionsExt, sync::Arc};
+
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = directory.path().join("timed-recovery-acp");
+        let starts = directory.path().join("starts");
+        let script = r#"#!/bin/sh
+printf 'start\n' >> '__STARTS__'
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"resume":{}}}}}\n' "$id" ;;
+    *'"method":"session/resume"'*) sleep 0.15; printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32002,"message":"Resource not found"}}\n' "$id" ;;
+    *'"method":"session/new"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"recovered"}}\n' "$id" ;;
+    *'"method":"session/prompt"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
+  esac
+done
+"#
+        .replace("__STARTS__", &starts.to_string_lossy());
+        fs::write(&fixture, script).unwrap();
+        fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let pool = AcpRuntimePool::new(Duration::from_secs(30));
+        let mut events = |_| Ok(());
+        let outcome = pool
+            .execute_turn(persistent_fixture_request(
+                &fixture,
+                directory.path(),
+                Arc::new(NoCapabilities),
+                AcpBindingTransition::Resume {
+                    acp_session_id: "missing".into(),
+                },
+                "stable context",
+                &mut events,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(fs::read_to_string(starts).unwrap(), "start\nstart\n");
+        assert_eq!(outcome.session_id, "recovered");
+        assert!(outcome.timings.total_ms >= 100);
+        assert!(outcome.timings.queue_ms < 100);
+    }
+
     struct NoCapabilities;
     #[async_trait]
     impl AgentCapabilities for NoCapabilities {
@@ -1593,6 +2608,120 @@ done
         ) -> Result<serde_json::Value> {
             Ok(serde_json::Value::Null)
         }
+    }
+
+    fn persistent_fixture_request<'a>(
+        fixture: &Path,
+        cwd: &Path,
+        environment: std::sync::Arc<dyn AgentCapabilities>,
+        transition: AcpBindingTransition,
+        context: &str,
+        events: &'a mut dyn AcpEventSink,
+    ) -> PersistentAcpTurnRequest<'a> {
+        let agent_id = mews_protocol::AgentId::new();
+        PersistentAcpTurnRequest {
+            session_key: agent_id.to_string(),
+            config: AcpHarnessConfig::new([fixture.as_os_str().to_owned()]).unwrap(),
+            cwd: cwd.to_owned(),
+            harness_options: BTreeMap::new(),
+            session: AcpSessionRequest {
+                agent_id,
+                agent_slug: "coder".into(),
+                transition,
+                prompt: "hello".into(),
+                recovery_prompt: "hello".into(),
+                context_text: context.into(),
+                instruction_channel: AcpInstructionChannel::CodexDeveloper,
+                skills: Vec::new(),
+                hook_metadata: None,
+            },
+            environment,
+            allowed_tools: Vec::new(),
+            cancellation: CancellationToken::new(),
+            events,
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingCapabilities {
+        hooks: std::sync::Mutex<Vec<(LifecycleHook, Value)>>,
+    }
+
+    #[async_trait]
+    impl AgentCapabilities for RecordingCapabilities {
+        async fn context(&self, _: &str, _: &Path) -> Result<ContextSnapshot> {
+            Ok(ContextSnapshot::default())
+        }
+
+        fn tools(&self) -> Vec<ToolDefinition> {
+            Vec::new()
+        }
+
+        async fn execute(
+            &self,
+            _: &mews_protocol::AgentId,
+            _: &ToolCall,
+            _: &Path,
+            _: &CancellationToken,
+            _: &dyn ProgressReporter,
+        ) -> Result<ToolResult> {
+            bail!("ACP fixture must not call MEWS extension tools")
+        }
+
+        async fn hook(
+            &self,
+            _: &mews_protocol::AgentId,
+            hook: LifecycleHook,
+            payload: Value,
+            _: &Path,
+            _: &CancellationToken,
+        ) -> Result<Value> {
+            self.hooks.lock().unwrap().push((hook, payload));
+            Ok(Value::Null)
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_end_runs_when_the_acp_process_cannot_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let environment = RecordingCapabilities::default();
+
+        execute_acp_turn_inner(
+            AcpHarnessConfig::new([directory.path().join("missing-acp").into_os_string()]).unwrap(),
+            directory.path().to_owned(),
+            BTreeMap::new(),
+            AcpSessionRequest {
+                agent_id: mews_protocol::AgentId::new(),
+                agent_slug: "coder".into(),
+                transition: AcpBindingTransition::New,
+                prompt: "hello".into(),
+                recovery_prompt: "hello".into(),
+                context_text: String::new(),
+                instruction_channel: AcpInstructionChannel::FirstPrompt,
+                skills: Vec::new(),
+                hook_metadata: Some(AcpHookMetadata {
+                    mews_session_id: "session".into(),
+                    turn_id: "turn".into(),
+                    harness: "fixture".into(),
+                    context_hash: String::new(),
+                    context_channel: AcpInstructionChannel::FirstPrompt,
+                    invoke_turn_start: true,
+                }),
+            },
+            &environment,
+            &[],
+            CancellationToken::new(),
+            &mut |_| Ok(()),
+        )
+        .await
+        .unwrap_err();
+
+        let hooks = environment.hooks.lock().unwrap();
+        assert_eq!(
+            hooks.iter().map(|(hook, _)| *hook).collect::<Vec<_>>(),
+            vec![LifecycleHook::TurnStart, LifecycleHook::TurnEnd]
+        );
+        assert_eq!(hooks[1].1["status"], "failed");
     }
 
     #[cfg(unix)]
@@ -1849,6 +2978,8 @@ done
         .unwrap();
         assert_eq!(outcome.answer, "intro\n\nfixture reply");
         assert_eq!(outcome.stop_reason, AcpStopReason::EndTurn);
+        assert!(outcome.timings.prompt_to_first_update_ms.is_some());
+        assert!(outcome.timings.prompt_to_first_token_ms.is_some());
         let dispatched = events
             .iter()
             .position(|event| matches!(event, AcpStreamEvent::PromptDispatched { session_id, .. } if session_id == "fixture"))
@@ -1881,5 +3012,564 @@ done
                     && status.as_deref() == Some("completed")
                     && input["query"] == "weather in Tashkent"
         )));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_updates_for_a_different_session() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = directory.path().join("misrouted-acp");
+        fs::write(
+            &fixture,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id" ;;
+    *'"method":"session/new"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"session-a"}}\n' "$id" ;;
+    *'"method":"session/prompt"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-b","update":{"sessionUpdate":"agent_message_chunk","content":{"text":"wrong answer"}}}}'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut events = Vec::new();
+
+        let error = execute_acp_turn_inner(
+            AcpHarnessConfig::new([fixture.into_os_string()]).unwrap(),
+            directory.path().to_owned(),
+            BTreeMap::new(),
+            AcpSessionRequest {
+                agent_id: mews_protocol::AgentId::new(),
+                agent_slug: "coder".into(),
+                transition: AcpBindingTransition::New,
+                prompt: "hello".into(),
+                recovery_prompt: "hello".into(),
+                context_text: String::new(),
+                instruction_channel: AcpInstructionChannel::FirstPrompt,
+                skills: Vec::new(),
+                hook_metadata: None,
+            },
+            &NoCapabilities,
+            &[],
+            CancellationToken::new(),
+            &mut |event| {
+                events.push(event);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("unexpected Session"));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AcpStreamEvent::AssistantDelta { .. }))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dead_cached_process_is_restarted_before_resume() {
+        use std::{fs, os::unix::fs::PermissionsExt, sync::Arc};
+
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = directory.path().join("restart-acp");
+        let starts = directory.path().join("starts");
+        let script = r#"#!/bin/sh
+printf 'start\n' >> '__STARTS__'
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"resume":{}}}}}\n' "$id" ;;
+    *'"method":"session/new"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"fixture"}}\n' "$id" ;;
+    *'"method":"session/resume"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"session/prompt"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"; exit 0 ;;
+  esac
+done
+"#
+        .replace("__STARTS__", &starts.to_string_lossy());
+        fs::write(&fixture, script).unwrap();
+        fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let pool = AcpRuntimePool::new(Duration::from_secs(30));
+        let environment: Arc<dyn AgentCapabilities> = Arc::new(NoCapabilities);
+        let mut first_events = |_| Ok(());
+        let mut first = persistent_fixture_request(
+            &fixture,
+            directory.path(),
+            environment.clone(),
+            AcpBindingTransition::New,
+            "stable context",
+            &mut first_events,
+        );
+        first.session_key = "session".into();
+        pool.execute_turn(first).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut second_events = |_| Ok(());
+        let mut second = persistent_fixture_request(
+            &fixture,
+            directory.path(),
+            environment,
+            AcpBindingTransition::Resume {
+                acp_session_id: "fixture".into(),
+            },
+            "stable context",
+            &mut second_events,
+        );
+        second.session_key = "session".into();
+        pool.execute_turn(second).await.unwrap();
+
+        assert_eq!(fs::read_to_string(starts).unwrap(), "start\nstart\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_pool_shares_only_compatible_sessions() {
+        use std::{fs, os::unix::fs::PermissionsExt, sync::Arc};
+
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = directory.path().join("persistent-acp");
+        let starts = directory.path().join("starts");
+        let closes = directory.path().join("closes");
+        let script = r#"#!/bin/sh
+printf '%s\n' "$CODEX_CONFIG" >> '__STARTS__'
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"resume":{},"close":{}}}}}\n' "$id" ;;
+    *'"method":"session/new"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"fixture-%s"}}\n' "$id" "$id" ;;
+    *'"method":"session/resume"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"session/prompt"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
+    *'"method":"session/close"'*) printf 'close\n' >> '__CLOSES__'; printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+  esac
+done
+"#
+        .replace("__STARTS__", &starts.to_string_lossy())
+        .replace("__CLOSES__", &closes.to_string_lossy());
+        fs::write(&fixture, script).unwrap();
+        fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let pool = AcpRuntimePool::new(Duration::from_millis(40));
+        let agent_id = mews_protocol::AgentId::new();
+        let environment: Arc<dyn mews_agent::AgentCapabilities> = Arc::new(NoCapabilities);
+        for (runtime_id, transition, context) in [
+            ("session-a", AcpBindingTransition::New, "shared context"),
+            ("session-b", AcpBindingTransition::New, "shared context"),
+            (
+                "session-a",
+                AcpBindingTransition::Resume {
+                    acp_session_id: "fixture-2".into(),
+                },
+                "shared context",
+            ),
+            ("session-c", AcpBindingTransition::New, "isolated context"),
+        ] {
+            pool.execute_turn(PersistentAcpTurnRequest {
+                session_key: runtime_id.into(),
+                config: AcpHarnessConfig::new([fixture.clone().into_os_string()]).unwrap(),
+                cwd: directory.path().to_owned(),
+                harness_options: BTreeMap::new(),
+                session: AcpSessionRequest {
+                    agent_id: agent_id.clone(),
+                    agent_slug: "coder".into(),
+                    transition,
+                    prompt: "hello".into(),
+                    recovery_prompt: "hello".into(),
+                    context_text: context.into(),
+                    instruction_channel: AcpInstructionChannel::CodexDeveloper,
+                    skills: Vec::new(),
+                    hook_metadata: Some(AcpHookMetadata {
+                        mews_session_id: runtime_id.into(),
+                        turn_id: uuid::Uuid::now_v7().to_string(),
+                        harness: "fixture".into(),
+                        context_hash: String::new(),
+                        context_channel: AcpInstructionChannel::CodexDeveloper,
+                        invoke_turn_start: false,
+                    }),
+                },
+                environment: environment.clone(),
+                allowed_tools: Vec::new(),
+                cancellation: CancellationToken::new(),
+                events: &mut |_| Ok(()),
+            })
+            .await
+            .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let starts = fs::read_to_string(starts)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[0]["developer_instructions"], "shared context");
+        assert_eq!(starts[1]["developer_instructions"], "isolated context");
+        assert_eq!(fs::read_to_string(closes).unwrap().lines().count(), 3);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_pool_scales_concurrency_without_exceeding_its_limit() {
+        use std::{fs, os::unix::fs::PermissionsExt, sync::Arc};
+
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = directory.path().join("concurrent-acp");
+        let starts = directory.path().join("starts");
+        let script = r#"#!/bin/sh
+printf 'start\n' >> '__STARTS__'
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id" ;;
+    *'"method":"session/new"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"fixture"}}\n' "$id" ;;
+    *'"method":"session/prompt"'*) sleep 0.1; printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
+  esac
+done
+"#
+        .replace("__STARTS__", &starts.to_string_lossy());
+        fs::write(&fixture, script).unwrap();
+        fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let pool = AcpRuntimePool::with_max_processes(Duration::from_millis(40), 2);
+        let environment: Arc<dyn AgentCapabilities> = Arc::new(NoCapabilities);
+        let mut events_a = |_| Ok(());
+        let mut events_b = |_| Ok(());
+        let mut events_c = |_| Ok(());
+        let a = pool.execute_turn(persistent_fixture_request(
+            &fixture,
+            directory.path(),
+            environment.clone(),
+            AcpBindingTransition::New,
+            "shared context",
+            &mut events_a,
+        ));
+        let b = pool.execute_turn(persistent_fixture_request(
+            &fixture,
+            directory.path(),
+            environment.clone(),
+            AcpBindingTransition::New,
+            "shared context",
+            &mut events_b,
+        ));
+        let c = pool.execute_turn(persistent_fixture_request(
+            &fixture,
+            directory.path(),
+            environment,
+            AcpBindingTransition::New,
+            "shared context",
+            &mut events_c,
+        ));
+        let (a, b, c) = tokio::join!(a, b, c);
+        a.unwrap();
+        b.unwrap();
+        c.unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        assert_eq!(fs::read_to_string(starts).unwrap(), "start\nstart\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_pool_evicts_idle_workers_at_the_global_limit() {
+        use std::{fs, os::unix::fs::PermissionsExt, sync::Arc};
+
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = directory.path().join("globally-bounded-acp");
+        let starts = directory.path().join("starts");
+        let script = r#"#!/bin/sh
+printf 'start\n' >> '__STARTS__'
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id" ;;
+    *'"method":"session/new"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"fixture"}}\n' "$id" ;;
+    *'"method":"session/prompt"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
+  esac
+done
+"#
+        .replace("__STARTS__", &starts.to_string_lossy());
+        fs::write(&fixture, script).unwrap();
+        fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let pool = AcpRuntimePool::with_max_processes(Duration::from_secs(30), 2);
+        let environment: Arc<dyn AgentCapabilities> = Arc::new(NoCapabilities);
+        for context in ["context-a", "context-b", "context-c"] {
+            let mut events = |_| Ok(());
+            pool.execute_turn(persistent_fixture_request(
+                &fixture,
+                directory.path(),
+                environment.clone(),
+                AcpBindingTransition::New,
+                context,
+                &mut events,
+            ))
+            .await
+            .unwrap();
+            assert!(pool.process_count() <= 2);
+        }
+
+        assert_eq!(fs::read_to_string(starts).unwrap().lines().count(), 3);
+        assert_eq!(pool.process_count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn queued_persistent_turn_cancels_without_reaching_the_adapter() {
+        use std::{fs, os::unix::fs::PermissionsExt, sync::Arc};
+
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = directory.path().join("queued-cancel-acp");
+        let prompts = directory.path().join("prompts");
+        let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id" ;;
+    *'"method":"session/new"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"fixture"}}\n' "$id" ;;
+    *'"method":"session/prompt"'*) printf 'prompt\n' >> '__PROMPTS__'; sleep 30 ;;
+  esac
+done
+"#
+        .replace("__PROMPTS__", &prompts.to_string_lossy());
+        fs::write(&fixture, script).unwrap();
+        fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let pool = AcpRuntimePool::with_max_processes(Duration::from_secs(30), 1);
+        let environment: Arc<dyn AgentCapabilities> = Arc::new(NoCapabilities);
+        let first_cancellation = CancellationToken::new();
+        let mut first_events = |_| Ok(());
+        let mut first_request = persistent_fixture_request(
+            &fixture,
+            directory.path(),
+            environment.clone(),
+            AcpBindingTransition::New,
+            "stable context",
+            &mut first_events,
+        );
+        first_request.cancellation = first_cancellation.clone();
+        let first = pool.execute_turn(first_request);
+        tokio::pin!(first);
+        loop {
+            tokio::select! {
+                result = &mut first => panic!("first Turn stopped before cancellation: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            if prompts.is_file() {
+                break;
+            }
+        }
+
+        let second_cancellation = CancellationToken::new();
+        let second_environment = Arc::new(RecordingCapabilities::default());
+        let mut turn_end_observed = false;
+        let mut second_events = |event| {
+            if matches!(
+                event,
+                AcpStreamEvent::HookOutcome { ref hook, .. } if hook == "turn_end"
+            ) {
+                turn_end_observed = true;
+            }
+            Ok(())
+        };
+        let mut second_request = persistent_fixture_request(
+            &fixture,
+            directory.path(),
+            second_environment.clone(),
+            AcpBindingTransition::New,
+            "stable context",
+            &mut second_events,
+        );
+        second_request.session.hook_metadata = Some(AcpHookMetadata {
+            mews_session_id: "queued-session".into(),
+            turn_id: "queued-turn".into(),
+            harness: "fixture".into(),
+            context_hash: String::new(),
+            context_channel: AcpInstructionChannel::CodexDeveloper,
+            invoke_turn_start: true,
+        });
+        second_request.cancellation = second_cancellation.clone();
+        let error = {
+            let second = pool.execute_turn(second_request);
+            tokio::pin!(second);
+            tokio::select! {
+                result = &mut second => panic!("queued Turn stopped before cancellation: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            second_cancellation.cancel();
+            tokio::time::timeout(Duration::from_millis(100), &mut second)
+                .await
+                .expect("queued cancellation should return promptly")
+                .unwrap_err()
+        };
+        assert!(crate::rpc::is_cancelled(&error));
+        assert!(turn_end_observed);
+        {
+            let hooks = second_environment.hooks.lock().unwrap();
+            assert_eq!(hooks.len(), 1);
+            assert_eq!(hooks[0].0, LifecycleHook::TurnEnd);
+            assert_eq!(hooks[0].1["status"], "cancelled");
+        }
+
+        first_cancellation.cancel();
+        first.await.unwrap_err();
+        assert_eq!(fs::read_to_string(prompts).unwrap(), "prompt\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn active_persistent_cancellation_persists_turn_end_before_returning() {
+        use std::{fs, os::unix::fs::PermissionsExt, sync::Arc};
+
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = directory.path().join("active-cancel-acp");
+        let prompts = directory.path().join("prompts");
+        let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id" ;;
+    *'"method":"session/new"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"fixture"}}\n' "$id" ;;
+    *'"method":"session/prompt"'*) printf 'prompt\n' >> '__PROMPTS__'; sleep 30 ;;
+  esac
+done
+"#
+        .replace("__PROMPTS__", &prompts.to_string_lossy());
+        fs::write(&fixture, script).unwrap();
+        fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let pool = AcpRuntimePool::new(Duration::from_secs(30));
+        let environment = Arc::new(RecordingCapabilities::default());
+        let cancellation = CancellationToken::new();
+        let mut turn_end_observed = false;
+        let mut events = |event| {
+            if matches!(
+                event,
+                AcpStreamEvent::HookOutcome { ref hook, .. } if hook == "turn_end"
+            ) {
+                turn_end_observed = true;
+            }
+            Ok(())
+        };
+        let mut request = persistent_fixture_request(
+            &fixture,
+            directory.path(),
+            environment.clone(),
+            AcpBindingTransition::New,
+            "stable context",
+            &mut events,
+        );
+        request.session.hook_metadata = Some(AcpHookMetadata {
+            mews_session_id: "active-session".into(),
+            turn_id: "active-turn".into(),
+            harness: "fixture".into(),
+            context_hash: String::new(),
+            context_channel: AcpInstructionChannel::CodexDeveloper,
+            invoke_turn_start: true,
+        });
+        request.cancellation = cancellation.clone();
+
+        let error = {
+            let execution = pool.execute_turn(request);
+            tokio::pin!(execution);
+            loop {
+                tokio::select! {
+                    result = &mut execution => panic!("active Turn stopped before cancellation: {result:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+                if prompts.is_file() {
+                    break;
+                }
+            }
+            cancellation.cancel();
+            execution.await.unwrap_err()
+        };
+
+        assert!(crate::rpc::is_cancelled(&error));
+        assert!(turn_end_observed);
+        let hooks = environment.hooks.lock().unwrap();
+        assert_eq!(
+            hooks.iter().map(|(hook, _)| *hook).collect::<Vec<_>>(),
+            vec![
+                LifecycleHook::TurnStart,
+                LifecycleHook::BeforeModel,
+                LifecycleHook::TurnEnd,
+            ]
+        );
+        assert_eq!(hooks.last().unwrap().1["status"], "cancelled");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_runtime_is_evicted_and_resumed_with_its_context() {
+        use std::{fs, os::unix::fs::PermissionsExt, sync::Arc};
+
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = directory.path().join("evictable-acp");
+        let starts = directory.path().join("starts");
+        let closes = directory.path().join("closes");
+        let script = r#"#!/bin/sh
+printf '%s\n' "$CODEX_CONFIG" >> '__STARTS__'
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"resume":{},"close":{}}}}}\n' "$id" ;;
+    *'"method":"session/new"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"fixture"}}\n' "$id" ;;
+    *'"method":"session/resume"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"session/prompt"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
+    *'"method":"session/close"'*) printf 'close\n' >> '__CLOSES__'; printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+  esac
+done
+"#
+        .replace("__STARTS__", &starts.to_string_lossy())
+        .replace("__CLOSES__", &closes.to_string_lossy());
+        fs::write(&fixture, script).unwrap();
+        fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let pool = AcpRuntimePool::new(Duration::from_millis(40));
+        let environment: Arc<dyn mews_agent::AgentCapabilities> = Arc::new(NoCapabilities);
+        let mut first_events = |_| Ok(());
+        pool.execute_turn(persistent_fixture_request(
+            &fixture,
+            directory.path(),
+            environment.clone(),
+            AcpBindingTransition::New,
+            "stable context",
+            &mut first_events,
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let mut second_events = |_| Ok(());
+        pool.execute_turn(persistent_fixture_request(
+            &fixture,
+            directory.path(),
+            environment,
+            AcpBindingTransition::Resume {
+                acp_session_id: "fixture".into(),
+            },
+            "stable context",
+            &mut second_events,
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let starts = fs::read_to_string(starts).unwrap();
+        assert_eq!(starts.lines().count(), 2);
+        assert!(starts.lines().all(|line| {
+            serde_json::from_str::<Value>(line).unwrap()["developer_instructions"]
+                == "stable context"
+        }));
+        assert_eq!(fs::read_to_string(closes).unwrap(), "close\nclose\n");
     }
 }

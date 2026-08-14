@@ -214,14 +214,15 @@ impl Mews {
 
     async fn send_locally(&mut self, request: SendRequest<'_>) -> Result<String> {
         let installation = self.installation()?;
-        let environment = mews_host::LocalEnvironment::new(
+        let environment: Arc<dyn AgentCapabilities> = Arc::new(mews_host::LocalEnvironment::new(
             Some(self.root.clone()),
             Arc::new(self.local_tools()?),
-        );
+        ));
         let harnesses = mews_host::HarnessCatalog::discover(Some(&self.root))?;
         self.execute_send(
             request,
-            &environment,
+            environment.as_ref(),
+            Some(environment.clone()),
             &installation.hub_host_id,
             Some(&harnesses),
             None,
@@ -280,6 +281,7 @@ impl Mews {
                 cancellation: mews_agent::CancellationToken::new(),
             },
             host.agent_capabilities(),
+            None,
             host.host_id(),
             None,
             Some(host),
@@ -308,6 +310,7 @@ impl Mews {
                 cancellation: turn.cancellation,
             },
             host.agent_capabilities(),
+            None,
             host.host_id(),
             None,
             Some(host),
@@ -319,6 +322,7 @@ impl Mews {
         &mut self,
         request: SendRequest<'_>,
         environment: &dyn AgentCapabilities,
+        persistent_environment: Option<Arc<dyn AgentCapabilities>>,
         environment_host_id: &crate::HostId,
         harnesses: Option<&mews_host::HarnessCatalog>,
         remote_host: Option<&dyn crate::host::HostControl>,
@@ -513,40 +517,43 @@ impl Mews {
             self.store
                 .mark_effect_started(&session.id, &turn, &operation_id)?;
             let prompt_dispatched = true;
-            let outcome = mews_acp::execute_acp_turn(mews_acp::AcpTurnRequest {
+            let acp_session = mews_acp::AcpSessionRequest {
+                agent_id: session.agent_id.clone(),
+                agent_slug: agent_slug.clone(),
+                transition: transition.clone(),
+                prompt: prompt.clone(),
+                recovery_prompt,
+                context_text: context_text.clone(),
+                instruction_channel: channel,
+                skills: skills
+                    .into_iter()
+                    .map(|skill| mews_acp::AcpSkill {
+                        name: skill.name,
+                        description: skill.description,
+                        hash: skill.hash,
+                        content: skill.content,
+                    })
+                    .collect(),
+                hook_metadata: Some(mews_acp::AcpHookMetadata {
+                    mews_session_id: session.id.to_string(),
+                    turn_id: turn.to_string(),
+                    harness: harness_descriptor.name.clone(),
+                    context_hash: mews_protocol::AcpContextSnapshot::hash_rendered(&context_text),
+                    context_channel: channel,
+                    invoke_turn_start: true,
+                }),
+            };
+            let outcome = self.acp_pool.execute_turn(
+                mews_acp::PersistentAcpTurnRequest {
+                session_key: session.id.to_string(),
                 config: acp,
                 cwd: session.working_directory.clone(),
                 harness_options: config.harness_options.clone(),
-                session: mews_acp::AcpSessionRequest {
-                    agent_id: session.agent_id.clone(),
-                    agent_slug: agent_slug.clone(),
-                    transition: transition.clone(),
-                    prompt: prompt.clone(),
-                    recovery_prompt,
-                    context_text: context_text.clone(),
-                    instruction_channel: channel,
-                    skills: skills
-                        .into_iter()
-                        .map(|skill| mews_acp::AcpSkill {
-                            name: skill.name,
-                            description: skill.description,
-                            hash: skill.hash,
-                            content: skill.content,
-                        })
-                        .collect(),
-                    hook_metadata: Some(mews_acp::AcpHookMetadata {
-                        mews_session_id: session.id.to_string(),
-                        turn_id: turn.to_string(),
-                        harness: harness_descriptor.name.clone(),
-                        context_hash: mews_protocol::AcpContextSnapshot::hash_rendered(
-                            &context_text,
-                        ),
-                        context_channel: channel,
-                        invoke_turn_start: true,
-                    }),
-                },
-                environment,
-                allowed_tools: &config.tools,
+                session: acp_session,
+                environment: persistent_environment
+                    .clone()
+                    .context("local ACP execution requires an owned environment")?,
+                allowed_tools: config.tools.clone(),
                 cancellation: cancellation.clone(),
                 events: &mut |event| {
                     if let mews_acp::AcpStreamEvent::SessionBound {
@@ -579,7 +586,8 @@ impl Mews {
                         &mut reasoning,
                     )
                 },
-            })
+                },
+            )
             .await;
             self.store.finish_effect(
                 &session.id,
@@ -593,6 +601,7 @@ impl Mews {
                 session,
                 &turn,
                 &harness_descriptor,
+                config.harness_options.get("model").map(String::as_str),
                 outcome,
                 event_notify,
             );
@@ -862,6 +871,7 @@ impl Mews {
                         session,
                         &turn,
                         &harness_descriptor,
+                        config.harness_options.get("model").map(String::as_str),
                         Ok(outcome),
                         event_notify,
                     );

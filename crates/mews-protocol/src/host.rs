@@ -325,9 +325,19 @@ pub enum AcpStopReason {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AcpTimings {
+    #[serde(default)]
+    pub queue_ms: u64,
     pub spawn_ms: u64,
     pub initialize_ms: u64,
     pub continuation_ms: u64,
+    #[serde(default)]
+    pub prompt_to_first_update_ms: Option<u64>,
+    #[serde(default)]
+    pub prompt_to_first_token_ms: Option<u64>,
+    #[serde(default)]
+    pub prompt_ms: u64,
+    #[serde(default)]
+    pub total_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

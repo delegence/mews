@@ -297,12 +297,14 @@ pub async fn handle_host_request_streaming(
                             .build()
                             .context("create ACP extension runtime")
                             .and_then(|runtime| {
-                                let environment = crate::LocalEnvironment::new(
+                                let acp_pool = registry.acp_pool().clone();
+                                let environment: Arc<dyn mews_agent::AgentCapabilities> = Arc::new(crate::LocalEnvironment::new(
                                     Some(host_root),
                                     Arc::new(registry),
-                                );
+                                ));
                                 runtime.block_on(
-                                    mews_acp::execute_acp_turn(mews_acp::AcpTurnRequest {
+                                    acp_pool.execute_turn(mews_acp::PersistentAcpTurnRequest {
+                                        session_key: mews_session_id.clone(),
                                         config,
                                         cwd: canonical_cwd,
                                         harness_options,
@@ -324,8 +326,8 @@ pub async fn handle_host_request_streaming(
                                                 invoke_turn_start: true,
                                             }),
                                         },
-                                        environment: &environment,
-                                        allowed_tools: &tools,
+                                        environment,
+                                        allowed_tools: tools,
                                         cancellation,
                                         events: &mut |event| {
                                             if let mews_acp::AcpStreamEvent::SessionBound {

@@ -206,15 +206,7 @@ impl RouterClient {
 #[async_trait]
 impl Provider for RouterClient {
     fn continuation_capability(&self, model: &str) -> mews_agent::ContinuationCapability {
-        match model.split_once('/').map(|(provider, _)| provider) {
-            Some(provider @ ("openai" | "openai-codex")) => {
-                mews_agent::ContinuationCapability::ResponseId {
-                    provider: provider.into(),
-                    api: "responses".into(),
-                }
-            }
-            _ => mews_agent::ContinuationCapability::None,
-        }
+        crate::registry::continuation_capability(model)
     }
 
     async fn generate(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {

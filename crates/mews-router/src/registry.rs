@@ -103,18 +103,20 @@ pub(crate) fn test_model() -> ModelInfo {
     }
 }
 
+pub(crate) fn continuation_capability(model: &str) -> mews_agent::ContinuationCapability {
+    match model.split_once('/').map(|(provider, _)| provider) {
+        Some(provider @ "openai") => mews_agent::ContinuationCapability::ResponseId {
+            provider: provider.into(),
+            api: "responses".into(),
+        },
+        _ => mews_agent::ContinuationCapability::None,
+    }
+}
+
 #[async_trait]
 impl Provider for ProviderRegistry {
     fn continuation_capability(&self, model: &str) -> mews_agent::ContinuationCapability {
-        match model.split_once('/').map(|(provider, _)| provider) {
-            Some(provider @ ("openai" | "openai-codex")) => {
-                mews_agent::ContinuationCapability::ResponseId {
-                    provider: provider.into(),
-                    api: "responses".into(),
-                }
-            }
-            _ => mews_agent::ContinuationCapability::None,
-        }
+        continuation_capability(model)
     }
 
     async fn generate(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
@@ -276,6 +278,18 @@ fn test_response(request: ModelRequest) -> ModelResponse {
 mod tests {
     use super::*;
     use crate::ModelMessage;
+
+    #[test]
+    fn codex_uses_canonical_history_instead_of_response_cursors() {
+        assert_eq!(
+            continuation_capability("openai-codex/gpt-test"),
+            mews_agent::ContinuationCapability::None
+        );
+        assert!(matches!(
+            continuation_capability("openai/gpt-test"),
+            mews_agent::ContinuationCapability::ResponseId { .. }
+        ));
+    }
 
     #[tokio::test]
     async fn test_provider_preserves_tool_calls() {

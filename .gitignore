@@ -1,7 +1,7 @@
 .DS_Store
 /target/
 /.mews/
-.archive/
+/.archive/
 *.db
 *.db-shm
 *.db-wal

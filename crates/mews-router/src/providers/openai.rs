@@ -14,6 +14,8 @@ use crate::{
 
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+// The Codex catalog filters models by the requesting client's protocol version.
+const CODEX_CLIENT_VERSION: &str = "0.147.0";
 const MAX_NONSTREAM_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 static CODEX_REFRESH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -69,7 +71,7 @@ pub(crate) async fn generate(
         "store": !codex,
     });
     if let Some(cursor) = request.continuation.as_ref().filter(|cursor| {
-        cursor.provider == provider && cursor.model == model && cursor.api == "responses"
+        !codex && cursor.provider == provider && cursor.model == model && cursor.api == "responses"
     }) {
         body["previous_response_id"] = Value::String(cursor.response_id.clone());
     }
@@ -157,7 +159,7 @@ pub(crate) async fn stream(
         "stream": true,
     });
     if let Some(cursor) = request.continuation.as_ref().filter(|cursor| {
-        cursor.provider == provider && cursor.model == model && cursor.api == "responses"
+        !codex && cursor.provider == provider && cursor.model == model && cursor.api == "responses"
     }) {
         body["previous_response_id"] = Value::String(cursor.response_id.clone());
     }
@@ -410,7 +412,7 @@ pub(crate) async fn models(
             Some(account_id),
         ),
     };
-    let mut request = client.get(url).bearer_auth(token);
+    let mut request = add_codex_client_version(client.get(url).bearer_auth(token), codex);
     if let Some(account_id) = account_id {
         request = request
             .header("chatgpt-account-id", account_id)
@@ -459,6 +461,17 @@ pub(crate) async fn models(
         .collect::<Vec<_>>();
     models.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(models)
+}
+
+fn add_codex_client_version(
+    request: reqwest::RequestBuilder,
+    codex: bool,
+) -> reqwest::RequestBuilder {
+    if codex {
+        request.query(&[("client_version", CODEX_CLIENT_VERSION)])
+    } else {
+        request
+    }
 }
 
 fn openai_agent_model(id: &str) -> bool {
@@ -937,6 +950,18 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_model_catalog_sends_client_version() {
+        let request = add_codex_client_version(
+            reqwest::Client::new().get("https://example.com/models"),
+            true,
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(request.url().query(), Some("client_version=0.147.0"));
+    }
 
     async fn collect_stream(body: String) -> Vec<ProviderResult<ModelStreamEvent>> {
         use futures_util::StreamExt;

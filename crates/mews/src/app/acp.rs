@@ -303,6 +303,7 @@ pub(super) fn finish_acp_turn(
     session: &crate::Session,
     turn: &crate::TurnId,
     harness: &mews_protocol::HarnessDescriptor,
+    model: Option<&str>,
     outcome: Result<mews_acp::AcpSessionOutcome>,
     notify: Option<Arc<tokio::sync::Notify>>,
 ) -> Result<String> {
@@ -325,8 +326,15 @@ pub(super) fn finish_acp_turn(
         }
     };
     eprintln!(
-        "ACP timings: spawn={}ms initialize={}ms continuation={}ms",
-        outcome.timings.spawn_ms, outcome.timings.initialize_ms, outcome.timings.continuation_ms
+        "ACP timings: queue={}ms spawn={}ms initialize={}ms continuation={}ms first_update={:?}ms first_token={:?}ms prompt={}ms total={}ms",
+        outcome.timings.queue_ms,
+        outcome.timings.spawn_ms,
+        outcome.timings.initialize_ms,
+        outcome.timings.continuation_ms,
+        outcome.timings.prompt_to_first_update_ms,
+        outcome.timings.prompt_to_first_token_ms,
+        outcome.timings.prompt_ms,
+        outcome.timings.total_ms,
     );
     if outcome.stop_reason == mews_acp::AcpStopReason::Cancelled {
         store.finish_turn(turn, TurnStatus::Cancelled, None)?;
@@ -347,10 +355,7 @@ pub(super) fn finish_acp_turn(
             turn,
             mews_protocol::AssistantResponse {
                 provider: harness.name.clone(),
-                model: harness
-                    .models
-                    .first()
-                    .map_or_else(|| "default".into(), |model| model.id.clone()),
+                model: acp_response_model(model).into(),
                 api: "acp".into(),
                 response_id: Some(outcome.session_id.clone()),
                 blocks: vec![mews_protocol::AssistantResponseBlock::Text {
@@ -371,4 +376,19 @@ pub(super) fn finish_acp_turn(
         notify.notify_waiters();
     }
     Ok(outcome.answer)
+}
+
+fn acp_response_model(selected_model: Option<&str>) -> &str {
+    selected_model.unwrap_or("default")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::acp_response_model;
+
+    #[test]
+    fn acp_response_model_uses_the_selected_model() {
+        assert_eq!(acp_response_model(Some("gpt-5.6-luna")), "gpt-5.6-luna");
+        assert_eq!(acp_response_model(None), "default");
+    }
 }
