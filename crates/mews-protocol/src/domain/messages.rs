@@ -372,9 +372,69 @@ pub enum SourceKind {
     Host,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnInputValidationError(String);
+
+impl std::fmt::Display for TurnInputValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for TurnInputValidationError {}
+
+/// Applies the same Turn admission limits at every ingress boundary.
+pub fn validate_turn_input(
+    idempotency_key: &str,
+    content: &MessageContent,
+    metadata: &Value,
+    source: &MessageSource,
+) -> Result<(), TurnInputValidationError> {
+    if idempotency_key.is_empty() || idempotency_key.len() > 200 {
+        return Err(TurnInputValidationError(
+            "invalid turn idempotency key".into(),
+        ));
+    }
+    if !matches!(source.kind, SourceKind::Client | SourceKind::Channel)
+        || source.id.is_empty()
+        || source.id.len() > 256
+    {
+        return Err(TurnInputValidationError(
+            "turn source must be a Client or Channel with a valid ID".into(),
+        ));
+    }
+    let metadata_bytes = serde_json::to_vec(metadata)
+        .map_err(|error| TurnInputValidationError(error.to_string()))?;
+    if metadata_bytes.len() > 64 * 1024 {
+        return Err(TurnInputValidationError(
+            "message metadata exceeds 64 KiB".into(),
+        ));
+    }
+    if matches!(content, MessageContent::Text { text } if text.trim().is_empty()) {
+        return Err(TurnInputValidationError(
+            "message text cannot be empty".into(),
+        ));
+    }
+    let entry = SessionEntryPayload::UserMessage {
+        content: content.clone(),
+        metadata: metadata.clone(),
+        source: source.clone(),
+    };
+    let entry_bytes =
+        serde_json::to_vec(&entry).map_err(|error| TurnInputValidationError(error.to_string()))?;
+    if entry_bytes.len() > crate::MAX_SESSION_ITEM_BYTES {
+        return Err(TurnInputValidationError(
+            "session item exceeds the page-safe size limit".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ToolResult;
+    use serde_json::{Value, json};
+
+    use super::*;
 
     #[test]
     fn legacy_tool_results_default_to_definitive() {
@@ -403,5 +463,44 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn turn_input_validation_is_shared_and_page_safe() {
+        let source = MessageSource {
+            kind: SourceKind::Channel,
+            id: "channel-1".into(),
+            channel_origin: None,
+        };
+        validate_turn_input(
+            "key-1",
+            &MessageContent::Text {
+                text: "hello".into(),
+            },
+            &json!({"source":"test"}),
+            &source,
+        )
+        .unwrap();
+
+        assert!(
+            validate_turn_input(
+                "key-2",
+                &MessageContent::Text { text: " ".into() },
+                &Value::Null,
+                &source,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_turn_input(
+                "key-3",
+                &MessageContent::Text {
+                    text: "x".repeat(crate::MAX_SESSION_ITEM_BYTES),
+                },
+                &Value::Null,
+                &source,
+            )
+            .is_err()
+        );
     }
 }

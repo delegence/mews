@@ -635,6 +635,97 @@ fn assistant_response_and_delivery_event_roll_back_together() {
 }
 
 #[test]
+fn assistant_response_and_accepted_tool_calls_commit_as_one_replayable_batch() {
+    let (mut store, installation) = initialized();
+    let (agent, _) = store
+        .create_agent(
+            &CommandContext::system(),
+            "assistant-tool-batch",
+            "Soul",
+            CONFIG,
+            &installation.hub_host_id,
+        )
+        .unwrap();
+    let session = store
+        .create_session(
+            &agent.id,
+            &installation.hub_host_id,
+            std::path::Path::new("/tmp"),
+        )
+        .unwrap();
+    let turn = store.start_turn(&session.id).unwrap();
+    let response = AssistantResponse {
+        provider: "test".into(),
+        model: "test".into(),
+        api: "test".into(),
+        response_id: None,
+        blocks: vec![mews_protocol::AssistantResponseBlock::ToolCall {
+            call_id: "call-1".into(),
+            tool: "read".into(),
+            arguments: json!({"path": "note.txt"}),
+            thought_signature: None,
+        }],
+        usage: None,
+        stop_reason: Some("tool_use".into()),
+    };
+    let call = ToolCall {
+        call_id: "call-1".into(),
+        tool: "read".into(),
+        arguments: json!({"path": "note.txt"}),
+        thought_signature: None,
+    };
+
+    store
+        .append_assistant_response_with_tool_calls(
+            &session.id,
+            &turn.id,
+            response.clone(),
+            vec![call.clone()],
+        )
+        .unwrap();
+
+    let entries = store.session_entries(&session.id).unwrap();
+    assert!(matches!(
+        &entries[0].payload,
+        SessionEntryPayload::AssistantResponse { response: stored, .. } if stored == &response
+    ));
+    assert!(matches!(
+        &entries[1].payload,
+        SessionEntryPayload::ToolStarted { call: stored, .. } if stored == &call
+    ));
+
+    let second_turn_session = store
+        .create_session(
+            &agent.id,
+            &installation.hub_host_id,
+            std::path::Path::new("/tmp"),
+        )
+        .unwrap();
+    let second_turn = store.start_turn(&second_turn_session.id).unwrap();
+    let oversized = ToolCall {
+        call_id: "too-large".into(),
+        tool: "read".into(),
+        arguments: json!({"value": "x".repeat(mews_protocol::MAX_SESSION_ITEM_BYTES)}),
+        thought_signature: None,
+    };
+    let error = store
+        .append_assistant_response_with_tool_calls(
+            &second_turn_session.id,
+            &second_turn.id,
+            response,
+            vec![oversized],
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("page-safe size limit"));
+    assert!(
+        store
+            .session_entries(&second_turn_session.id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn large_client_events_are_paged_below_the_hub_frame_limit() {
     let (mut store, installation) = initialized();
     let (agent, _) = store
@@ -2392,6 +2483,7 @@ fn acp_session_binding_is_one_to_one_and_replacement_is_explicit() {
     let context = AcpContextSnapshot {
         version: ACP_CONTEXT_VERSION,
         agent_slug: "acp-binding".into(),
+        system_instructions: "System".into(),
         soul: "Soul".into(),
         skills: Vec::new(),
     };
@@ -2486,6 +2578,7 @@ fn acp_binding_and_context_acknowledgement_bundles_are_idempotent() {
     let context = AcpContextSnapshot {
         version: ACP_CONTEXT_VERSION,
         agent_slug: "acp-bundle".into(),
+        system_instructions: "System".into(),
         soul: "Soul".into(),
         skills: Vec::new(),
     };
@@ -2594,6 +2687,111 @@ fn acp_observation_and_transient_signal_roll_back_together() {
         )
         .unwrap_err();
     assert!(error.to_string().contains("event page limit"));
+    assert!(store.session_entries(&session.id).unwrap().is_empty());
+}
+
+#[test]
+fn harness_observation_batches_are_atomic() {
+    let (mut store, installation) = initialized();
+    let (agent, _) = store
+        .create_agent(
+            &CommandContext::system(),
+            "observation-batch",
+            "Soul",
+            CONFIG,
+            &installation.hub_host_id,
+        )
+        .unwrap();
+    let session = store
+        .create_session(
+            &agent.id,
+            &installation.hub_host_id,
+            std::path::Path::new("/tmp"),
+        )
+        .unwrap();
+    let turn = store.start_turn(&session.id).unwrap();
+
+    let error = store
+        .append_harness_observations(
+            &session.id,
+            &turn.id,
+            vec![
+                HarnessObservationInput {
+                    harness_session_id: None,
+                    kind: "first".into(),
+                    data: json!({"ok": true}),
+                    idempotency_key: Some("batch:first".into()),
+                },
+                HarnessObservationInput {
+                    harness_session_id: None,
+                    kind: "oversized".into(),
+                    data: json!({"text": "x".repeat(mews_protocol::MAX_SESSION_ITEM_BYTES)}),
+                    idempotency_key: Some("batch:oversized".into()),
+                },
+            ],
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("page-safe size limit"));
+    assert!(
+        store
+            .session_entries(&session.id)
+            .unwrap()
+            .iter()
+            .all(|entry| !matches!(
+                entry.payload,
+                mews_protocol::SessionEntryPayload::HarnessObservation { .. }
+            ))
+    );
+}
+
+#[test]
+fn duplicate_harness_observation_keys_reject_the_complete_batch() {
+    let (mut store, installation) = initialized();
+    let (agent, _) = store
+        .create_agent(
+            &CommandContext::system(),
+            "duplicate-observation-key",
+            "Soul",
+            CONFIG,
+            &installation.hub_host_id,
+        )
+        .unwrap();
+    let session = store
+        .create_session(
+            &agent.id,
+            &installation.hub_host_id,
+            std::path::Path::new("/tmp"),
+        )
+        .unwrap();
+    let turn = store.start_turn(&session.id).unwrap();
+
+    let error = store
+        .append_harness_observations(
+            &session.id,
+            &turn.id,
+            vec![
+                HarnessObservationInput {
+                    harness_session_id: None,
+                    kind: "manifest".into(),
+                    data: json!({"chunks": 1}),
+                    idempotency_key: Some("prepared:request".into()),
+                },
+                HarnessObservationInput {
+                    harness_session_id: None,
+                    kind: "chunk".into(),
+                    data: json!({"index": 0}),
+                    idempotency_key: Some("prepared:request".into()),
+                },
+            ],
+        )
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("duplicate Harness observation key")
+    );
     assert!(store.session_entries(&session.id).unwrap().is_empty());
 }
 

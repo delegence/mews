@@ -255,6 +255,7 @@ pub(super) async fn persist_remote_acp_binding(
     let snapshot = mews_protocol::AcpContextSnapshot {
         version: context.version,
         agent_slug: String::new(),
+        system_instructions: String::new(),
         soul: String::new(),
         skills: Vec::new(),
     };

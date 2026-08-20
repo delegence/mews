@@ -283,7 +283,11 @@ async fn handle(
         return handle_anthropic_login(stream).await;
     }
     if let RouterRequest::GenerateStream(request) = request {
-        let mut events = match registry.stream(request).await {
+        let started = tokio::select! {
+            result = registry.stream(request) => result,
+            _ = stream.read_u8() => return Ok(()),
+        };
+        let mut events = match started {
             Ok(events) => events,
             Err(error) => {
                 write_frame(&mut stream, &RouterResponse::StreamEvent(Err(error))).await?;
@@ -291,16 +295,22 @@ async fn handle(
                 return Ok(());
             }
         };
-        while let Some(event) = events.next().await {
+        loop {
+            let event = tokio::select! {
+                event = events.next() => event,
+                _ = stream.read_u8() => return Ok(()),
+            };
+            let Some(event) = event else { break };
             write_frame(&mut stream, &RouterResponse::StreamEvent(event)).await?;
         }
         write_frame(&mut stream, &RouterResponse::StreamEnd).await?;
         return Ok(());
     }
     let response = match request {
-        RouterRequest::Generate(request) => {
-            RouterResponse::Generated(registry.generate(request).await)
-        }
+        RouterRequest::Generate(request) => RouterResponse::Generated(tokio::select! {
+            result = registry.generate(request) => result,
+            _ = stream.read_u8() => return Ok(()),
+        }),
         RouterRequest::GenerateStream(_) => unreachable!(),
         RouterRequest::Providers => RouterResponse::Providers(crate::implemented_providers()),
         RouterRequest::Models => RouterResponse::Models(load_models_locked(&registry).await),
@@ -572,6 +582,86 @@ impl Drop for SocketCleanup {
 mod tests {
     use super::*;
 
+    async fn test_router(
+        upstream: std::net::SocketAddr,
+    ) -> (
+        tempfile::TempDir,
+        RouterClient,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        crate::AuthStore::initialize(root.path()).unwrap();
+        crate::AuthStore::set(
+            root.path(),
+            "openai",
+            &AuthCredential::ApiKey {
+                key: "secret".into(),
+                base_url: Some(format!("http://{upstream}")),
+            },
+        )
+        .unwrap();
+        std::fs::write(root.path().join("models.json"), b"{\"providers\":{}}").unwrap();
+        let service = tokio::spawn(serve(root.path().to_path_buf()));
+        let client = RouterClient::new(root.path());
+        for _ in 0..100 {
+            if client.ready().await {
+                return (root, client, service);
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("router did not become ready");
+    }
+
+    fn openai_request() -> ModelRequest {
+        ModelRequest {
+            model: "openai/test".into(),
+            reasoning: None,
+            system: String::new(),
+            messages: vec![],
+            tools: vec![],
+            continuation: None,
+        }
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) {
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 2048];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert_ne!(read, 0, "HTTP client closed before request completed");
+            request.extend_from_slice(&chunk[..read]);
+            let Some(headers_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers_end = headers_end + 4;
+            let headers = String::from_utf8_lossy(&request[..headers_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            if request.len() >= headers_end + content_length {
+                return;
+            }
+        }
+    }
+
+    fn assert_connection_closed(result: std::io::Result<usize>) {
+        match result {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                ) => {}
+            result => panic!("upstream connection remained open: {result:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn client_calls_router_over_unix_socket() {
         let root = tempfile::tempdir().unwrap();
@@ -649,6 +739,110 @@ mod tests {
                 .any(|status| status.provider == "openai")
         );
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn stream_disconnect_before_first_token_drops_upstream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (started, upstream_started) = tokio::sync::oneshot::channel();
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_request(&mut stream).await;
+            let _ = started.send(());
+            let mut byte = [0_u8; 1];
+            stream.read(&mut byte).await
+        });
+        let (_root, client, router) = test_router(address).await;
+        let events = client.stream(openai_request()).await.unwrap();
+        upstream_started.await.unwrap();
+
+        drop(events);
+
+        assert_connection_closed(
+            tokio::time::timeout(std::time::Duration::from_secs(1), upstream)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        router.abort();
+    }
+
+    #[tokio::test]
+    async fn stream_disconnect_between_events_drops_upstream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_request(&mut stream).await;
+            stream
+                .write_all(
+                    concat!(
+                        "HTTP/1.1 200 OK\r\n",
+                        "Content-Type: text/event-stream\r\n",
+                        "Connection: close\r\n\r\n",
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"one\"}\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut byte = [0_u8; 1];
+            stream.read(&mut byte).await
+        });
+        let (_root, client, router) = test_router(address).await;
+        let mut events = client.stream(openai_request()).await.unwrap();
+        loop {
+            if matches!(
+                events.next().await,
+                Some(Ok(ModelStreamEvent::TextDelta(text))) if text == "one"
+            ) {
+                break;
+            }
+        }
+
+        drop(events);
+
+        assert_connection_closed(
+            tokio::time::timeout(std::time::Duration::from_secs(1), upstream)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        router.abort();
+    }
+
+    #[tokio::test]
+    async fn generate_disconnect_drops_upstream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (started, upstream_started) = tokio::sync::oneshot::channel();
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let _ = started.send(());
+            let mut byte = [0_u8; 1];
+            stream.read(&mut byte).await
+        });
+        let (_root, client, router) = test_router(address).await;
+        let request = tokio::spawn(async move { client.generate(openai_request()).await });
+        upstream_started.await.unwrap();
+
+        request.abort();
+
+        assert_connection_closed(
+            tokio::time::timeout(std::time::Duration::from_secs(1), upstream)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        router.abort();
     }
 
     #[test]

@@ -39,6 +39,16 @@ pub struct ToolDefinition {
     pub agent_id: Option<AgentId>,
 }
 
+/// One immutable generation of a Host's tool catalog.
+///
+/// Calls selected from this catalog carry `generation` back to the Host so a
+/// hot reload can never pair an old model-visible schema with a new executor.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ToolCatalogSnapshot {
+    pub generation: u64,
+    pub tools: Vec<ToolDefinition>,
+}
+
 /// The wire-level protocol used by a Host Harness. Agent configuration keeps
 /// the logical Harness name; Hosts keep the executable details private.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,7 +128,7 @@ pub struct HarnessDescriptor {
     pub native_tools: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modes: Vec<String>,
-    pub supports_mcp: bool,
+    pub supports_http_mcp: bool,
     pub supports_continuation: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<HarnessModelCapability>,

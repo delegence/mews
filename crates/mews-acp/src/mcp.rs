@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use mews_agent::{
     AgentCapabilities, CancellationToken, LifecycleHook, ProgressReporter, ToolCall, ToolCatalog,
-    ToolDefinition, ToolResult, UNCERTAIN_EFFECT_INSTRUCTION, effect_uncertainty,
+    ToolDefinition, ToolResult, UNCERTAIN_EFFECT_INSTRUCTION, effect_uncertainty, tool_allowed,
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -154,8 +154,10 @@ impl<'a> TurnMcpBridge<'a> {
         allowed_tools: &[String],
         skills: Vec<AcpSkill>,
     ) -> Result<Self> {
-        let mut definitions = environment
-            .extension_tools(agent_id)
+        let snapshot = environment.extension_tools(agent_id);
+        let generation = snapshot.generation;
+        let mut definitions = snapshot
+            .tools
             .into_iter()
             // Defense in depth: native MEWS tools cannot be exposed over MCP
             // even if a Host implementation incorrectly includes one here.
@@ -170,29 +172,36 @@ impl<'a> TurnMcpBridge<'a> {
             .into_iter()
             .map(|skill| (skill.name.clone(), skill))
             .collect::<BTreeMap<_, _>>();
-        for (name, description, schema) in [
-            (
-                "mews_list_skills",
-                "List selected-agent skill metadata.",
-                json!({"type":"object","additionalProperties":false}),
-            ),
-            (
-                "mews_read_skill",
-                "Read one selected-agent SKILL.md snapshot.",
-                json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}),
-            ),
-        ] {
-            if definitions.iter().any(|tool| tool.name == name) {
-                anyhow::bail!("Host extension conflicts with reserved MCP tool {name:?}");
-            }
-            definitions.push(ToolDefinition {
-                name: name.into(),
-                description: description.into(),
-                schema,
-                agent_id: None,
-            });
+        if definitions
+            .iter()
+            .any(|tool| mews_protocol::is_reserved_acp_skill_tool(&tool.name))
+        {
+            anyhow::bail!("Host extension conflicts with a reserved MCP skill tool");
         }
-        let catalog = ToolCatalog::compile(definitions.clone())?;
+        if !skills.is_empty() {
+            for ((name, description), schema) in mews_protocol::ACP_SKILL_TOOL_NAMES
+                .into_iter()
+                .zip([
+                    "List selected-agent skill metadata.",
+                    "Read one selected-agent SKILL.md snapshot.",
+                ])
+                .zip([
+                    json!({"type":"object","additionalProperties":false}),
+                    json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}),
+                ])
+            {
+                definitions.push(ToolDefinition {
+                    name: name.into(),
+                    description: description.into(),
+                    schema,
+                    agent_id: None,
+                });
+            }
+        }
+        let catalog = ToolCatalog::compile(mews_protocol::ToolCatalogSnapshot {
+            generation,
+            tools: definitions.clone(),
+        })?;
         let tools = definitions
             .into_iter()
             .map(|tool| (tool.name.clone(), tool))
@@ -237,7 +246,7 @@ impl<'a> TurnMcpBridge<'a> {
             || self
                 .tools
                 .keys()
-                .any(|name| name != "mews_list_skills" && name != "mews_read_skill")
+                .any(|name| !mews_protocol::is_reserved_acp_skill_tool(name))
     }
 
     pub fn drain_hook_outcomes(&self) -> Vec<McpHookOutcome> {
@@ -456,12 +465,17 @@ impl<'a> TurnMcpBridge<'a> {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| Value::Object(Default::default()));
-        let mut call = ToolCall {
+        let call = ToolCall {
             id: format!("mcp-{}", self.next_call_id.fetch_add(1, Ordering::Relaxed)),
             name: name.to_owned(),
             arguments,
             thought_signature: None,
+            catalog_generation: self.catalog.generation(),
         };
+        if let Err(error) = self.catalog.validate(&call) {
+            self.record_hook("before_tool", false, Some(error.to_string()), Some(&call));
+            return Ok(tool_result(ToolResult::error(error)));
+        }
         let before = self
             .environment
             .hook(
@@ -470,6 +484,7 @@ impl<'a> TurnMcpBridge<'a> {
                 self.hook_payload(&call, Value::Null),
                 &self.cwd,
                 &self.cancellation,
+                Some(call.catalog_generation),
             )
             .await;
         let before = match before {
@@ -482,30 +497,18 @@ impl<'a> TurnMcpBridge<'a> {
                 ))));
             }
         };
-        let before = match parse_before_tool(before) {
+        let before = match mews_agent::before_tool_decision(&call, before) {
             Ok(before) => before,
             Err(detail) => {
-                self.record_hook("before_tool", false, Some(detail.clone()), Some(&call));
+                self.record_hook("before_tool", false, Some(detail.to_string()), Some(&call));
                 return Ok(tool_result(ToolResult::error(format!(
                     "invalid before_tool hook response: {detail}"
                 ))));
             }
         };
-        if let Some(reason) = before.block {
-            self.record_hook("before_tool", false, Some(reason.to_owned()), Some(&call));
-            return Ok(tool_result(ToolResult::error(format!(
-                "before_tool hook blocked MCP call: {reason}"
-            ))));
-        }
-        if let Some(tool) = before.name {
-            call.name = tool;
-        }
-        if let Some(arguments) = before.arguments {
-            call.arguments = arguments;
-        }
-        if let Err(error) = self.catalog.validate(&call) {
-            self.record_hook("before_tool", false, Some(error.to_string()), Some(&call));
-            return Ok(tool_result(ToolResult::error(error)));
+        if let mews_agent::ToolDecision::Block(reason) = before {
+            self.record_hook("before_tool", false, Some(reason.clone()), Some(&call));
+            return Ok(tool_result(ToolResult::error(reason)));
         }
         self.record_hook("before_tool", true, None, Some(&call));
         let mut result = if call.name == "mews_list_skills" {
@@ -564,6 +567,7 @@ impl<'a> TurnMcpBridge<'a> {
                 ),
                 &self.cwd,
                 &self.cancellation,
+                Some(call.catalog_generation),
             )
             .await
         {
@@ -592,12 +596,6 @@ impl<'a> TurnMcpBridge<'a> {
     }
 }
 
-struct BeforeTool {
-    block: Option<String>,
-    name: Option<String>,
-    arguments: Option<Value>,
-}
-
 fn hook_object(
     value: Value,
 ) -> std::result::Result<Option<serde_json::Map<String, Value>>, String> {
@@ -606,35 +604,6 @@ fn hook_object(
         Value::Object(object) => Ok(Some(object)),
         _ => Err("hook response must be an object or null".into()),
     }
-}
-
-fn optional_string(
-    object: &serde_json::Map<String, Value>,
-    key: &str,
-) -> std::result::Result<Option<String>, String> {
-    object.get(key).map_or(Ok(None), |value| {
-        value
-            .as_str()
-            .map(str::to_owned)
-            .map(Some)
-            .ok_or_else(|| format!("{key} must be a string"))
-    })
-}
-
-fn parse_before_tool(value: Value) -> std::result::Result<BeforeTool, String> {
-    let Some(object) = hook_object(value)? else {
-        return Ok(BeforeTool {
-            block: None,
-            name: None,
-            arguments: None,
-        });
-    };
-    let name = optional_string(&object, "name")?.or(optional_string(&object, "tool")?);
-    Ok(BeforeTool {
-        block: optional_string(&object, "block")?,
-        name,
-        arguments: object.get("arguments").cloned(),
-    })
 }
 
 struct AfterTool {
@@ -661,14 +630,6 @@ fn parse_after_tool(value: Value) -> std::result::Result<AfterTool, String> {
         result: object.get("result").cloned(),
         is_error,
     })
-}
-
-fn tool_allowed(pattern: &str, name: &str) -> bool {
-    pattern == "*"
-        || pattern == name
-        || pattern
-            .strip_suffix('*')
-            .is_some_and(|prefix| name.starts_with(prefix))
 }
 
 /// A minimal Streamable HTTP MCP transport. It deliberately supports only
@@ -1088,19 +1049,25 @@ mod tests {
         async fn context(&self, _: &str, _: &Path) -> Result<ContextSnapshot> {
             Ok(ContextSnapshot::default())
         }
-        fn tools(&self) -> Vec<ToolDefinition> {
-            Vec::new()
+        fn tools(&self) -> mews_protocol::ToolCatalogSnapshot {
+            mews_protocol::ToolCatalogSnapshot::default()
         }
-        fn extension_tools(&self, _: &mews_protocol::AgentId) -> Vec<ToolDefinition> {
-            ["issue_lookup", "deploy_preview", "read"]
-                .into_iter()
-                .map(|name| ToolDefinition {
-                    name: name.into(),
-                    description: format!("{name} description"),
-                    schema: json!({"type":"object"}),
-                    agent_id: None,
-                })
-                .collect()
+        fn extension_tools(
+            &self,
+            _: &mews_protocol::AgentId,
+        ) -> mews_protocol::ToolCatalogSnapshot {
+            mews_protocol::ToolCatalogSnapshot {
+                generation: 1,
+                tools: ["issue_lookup", "deploy_preview", "read"]
+                    .into_iter()
+                    .map(|name| ToolDefinition {
+                        name: name.into(),
+                        description: format!("{name} description"),
+                        schema: json!({"type":"object"}),
+                        agent_id: None,
+                    })
+                    .collect(),
+            }
         }
         async fn execute(
             &self,
@@ -1127,6 +1094,7 @@ mod tests {
             _: Value,
             _: &Path,
             _: &CancellationToken,
+            _: Option<u64>,
         ) -> Result<Value> {
             Ok(Value::Null)
         }
@@ -1381,21 +1349,27 @@ mod tests {
             async fn context(&self, _: &str, _: &Path) -> Result<ContextSnapshot> {
                 Ok(ContextSnapshot::default())
             }
-            fn tools(&self) -> Vec<ToolDefinition> {
-                Vec::new()
+            fn tools(&self) -> mews_protocol::ToolCatalogSnapshot {
+                mews_protocol::ToolCatalogSnapshot::default()
             }
-            fn extension_tools(&self, _: &mews_protocol::AgentId) -> Vec<ToolDefinition> {
-                vec![ToolDefinition {
-                    name: "lookup".into(),
-                    description: "Lookup".into(),
-                    agent_id: None,
-                    schema: json!({
-                        "type":"object",
-                        "properties":{"id":{"type":"string"}},
-                        "required":["id"],
-                        "additionalProperties":false
-                    }),
-                }]
+            fn extension_tools(
+                &self,
+                _: &mews_protocol::AgentId,
+            ) -> mews_protocol::ToolCatalogSnapshot {
+                mews_protocol::ToolCatalogSnapshot {
+                    generation: 1,
+                    tools: vec![ToolDefinition {
+                        name: "lookup".into(),
+                        description: "Lookup".into(),
+                        agent_id: None,
+                        schema: json!({
+                            "type":"object",
+                            "properties":{"id":{"type":"string"}},
+                            "required":["id"],
+                            "additionalProperties":false
+                        }),
+                    }],
+                }
             }
             async fn execute(
                 &self,
@@ -1414,8 +1388,9 @@ mod tests {
                 _: Value,
                 _: &Path,
                 _: &CancellationToken,
+                _: Option<u64>,
             ) -> Result<Value> {
-                Ok(Value::Null)
+                panic!("invalid arguments must not launch a hook")
             }
         }
         let bridge = TurnMcpBridge::for_extensions(
@@ -1434,6 +1409,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response["result"]["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn before_tool_identity_rewrite_is_a_call_error() {
+        struct RewriteCapabilities;
+        #[async_trait]
+        impl AgentCapabilities for RewriteCapabilities {
+            async fn context(&self, _: &str, _: &Path) -> Result<ContextSnapshot> {
+                Ok(ContextSnapshot::default())
+            }
+            fn tools(&self) -> mews_protocol::ToolCatalogSnapshot {
+                mews_protocol::ToolCatalogSnapshot::default()
+            }
+            fn extension_tools(
+                &self,
+                _: &mews_protocol::AgentId,
+            ) -> mews_protocol::ToolCatalogSnapshot {
+                mews_protocol::ToolCatalogSnapshot {
+                    generation: 1,
+                    tools: vec![ToolDefinition {
+                        name: "lookup".into(),
+                        description: "Lookup".into(),
+                        agent_id: None,
+                        schema: json!({"type":"object"}),
+                    }],
+                }
+            }
+            async fn execute(
+                &self,
+                _: &mews_protocol::AgentId,
+                _: &ToolCall,
+                _: &Path,
+                _: &CancellationToken,
+                _: &dyn ProgressReporter,
+            ) -> Result<ToolResult> {
+                panic!("rewritten call must not execute")
+            }
+            async fn hook(
+                &self,
+                _: &mews_protocol::AgentId,
+                hook: LifecycleHook,
+                _: Value,
+                _: &Path,
+                _: &CancellationToken,
+                _: Option<u64>,
+            ) -> Result<Value> {
+                assert_eq!(hook, LifecycleHook::BeforeTool);
+                Ok(json!({"name":"lookup","tool":"other","arguments":{}}))
+            }
+        }
+        let bridge = TurnMcpBridge::for_extensions(
+            &RewriteCapabilities,
+            PathBuf::from("/tmp"),
+            CancellationToken::new(),
+            &["lookup".into()],
+        )
+        .unwrap();
+
+        let response = bridge
+            .handle(json!({
+                "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                "params":{"name":"lookup", "arguments":{}}
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(response["result"]["isError"], true);
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("may not change its tool name")
+        );
     }
 
     #[tokio::test]
@@ -1505,7 +1553,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_skills_need_no_transport_but_remain_listable_with_extensions() {
+    async fn skill_tools_exist_only_for_a_nonempty_skill_snapshot() {
         let capabilities = Capabilities {
             calls: Mutex::new(Vec::new()),
             delay: std::time::Duration::ZERO,
@@ -1520,6 +1568,11 @@ mod tests {
         )
         .unwrap();
         assert!(!empty.needs_transport());
+        let listed = empty
+            .handle(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+            .await
+            .unwrap();
+        assert_eq!(listed["result"]["tools"], json!([]));
 
         let with_extension = TurnMcpBridge::for_extensions_and_skills(
             &capabilities,
@@ -1532,10 +1585,89 @@ mod tests {
         .unwrap();
         assert!(with_extension.needs_transport());
         let listed = with_extension
-            .handle(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mews_list_skills","arguments":{}}}))
+            .handle(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
             .await
             .unwrap();
-        assert_eq!(listed["result"]["content"][0]["text"], "[]");
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["result"]["tools"][0]["name"], "issue_lookup");
+    }
+
+    #[test]
+    fn reserved_skill_tool_collisions_are_rejected_for_all_skill_snapshots() {
+        struct ReservedCapabilities(&'static str);
+
+        #[async_trait]
+        impl AgentCapabilities for ReservedCapabilities {
+            async fn context(&self, _: &str, _: &Path) -> Result<ContextSnapshot> {
+                unreachable!()
+            }
+
+            fn tools(&self) -> mews_protocol::ToolCatalogSnapshot {
+                mews_protocol::ToolCatalogSnapshot::default()
+            }
+
+            fn extension_tools(
+                &self,
+                _: &mews_protocol::AgentId,
+            ) -> mews_protocol::ToolCatalogSnapshot {
+                mews_protocol::ToolCatalogSnapshot {
+                    generation: 1,
+                    tools: vec![ToolDefinition {
+                        name: self.0.into(),
+                        description: "Reserved collision".into(),
+                        schema: json!({"type":"object"}),
+                        agent_id: None,
+                    }],
+                }
+            }
+
+            async fn execute(
+                &self,
+                _: &mews_protocol::AgentId,
+                _: &ToolCall,
+                _: &Path,
+                _: &CancellationToken,
+                _: &dyn ProgressReporter,
+            ) -> Result<ToolResult> {
+                unreachable!()
+            }
+
+            async fn hook(
+                &self,
+                _: &mews_protocol::AgentId,
+                _: LifecycleHook,
+                _: Value,
+                _: &Path,
+                _: &CancellationToken,
+                _: Option<u64>,
+            ) -> Result<Value> {
+                unreachable!()
+            }
+        }
+
+        for name in mews_protocol::ACP_SKILL_TOOL_NAMES {
+            for skills in [
+                Vec::new(),
+                vec![AcpSkill {
+                    name: "review".into(),
+                    description: "Review code".into(),
+                    hash: "a".repeat(64),
+                    content: "body".into(),
+                }],
+            ] {
+                let error = TurnMcpBridge::for_extensions_and_skills(
+                    &ReservedCapabilities(name),
+                    &mews_protocol::AgentId::new(),
+                    PathBuf::from("/tmp"),
+                    CancellationToken::new(),
+                    &["*".into()],
+                    skills,
+                )
+                .err()
+                .expect("reserved collision must fail");
+                assert!(error.to_string().contains("reserved MCP skill tool"));
+            }
+        }
     }
 
     #[tokio::test]

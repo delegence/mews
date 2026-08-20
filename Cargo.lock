@@ -1265,7 +1265,6 @@ dependencies = [
  "mews-transport",
  "mews-tui",
  "rand_core 0.6.4",
- "regex",
  "reqwest",
  "rpassword",
  "rusqlite",
@@ -1305,6 +1304,7 @@ dependencies = [
  "futures-util",
  "jsonschema",
  "mews-protocol",
+ "mews-store",
  "serde",
  "serde_json",
  "thiserror",
@@ -1323,6 +1323,7 @@ dependencies = [
  "mews-protocol",
  "rusqlite",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
 ]
@@ -1456,6 +1457,7 @@ name = "mews-transport"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64",
  "chrono",
  "ed25519-dalek",

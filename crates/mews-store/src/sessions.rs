@@ -7,6 +7,14 @@ pub enum EffectOutcome {
     Uncertain(String),
 }
 
+/// One non-contextual Harness observation to append as part of an atomic batch.
+pub struct HarnessObservationInput {
+    pub harness_session_id: Option<String>,
+    pub kind: String,
+    pub data: Value,
+    pub idempotency_key: Option<String>,
+}
+
 impl Store {
     pub fn schedule_effect(
         &self,
@@ -72,7 +80,7 @@ impl Store {
         metadata: &Value,
         source: &MessageSource,
     ) -> Result<Option<(Turn, Message)>, StoreError> {
-        validate_turn_key(key)?;
+        validate_turn_input(key, request_content, metadata, source)?;
         let command_id = turn_command_id(session_id, key);
         let Some(receipt) = self.command_receipt(&command_id)? else {
             return Ok(None);
@@ -94,10 +102,8 @@ impl Store {
         metadata: Value,
         source: MessageSource,
     ) -> Result<(Turn, Message, bool), StoreError> {
-        validate_turn_key(key)?;
-        validate_message_input(&request_content, &metadata)?;
-        validate_message_input(&resolved_content, &metadata)?;
-        validate_turn_source(&source)?;
+        validate_turn_input(key, &request_content, &metadata, &source)?;
+        validate_turn_input(key, &resolved_content, &metadata, &source)?;
         // Reserve the write slot before reading state so the accepted Turn uses
         // one authoritative Session/Agent snapshot.
         let transaction = rusqlite::Transaction::new_unchecked(
@@ -512,21 +518,34 @@ impl Store {
         turn_id: &TurnId,
         response: AssistantResponse,
     ) -> Result<SessionEntry, StoreError> {
+        self.append_assistant_response_with_tool_calls(session_id, turn_id, response, Vec::new())
+    }
+
+    /// Records one model response and all tool calls accepted from it as one
+    /// durable context transition.
+    pub fn append_assistant_response_with_tool_calls(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        response: AssistantResponse,
+        calls: Vec<ToolCall>,
+    ) -> Result<SessionEntry, StoreError> {
         let transaction = rusqlite::Transaction::new_unchecked(
             &self.connection,
             rusqlite::TransactionBehavior::Immediate,
         )?;
         validate_active_turn(&transaction, session_id, turn_id)?;
+        let actor = turn_actor(
+            &transaction,
+            session_id,
+            turn_id,
+            mews_protocol::EventActorKind::Harness,
+        )?;
         let entry_id = MessageId::new();
         let event = record_session_event(
             &transaction,
             session_id,
-            turn_actor(
-                &transaction,
-                session_id,
-                turn_id,
-                mews_protocol::EventActorKind::Harness,
-            )?,
+            actor.clone(),
             mews_protocol::JournalEvent::AssistantResponseRecorded {
                 turn_id: turn_id.clone(),
                 entry_id: entry_id.clone(),
@@ -535,6 +554,19 @@ impl Store {
         )?;
         apply_session_journal_entry(&transaction, &event)?;
         let entry = select_session_entry(&transaction, session_id, &entry_id)?;
+        for call in calls {
+            let event = record_session_event(
+                &transaction,
+                session_id,
+                actor.clone(),
+                mews_protocol::JournalEvent::ToolCallRequested {
+                    turn_id: turn_id.clone(),
+                    entry_id: MessageId::new(),
+                    call,
+                },
+            )?;
+            apply_session_journal_entry(&transaction, &event)?;
+        }
         transaction.commit()?;
         self.prune_client_events()?;
         Ok(entry)
@@ -718,32 +750,69 @@ impl Store {
         data: Value,
         idempotency_key: Option<String>,
     ) -> Result<(), StoreError> {
-        let transaction = self.connection.unchecked_transaction()?;
-        validate_active_turn(&transaction, session_id, turn_id)?;
-        if observation_exists(&transaction, session_id, idempotency_key.as_deref())? {
-            transaction.commit()?;
-            return Ok(());
-        }
-        let entry_id = MessageId::new();
-        let event = record_session_event_correlated(
-            &transaction,
+        self.append_harness_observations(
             session_id,
-            turn_actor(
-                &transaction,
-                session_id,
-                turn_id,
-                mews_protocol::EventActorKind::Harness,
-            )?,
-            mews_protocol::JournalEvent::HarnessObservationRecorded {
-                turn_id: turn_id.clone(),
-                entry_id,
+            turn_id,
+            vec![HarnessObservationInput {
                 harness_session_id,
                 kind: kind.into(),
                 data,
-            },
-            idempotency_key,
+                idempotency_key,
+            }],
+        )
+    }
+
+    /// Appends a complete observation group in one transaction. This is used
+    /// when one logical Harness record must be split into page-safe entries.
+    pub fn append_harness_observations(
+        &self,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        observations: Vec<HarnessObservationInput>,
+    ) -> Result<(), StoreError> {
+        let mut keys = std::collections::HashSet::new();
+        for key in observations
+            .iter()
+            .filter_map(|observation| observation.idempotency_key.as_deref())
+        {
+            if !keys.insert(key) {
+                return Err(StoreError::InvalidData(format!(
+                    "duplicate Harness observation key {key:?}"
+                )));
+            }
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        validate_active_turn(&transaction, session_id, turn_id)?;
+        let actor = turn_actor(
+            &transaction,
+            session_id,
+            turn_id,
+            mews_protocol::EventActorKind::Harness,
         )?;
-        apply_session_journal_entry(&transaction, &event)?;
+        for observation in observations {
+            if observation_exists(
+                &transaction,
+                session_id,
+                observation.idempotency_key.as_deref(),
+            )? {
+                continue;
+            }
+            let entry_id = MessageId::new();
+            let event = record_session_event_correlated(
+                &transaction,
+                session_id,
+                actor.clone(),
+                mews_protocol::JournalEvent::HarnessObservationRecorded {
+                    turn_id: turn_id.clone(),
+                    entry_id,
+                    harness_session_id: observation.harness_session_id,
+                    kind: observation.kind,
+                    data: observation.data,
+                },
+                observation.idempotency_key,
+            )?;
+            apply_session_journal_entry(&transaction, &event)?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -827,7 +896,7 @@ impl Store {
                 "append_message only accepts user messages; use a typed transcript append".into(),
             ));
         }
-        validate_message_input(&content, &metadata)?;
+        validate_appended_message(&content, &metadata, &source)?;
         let transaction = self.connection.unchecked_transaction()?;
         let current_leaf: Option<MessageId> = transaction
             .query_row(
@@ -1068,7 +1137,28 @@ pub(super) fn validate_session_item(payload: &SessionEntryPayload) -> Result<(),
     Ok(())
 }
 
-fn validate_message_input(content: &MessageContent, metadata: &Value) -> Result<(), StoreError> {
+fn validate_turn_input(
+    key: &str,
+    content: &MessageContent,
+    metadata: &Value,
+    source: &MessageSource,
+) -> Result<(), StoreError> {
+    mews_protocol::validate_turn_input(key, content, metadata, source)
+        .map_err(|error| StoreError::InvalidData(error.to_string()))
+}
+
+fn validate_appended_message(
+    content: &MessageContent,
+    metadata: &Value,
+    source: &MessageSource,
+) -> Result<(), StoreError> {
+    // Harness follow-ups are transcript additions inside an admitted Turn.
+    // New Turn admission remains limited to Client and Channel sources above.
+    if source.id.is_empty() || source.id.len() > 256 {
+        return Err(StoreError::InvalidData(
+            "message source must have a valid ID".into(),
+        ));
+    }
     let metadata_bytes =
         serde_json::to_vec(metadata).map_err(|error| StoreError::InvalidData(error.to_string()))?;
     if metadata_bytes.len() > 64 * 1024 {
@@ -1081,28 +1171,11 @@ fn validate_message_input(content: &MessageContent, metadata: &Value) -> Result<
             "message text cannot be empty".into(),
         ));
     }
-    Ok(())
-}
-
-fn validate_turn_key(key: &str) -> Result<(), StoreError> {
-    if key.is_empty() || key.len() > 200 {
-        return Err(StoreError::InvalidData(
-            "invalid turn idempotency key".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_turn_source(source: &MessageSource) -> Result<(), StoreError> {
-    if !matches!(source.kind, SourceKind::Client | SourceKind::Channel)
-        || source.id.is_empty()
-        || source.id.len() > 256
-    {
-        return Err(StoreError::InvalidData(
-            "turn source must be a Client or Channel with a valid ID".into(),
-        ));
-    }
-    Ok(())
+    validate_session_item(&SessionEntryPayload::UserMessage {
+        content: content.clone(),
+        metadata: metadata.clone(),
+        source: source.clone(),
+    })
 }
 
 fn turn_command_id(session_id: &SessionId, key: &str) -> String {

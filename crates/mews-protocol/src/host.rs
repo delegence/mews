@@ -5,10 +5,10 @@ use serde_json::Value;
 
 use crate::{
     Agent, AgentId, AgentRevision, HarnessDescriptor, HostId, HubRequest, HubResponse,
-    InstallationId, RequestId, ToolDefinition,
+    InstallationId, RequestId, ToolCatalogSnapshot,
 };
 
-pub const HOST_PROTOCOL_VERSION: u32 = 2;
+pub const HOST_PROTOCOL_VERSION: u32 = 4;
 pub const MAX_HOST_FRAME_BYTES: usize = 256 * 1024;
 /// Reserved in Host frames for the request envelope, Agent configuration,
 /// tools, and other metadata surrounding project instructions.
@@ -93,14 +93,10 @@ pub enum HubToHost {
         agent_slug: String,
         canonical_cwd: PathBuf,
     },
-    ReadPrompt {
-        request_id: RequestId,
-        name: String,
-        canonical_cwd: PathBuf,
-    },
     ExecuteTool {
         request_id: RequestId,
         agent_id: AgentId,
+        catalog_generation: u64,
         tool: String,
         arguments: Value,
         canonical_cwd: PathBuf,
@@ -114,6 +110,7 @@ pub enum HubToHost {
         hook: String,
         payload: Value,
         canonical_cwd: PathBuf,
+        catalog_generation: Option<u64>,
     },
     /// Execute an external ACP Harness on this Host. The prompt is already
     /// canonicalized by the Hub; launch details remain Host-local.
@@ -127,6 +124,7 @@ pub enum HubToHost {
         recovery_prompt: String,
         agent_id: AgentId,
         agent_slug: String,
+        system_instructions: String,
         soul: String,
         mews_session_id: String,
         turn_id: String,
@@ -246,11 +244,11 @@ pub enum HostToHub {
         error: Option<String>,
     },
     Ready {
-        tools: Vec<ToolDefinition>,
+        tools: ToolCatalogSnapshot,
         harnesses: Vec<HarnessDescriptor>,
     },
     ToolCatalogChanged {
-        tools: Vec<ToolDefinition>,
+        tools: ToolCatalogSnapshot,
     },
     HarnessCatalog {
         request_id: RequestId,
@@ -300,11 +298,6 @@ pub enum HostToHub {
     ProjectContext {
         request_id: RequestId,
         context: Option<String>,
-        error: Option<String>,
-    },
-    Prompt {
-        request_id: RequestId,
-        content: Option<String>,
         error: Option<String>,
     },
     Pong {

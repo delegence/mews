@@ -7,7 +7,6 @@ use tokio::sync::Mutex;
 
 use crate::app::Mews;
 use crate::app::StartedTurn;
-use crate::host::HostExecutor;
 
 use super::HubRuntime;
 
@@ -71,7 +70,6 @@ pub(super) async fn start_turn(
     {
         return Ok(turn);
     }
-    let request_prompt = prompt.clone();
     let session = mews.session(&session_id)?;
     let agent_slug = mews
         .agents()?
@@ -80,16 +78,10 @@ pub(super) async fn start_turn(
         .context("Session Agent no longer exists")?
         .slug;
     let installation = mews.installation()?;
-    let prompt = if session.host_id == installation.hub_host_id {
+    if session.host_id == installation.hub_host_id {
         mews.commands(mews_store::CommandContext::system())
             .synchronize_agent_on(&agent_slug, runtime.local_host.as_ref())
             .await?;
-        Mews::expand_prompt(
-            runtime.local_host.agent_capabilities(),
-            &session.working_directory,
-            &prompt,
-        )
-        .await?
     } else {
         let host = runtime
             .remote_hosts
@@ -101,17 +93,11 @@ pub(super) async fn start_turn(
         mews.commands(mews_store::CommandContext::system())
             .synchronize_agent_on(&agent_slug, host.as_ref())
             .await?;
-        Mews::expand_prompt(
-            host.agent_capabilities(),
-            &session.working_directory,
-            &prompt,
-        )
-        .await?
-    };
+    }
     let (turn, _, created) = mews.accept_turn_idempotent(
         &session_id,
         &idempotency_key,
-        request_prompt,
+        prompt.clone(),
         prompt.clone(),
         metadata.clone(),
         source.clone(),

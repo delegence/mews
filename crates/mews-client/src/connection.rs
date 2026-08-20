@@ -118,12 +118,13 @@ fn retry_safe(request: &HubRequest) -> bool {
         request,
         HubRequest::Status
             | HubRequest::ListAgents
+            | HubRequest::InspectAgent { .. }
             | HubRequest::ListSessions
             | HubRequest::GetSession { .. }
             | HubRequest::GetSessionHistory { .. }
             | HubRequest::GetSessionEntries { .. }
             | HubRequest::GetSessionModelConfig { .. }
-            | HubRequest::ListHosts
+            | HubRequest::ListHosts { .. }
             | HubRequest::ListAuth
             | HubRequest::ListModels
             | HubRequest::GetProviderDefaults

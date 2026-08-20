@@ -19,6 +19,11 @@ pub struct InboundMessage {
     pub metadata: Value,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InboundRejection {
+    InvalidTurnInput { reason: String },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum OutboundEvent {
     CompletedMessage { text: String },
@@ -81,6 +86,15 @@ pub trait ChannelInbound: Send {
 
     async fn acknowledge_inbound(&mut self, _external_id: &str) -> Result<()> {
         Ok(())
+    }
+
+    /// Terminally rejects, dead-letters, or discards an inbound message.
+    async fn reject_inbound(
+        &mut self,
+        external_id: &str,
+        _rejection: InboundRejection,
+    ) -> Result<()> {
+        self.acknowledge_inbound(external_id).await
     }
 }
 

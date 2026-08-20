@@ -34,12 +34,12 @@ pub enum Command {
     },
     /// Create, manage, and chat with agents
     #[command(
-        after_help = "Forms:\n  mews agents list\n  mews agents new [name] [--harness <name>] [--option <key=value>]...\n  mews agents rename <slug> <new-slug>\n  mews agents delete <slug>\n  mews agents <slug>\n  mews agents <slug> -p <message> [--detach]"
+        after_help = "Forms:\n  mews agents list\n  mews agents inspect <slug>\n  mews agents new [name] [--harness <name>] [--option <key=value>]...\n  mews agents rename <slug> <new-slug>\n  mews agents delete <slug>\n  mews agents <slug>\n  mews agents <slug> -p <message> [--detach]"
     )]
     Agents {
         #[arg(
             trailing_var_arg = true,
-            value_name = "new [name] | <slug> [-p <message> [--detach]]"
+            value_name = "inspect <slug> | new [name] | <slug> [-p <message> [--detach]]"
         )]
         args: Vec<String>,
     },

@@ -8,13 +8,18 @@ use mews_agent::{
     AgentCapabilities, AgentEvent, AgentLoopConfig, AgentRuntime, AgentSignal, CancellationToken,
     ContextDocument, ContextSnapshot, LifecycleHook, ModelMessage, ModelRequest, NextStepUpdate,
     ProgressReporter, Provider, ProviderCallOutcome, StepDecision, ToolCall, ToolDecision,
-    ToolDefinition, ToolResult,
+    ToolDefinition, ToolResult, tool_allowed,
 };
-use mews_protocol::{AgentConfig, EffectRequest, OperationId, ReasoningEffort, ToolExecutionMode};
+use mews_protocol::{
+    AgentConfig, EffectRequest, OperationId, ReasoningEffort, ToolCatalogSnapshot,
+    ToolExecutionMode,
+};
 use serde_json::Value;
 
 mod prompt;
 pub use prompt::{canonical_prompt, initial_session_prompt};
+
+pub const SYSTEM_INSTRUCTIONS: &str = "You are an AI agent operating inside MEWS. Follow the agent soul and applicable project instructions. Use available tools when helpful and continue until the user's request is resolved.";
 
 /// Conversation boundary required by the durable runtime. SQLite is only one implementation.
 pub trait ConversationStore {
@@ -23,10 +28,17 @@ pub trait ConversationStore {
     fn history(&self, model: &str) -> Result<Vec<ModelMessage>>;
     fn append(&self, message: ModelMessage) -> Result<()>;
     fn append_response(&self, response: mews_protocol::AssistantResponse) -> Result<()>;
+    fn append_response_with_tool_calls(
+        &self,
+        response: mews_protocol::AssistantResponse,
+        calls: Vec<ToolCall>,
+    ) -> Result<()>;
     fn tool_requested(&self, call: ToolCall) -> Result<()>;
     fn tool_execution_started(&self, call: ToolCall) -> Result<()>;
     fn tool_execution_completed(&self, call: ToolCall, result: ToolResult) -> Result<()>;
     fn tool_result_recorded(&self, call: ToolCall, result: ToolResult) -> Result<()>;
+    /// Records the fully transformed logical request immediately before dispatch.
+    fn model_request_prepared(&self, request: &ModelRequest) -> Result<()>;
     fn continuation(&self, _model: &str) -> Result<Option<mews_agent::ResponseContinuation>> {
         Ok(None)
     }
@@ -242,7 +254,7 @@ struct MewsRuntime<'a, E: AgentCapabilities + ?Sized> {
 
 impl<E: AgentCapabilities + ?Sized> MewsRuntime<'_, E> {
     async fn execute_hook(&self, hook: LifecycleHook, payload: Value) -> Result<Value> {
-        self.execute_hook_with_cancellation(hook, payload, &self.config.cancellation)
+        self.execute_hook_with_cancellation(hook, payload, &self.config.cancellation, None)
             .await
     }
 
@@ -251,6 +263,7 @@ impl<E: AgentCapabilities + ?Sized> MewsRuntime<'_, E> {
         hook: LifecycleHook,
         payload: Value,
         cancellation: &CancellationToken,
+        catalog_generation: Option<u64>,
     ) -> Result<Value> {
         let operation_id = self.store.start_effect(EffectRequest::LifecycleHook {
             hook: lifecycle_hook_name(hook).into(),
@@ -263,6 +276,7 @@ impl<E: AgentCapabilities + ?Sized> MewsRuntime<'_, E> {
                 payload,
                 &self.config.cwd,
                 cancellation,
+                catalog_generation,
             )
             .await;
         let termination = match &outcome {
@@ -310,16 +324,19 @@ impl<E: AgentCapabilities + ?Sized> AgentRuntime for MewsRuntime<'_, E> {
             LifecycleHook::TurnEnd,
             serde_json::json!({}),
             &CancellationToken::new(),
+            None,
         )
         .await?;
         Ok(())
     }
 
     async fn request(&self, tools: Vec<ToolDefinition>) -> Result<ModelRequest> {
-        let mut system = self.config.soul.clone();
+        let mut system = SYSTEM_INSTRUCTIONS.to_owned();
+        system.push_str(&format!("\n\n<soul>\n{}\n</soul>", self.config.soul));
         append_project_context(&mut system, &self.context.documents);
         if !self.context.skills.is_empty() {
             system.push_str("\n\n<available_skills>\n");
+            system.push_str("Read the matching SKILL.md before using a skill.\n");
             for skill in &self.context.skills {
                 system.push_str(&format!(
                     "<skill name={:?} description={:?} path={:?} />\n",
@@ -328,16 +345,10 @@ impl<E: AgentCapabilities + ?Sized> AgentRuntime for MewsRuntime<'_, E> {
             }
             system.push_str("</available_skills>");
         }
-        if !self.context.prompts.is_empty() {
-            system.push_str("\n\n<available_prompts>\n");
-            for prompt in &self.context.prompts {
-                system.push_str(&format!(
-                    "<prompt name={:?} description={:?} path={:?} />\n",
-                    prompt.name, prompt.description, prompt.path
-                ));
-            }
-            system.push_str("</available_prompts>");
-        }
+        system.push_str(&format!(
+            "\n\n<runtime_context>\nCurrent working directory: {:?}\n</runtime_context>",
+            self.config.cwd
+        ));
         Ok(ModelRequest {
             model: self.config.model.clone(),
             reasoning: self.config.reasoning,
@@ -348,26 +359,29 @@ impl<E: AgentCapabilities + ?Sized> AgentRuntime for MewsRuntime<'_, E> {
         })
     }
 
-    async fn tools(&self) -> Result<Vec<ToolDefinition>> {
-        Ok(self
-            .environment
-            .tools()
-            .into_iter()
-            .filter(|tool| {
-                tool.agent_id
-                    .as_ref()
-                    .is_none_or(|owner| owner == &self.config.agent_id)
-                    && self
-                        .config
-                        .allowed_tools
-                        .iter()
-                        .any(|pattern| tool_allowed(pattern, &tool.name))
-            })
-            .map(|mut tool| {
-                tool.agent_id = None;
-                tool
-            })
-            .collect())
+    async fn tools(&self) -> Result<ToolCatalogSnapshot> {
+        let snapshot = self.environment.tools();
+        Ok(ToolCatalogSnapshot {
+            generation: snapshot.generation,
+            tools: snapshot
+                .tools
+                .into_iter()
+                .filter(|tool| {
+                    tool.agent_id
+                        .as_ref()
+                        .is_none_or(|owner| owner == &self.config.agent_id)
+                        && self
+                            .config
+                            .allowed_tools
+                            .iter()
+                            .any(|pattern| tool_allowed(pattern, &tool.name))
+                })
+                .map(|mut tool| {
+                    tool.agent_id = None;
+                    tool
+                })
+                .collect(),
+        })
     }
 
     async fn execute(
@@ -389,8 +403,9 @@ impl<E: AgentCapabilities + ?Sized> AgentRuntime for MewsRuntime<'_, E> {
 
     async fn event(&self, event: AgentEvent) -> Result<()> {
         match event {
-            AgentEvent::AssistantResponse(response) => self.store.append_response(response)?,
-            AgentEvent::ToolCall(call) => self.store.tool_requested(call)?,
+            AgentEvent::AssistantResponse { response, calls } => self
+                .store
+                .append_response_with_tool_calls(response, calls)?,
             AgentEvent::ToolExecutionStarted(call) => self.store.tool_execution_started(call)?,
             AgentEvent::ToolExecutionCompleted { call, result } => {
                 self.store.tool_execution_completed(call, result)?
@@ -408,6 +423,7 @@ impl<E: AgentCapabilities + ?Sized> AgentRuntime for MewsRuntime<'_, E> {
     }
 
     async fn provider_call_started(&self, request: &ModelRequest) -> Result<Option<OperationId>> {
+        self.store.model_request_prepared(request)?;
         let (provider, model) = request
             .model
             .split_once('/')
@@ -443,25 +459,21 @@ impl<E: AgentCapabilities + ?Sized> AgentRuntime for MewsRuntime<'_, E> {
         Ok(())
     }
 
-    async fn before_tool(&self, call: &mut ToolCall) -> Result<ToolDecision> {
+    async fn before_tool(&self, call: &ToolCall) -> Result<ToolDecision> {
         let payload = self
-            .execute_hook(LifecycleHook::BeforeTool, serde_json::to_value(&*call)?)
+            .execute_hook_with_cancellation(
+                LifecycleHook::BeforeTool,
+                serde_json::to_value(call)?,
+                &self.config.cancellation,
+                Some(call.catalog_generation),
+            )
             .await?;
-        if let Some(reason) = payload.get("block").and_then(Value::as_str) {
-            return Ok(ToolDecision::Block(reason.into()));
-        }
-        if let Some(name) = payload.get("name").and_then(Value::as_str) {
-            call.name = name.into();
-        }
-        if let Some(arguments) = payload.get("arguments") {
-            call.arguments = arguments.clone();
-        }
-        Ok(ToolDecision::Allow)
+        mews_agent::before_tool_decision(call, payload).map_err(Into::into)
     }
 
     async fn after_tool(&self, call: &ToolCall, result: &mut ToolResult) -> Result<()> {
         let payload = self
-            .execute_hook(
+            .execute_hook_with_cancellation(
                 LifecycleHook::AfterTool,
                 serde_json::json!({
                     "call": call,
@@ -469,6 +481,8 @@ impl<E: AgentCapabilities + ?Sized> AgentRuntime for MewsRuntime<'_, E> {
                     "is_error": result.is_error,
                     "terminate": result.terminate,
                 }),
+                &self.config.cancellation,
+                Some(call.catalog_generation),
             )
             .await?;
         if let Some(value) = payload.get("result") {
@@ -493,14 +507,6 @@ impl<E: AgentCapabilities + ?Sized> AgentRuntime for MewsRuntime<'_, E> {
     }
 }
 
-fn tool_allowed(pattern: &str, name: &str) -> bool {
-    pattern == "*"
-        || pattern == name
-        || pattern
-            .strip_suffix('*')
-            .is_some_and(|prefix| name.starts_with(prefix))
-}
-
 fn append_project_context(system: &mut String, documents: &[ContextDocument]) {
     for document in documents {
         system.push_str(&format!(
@@ -514,7 +520,7 @@ fn append_project_context(system: &mut String, documents: &[ContextDocument]) {
 mod tests {
     use std::sync::{
         Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     use anyhow::Result;
@@ -527,14 +533,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-
-    #[test]
-    fn tool_allowlist_supports_exact_prefix_and_global_patterns() {
-        assert!(tool_allowed("read", "read"));
-        assert!(tool_allowed("git_*", "git_status"));
-        assert!(tool_allowed("*", "anything"));
-        assert!(!tool_allowed("read", "write"));
-    }
 
     #[test]
     fn project_instructions_have_explicit_file_boundaries() {
@@ -584,6 +582,8 @@ mod tests {
     struct SnapshotEnvironment {
         contexts: AtomicUsize,
         catalogs: AtomicUsize,
+        executions: AtomicUsize,
+        rewrite_before_tool: AtomicBool,
     }
 
     #[async_trait]
@@ -595,27 +595,33 @@ mod tests {
                     path: "AGENTS.md".into(),
                     content: "stable".into(),
                 }],
-                skills: Vec::<ResourceDescriptor>::new(),
-                prompts: Vec::<ResourceDescriptor>::new(),
+                skills: vec![ResourceDescriptor {
+                    name: "review".into(),
+                    description: "Review changes".into(),
+                    path: ".agents/skills/review/SKILL.md".into(),
+                }],
             })
         }
 
-        fn tools(&self) -> Vec<ToolDefinition> {
+        fn tools(&self) -> ToolCatalogSnapshot {
             self.catalogs.fetch_add(1, Ordering::SeqCst);
-            vec![
-                ToolDefinition {
-                    name: "work".into(),
-                    description: "work".into(),
-                    schema: json!({"type":"object"}),
-                    agent_id: None,
-                },
-                ToolDefinition {
-                    name: "foreign".into(),
-                    description: "another Agent's tool".into(),
-                    schema: json!({"type":"object"}),
-                    agent_id: Some(mews_protocol::AgentId::new()),
-                },
-            ]
+            ToolCatalogSnapshot {
+                generation: 1,
+                tools: vec![
+                    ToolDefinition {
+                        name: "work".into(),
+                        description: "work".into(),
+                        schema: json!({"type":"object"}),
+                        agent_id: None,
+                    },
+                    ToolDefinition {
+                        name: "foreign".into(),
+                        description: "another Agent's tool".into(),
+                        schema: json!({"type":"object"}),
+                        agent_id: Some(mews_protocol::AgentId::new()),
+                    },
+                ],
+            }
         }
 
         async fn execute(
@@ -626,18 +632,24 @@ mod tests {
             _: &CancellationToken,
             _: &dyn ProgressReporter,
         ) -> Result<ToolResult> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
             Ok(ToolResult::success(json!({"ok": true})))
         }
 
         async fn hook(
             &self,
             _: &mews_protocol::AgentId,
-            _: LifecycleHook,
-            payload: Value,
+            hook: LifecycleHook,
+            mut payload: Value,
             _: &std::path::Path,
             cancellation: &CancellationToken,
+            _: Option<u64>,
         ) -> Result<Value> {
             cancellation.check()?;
+            if hook == LifecycleHook::BeforeTool && self.rewrite_before_tool.load(Ordering::SeqCst)
+            {
+                payload["arguments"] = json!({"rewritten": true});
+            }
             Ok(payload)
         }
     }
@@ -649,6 +661,7 @@ mod tests {
         signals: Mutex<Vec<AgentSignal>>,
         effects_started: Mutex<Vec<(OperationId, EffectRequest)>>,
         effects_finished: Mutex<Vec<(OperationId, EffectTermination)>>,
+        prepared_requests: Mutex<Vec<ModelRequest>>,
     }
 
     impl ConversationStore for MemoryStore {
@@ -704,6 +717,14 @@ mod tests {
             Ok(())
         }
 
+        fn append_response_with_tool_calls(
+            &self,
+            response: mews_protocol::AssistantResponse,
+            _calls: Vec<ToolCall>,
+        ) -> Result<()> {
+            self.append_response(response)
+        }
+
         fn tool_requested(&self, _call: ToolCall) -> Result<()> {
             Ok(())
         }
@@ -724,6 +745,10 @@ mod tests {
                     uncertain: result.uncertain,
                 },
             });
+            Ok(())
+        }
+        fn model_request_prepared(&self, request: &ModelRequest) -> Result<()> {
+            self.prepared_requests.lock().unwrap().push(request.clone());
             Ok(())
         }
         fn signal(&self, signal: AgentSignal) -> Result<()> {
@@ -840,6 +865,8 @@ mod tests {
         let environment = SnapshotEnvironment {
             contexts: AtomicUsize::new(0),
             catalogs: AtomicUsize::new(0),
+            executions: AtomicUsize::new(0),
+            rewrite_before_tool: AtomicBool::new(false),
         };
         let store = MemoryStore::default();
         let answer = execute_turn(
@@ -861,6 +888,20 @@ mod tests {
         ));
         assert_eq!(environment.contexts.load(Ordering::SeqCst), 1);
         assert_eq!(environment.catalogs.load(Ordering::SeqCst), 2);
+        assert_eq!(environment.executions.load(Ordering::SeqCst), 1);
+        let prepared = store.prepared_requests.lock().unwrap();
+        assert_eq!(prepared.len(), 2);
+        assert_eq!(
+            prepared[0].system,
+            format!(
+                "{SYSTEM_INSTRUCTIONS}\n\n<soul>\nsoul\n</soul>\n\n<project_instruction path=\"AGENTS.md\">\nstable\n</project_instruction>\n\n<available_skills>\nRead the matching SKILL.md before using a skill.\n<skill name=\"review\" description=\"Review changes\" path=\".agents/skills/review/SKILL.md\" />\n</available_skills>\n\n<runtime_context>\nCurrent working directory: \".\"\n</runtime_context>"
+            )
+        );
+        assert_eq!(prepared[0].tools.len(), 1);
+        assert!(prepared[1].messages.iter().any(|message| {
+            matches!(message.content, MessageContent::ToolResult { ref call_id, .. } if call_id == "call-1")
+        }));
+        drop(prepared);
         assert_eq!(
             store
                 .effects_started
@@ -889,10 +930,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn before_tool_cannot_rewrite_the_provider_call() {
+        let environment = SnapshotEnvironment {
+            contexts: AtomicUsize::new(0),
+            catalogs: AtomicUsize::new(0),
+            executions: AtomicUsize::new(0),
+            rewrite_before_tool: AtomicBool::new(true),
+        };
+        let store = MemoryStore::default();
+        let answer = execute_turn(
+            &TwoTurnProvider(AtomicUsize::new(0)),
+            &environment,
+            &store,
+            test_config(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(answer, "done");
+        assert_eq!(environment.executions.load(Ordering::SeqCst), 0);
+        assert!(store.messages.lock().unwrap().iter().any(|message| {
+            matches!(
+                &message.content,
+                MessageContent::ToolResult {
+                    is_error: true,
+                    result,
+                    ..
+                } if result.as_str().is_some_and(|text| text.contains("may not change its arguments"))
+            )
+        }));
+    }
+
+    #[tokio::test]
     async fn records_typed_cancellation_instead_of_failure() {
         let environment = SnapshotEnvironment {
             contexts: AtomicUsize::new(0),
             catalogs: AtomicUsize::new(0),
+            executions: AtomicUsize::new(0),
+            rewrite_before_tool: AtomicBool::new(false),
         };
         let store = MemoryStore::default();
 
@@ -943,6 +1018,8 @@ mod tests {
         let environment = SnapshotEnvironment {
             contexts: AtomicUsize::new(0),
             catalogs: AtomicUsize::new(0),
+            executions: AtomicUsize::new(0),
+            rewrite_before_tool: AtomicBool::new(false),
         };
         let store = MemoryStore::default();
 

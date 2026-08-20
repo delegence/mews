@@ -70,6 +70,7 @@ mod tests {
                 recovery_prompt: "recovery conversation".into(),
                 agent_id: AgentId::new(),
                 agent_slug: "fixture-agent".into(),
+                system_instructions: "system".into(),
                 soul: "fixture soul".into(),
                 mews_session_id: "session-fixture".into(),
                 turn_id: "turn-fixture".into(),

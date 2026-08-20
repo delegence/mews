@@ -14,9 +14,9 @@ mod types;
 
 pub use capabilities::*;
 pub use context_budget::{apply_context_budget, context_budget_bytes};
-pub use r#loop::{execute_turn, execute_turn_with_config};
+pub use r#loop::{MAX_TOOL_CALL_ID_BYTES, execute_turn, execute_turn_with_config};
 pub use mews_protocol::{ReasoningEffort, ToolDefinition};
 pub use model::*;
 pub use queue::MessageQueue;
-pub use tools::ToolCatalog;
+pub use tools::{ToolCatalog, tool_allowed};
 pub use types::*;

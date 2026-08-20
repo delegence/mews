@@ -75,4 +75,4 @@ mod tests;
 use values::*;
 
 pub use events::*;
-pub use sessions::EffectOutcome;
+pub use sessions::{EffectOutcome, HarnessObservationInput};

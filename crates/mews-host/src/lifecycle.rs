@@ -137,7 +137,7 @@ pub async fn handle_host_request_streaming(
                 .and_then(activate_hub_transfer)
                 .map(|_| None),
         ),
-        HubToHost::ReadProjectContext { .. } | HubToHost::ReadPrompt { .. } => {
+        HubToHost::ReadProjectContext { .. } => {
             unreachable!("execution requests are handled by mews-host")
         }
         HubToHost::RefreshHarnessCatalog { request_id } => catalog_response(
@@ -174,6 +174,7 @@ pub async fn handle_host_request_streaming(
             recovery_prompt,
             agent_id,
             agent_slug,
+            system_instructions,
             soul,
             mews_session_id,
             turn_id,
@@ -225,6 +226,7 @@ pub async fn handle_host_request_streaming(
                     &mews_protocol::AcpContextSnapshot {
                         version: mews_protocol::ACP_CONTEXT_VERSION,
                         agent_slug,
+                        system_instructions,
                         soul,
                         skills: skills.iter().map(|skill| mews_protocol::AcpSkillInventoryItem {
                             name: skill.name.clone(), description: skill.description.clone(), hash: skill.hash.clone(),

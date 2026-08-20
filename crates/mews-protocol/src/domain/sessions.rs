@@ -58,7 +58,7 @@ pub enum AcpBindingTransition {
     Replace { reason: AcpReplacementReason },
 }
 
-pub const ACP_CONTEXT_VERSION: u32 = 1;
+pub const ACP_CONTEXT_VERSION: u32 = 2;
 pub const MAX_ACP_CONTEXT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +72,7 @@ pub struct AcpSkillInventoryItem {
 pub struct AcpContextSnapshot {
     pub version: u32,
     pub agent_slug: String,
+    pub system_instructions: String,
     pub soul: String,
     pub skills: Vec<AcpSkillInventoryItem>,
 }
@@ -106,8 +107,8 @@ impl AcpContextSnapshot {
         let mut skills = self.skills.clone();
         skills.sort_by(|left, right| left.name.cmp(&right.name));
         let mut text = format!(
-            "<mews_context version=\"{}\">\n<agent slug={:?}>\n<soul>{}</soul>\n<skills>\n",
-            self.version, self.agent_slug, self.soul
+            "<mews_context version=\"{}\">\n<system_instructions>\n{}\n</system_instructions>\n<agent slug={:?}>\n<soul>\n{}\n</soul>\n<skills>\n",
+            self.version, self.system_instructions, self.agent_slug, self.soul
         );
         for skill in skills {
             text.push_str(&format!(

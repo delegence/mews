@@ -96,15 +96,15 @@ async fn serve_joined_host_once(root: &Path) -> Result<bool> {
         let root = root.to_path_buf();
         async move { registry.watch_agent_extensions(root).await }
     });
+    let (mut catalog, ready_tools) = registry.subscribe_with_snapshot();
     peer_out
         .send(PeerEnvelope::ToolResponse {
             body: HostToHub::Ready {
-                tools: registry.definitions(),
+                tools: ready_tools,
                 harnesses,
             },
         })
         .await?;
-    let mut catalog = registry.subscribe();
     let catalog_peer = peer_out.clone();
     tokio::spawn(async move {
         while catalog.changed().await.is_ok() {

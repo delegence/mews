@@ -77,6 +77,7 @@ done
             prompt: "canonical remote prompt".into(),
             recovery_prompt: "recovery prompt".into(),
             agent_slug: "fixture-agent".into(),
+            system_instructions: "system".into(),
             soul: "fixture soul".into(),
             mews_session_id: "session-fixture".into(),
             turn_id: "turn-fixture".into(),
@@ -300,6 +301,7 @@ async fn disconnect_after_acp_dispatch_is_an_uncertain_effect() {
                 prompt: "prompt".into(),
                 recovery_prompt: "recovery".into(),
                 agent_slug: "agent".into(),
+                system_instructions: "system".into(),
                 soul: "soul".into(),
                 mews_session_id: "session".into(),
                 turn_id: "turn".into(),
@@ -386,6 +388,7 @@ async fn cancelling_remote_capability_execution_stops_shell_descendants() {
         name: "bash".into(),
         arguments: serde_json::json!({"command": command, "timeout_seconds": 30}),
         thought_signature: None,
+        catalog_generation: host.tool_catalog().generation,
     };
     let cwd = directory.path().canonicalize().unwrap();
     let agent_id = mews_protocol::AgentId::new();

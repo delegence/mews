@@ -21,5 +21,6 @@ uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 chrono.workspace = true
 tempfile.workspace = true

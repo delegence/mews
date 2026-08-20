@@ -403,7 +403,7 @@ fn native_mews() -> HarnessDescriptor {
         executable_version: Some(env!("CARGO_PKG_VERSION").into()),
         native_tools: vec!["read".into(), "write".into(), "edit".into(), "bash".into()],
         modes: Vec::new(),
-        supports_mcp: false,
+        supports_http_mcp: false,
         supports_continuation: false,
         models: Vec::new(),
         config_options: Vec::new(),
@@ -449,7 +449,7 @@ fn detected_adapter(
         executable_version: command.as_ref().map(|_| adapter.version.into()),
         native_tools: Vec::new(),
         modes: Vec::new(),
-        supports_mcp: false,
+        supports_http_mcp: false,
         supports_continuation: false,
         models: Vec::new(),
         config_options: Vec::new(),
@@ -490,7 +490,7 @@ fn definition_descriptor(root: Option<&Path>, definition: TrustedDefinition) -> 
         executable_version: None,
         native_tools: Vec::new(),
         modes: Vec::new(),
-        supports_mcp: false,
+        supports_http_mcp: false,
         supports_continuation: false,
         models: Vec::new(),
         config_options: Vec::new(),
@@ -554,13 +554,11 @@ fn normalize_probe(
 ) -> HarnessDescriptor {
     descriptor.availability.runtime = HarnessReadiness::Ready;
     descriptor.availability.adapter = HarnessReadiness::Ready;
-    descriptor.supports_mcp = ["http", "sse", "acp"].into_iter().any(|transport| {
-        probe
-            .initialize
-            .pointer(&format!("/agentCapabilities/mcpCapabilities/{transport}"))
-            .and_then(Value::as_bool)
-            == Some(true)
-    });
+    descriptor.supports_http_mcp = probe
+        .initialize
+        .pointer("/agentCapabilities/mcpCapabilities/http")
+        .and_then(Value::as_bool)
+        == Some(true);
     descriptor.supports_continuation = probe
         .initialize
         .pointer("/agentCapabilities/sessionCapabilities/resume")
@@ -686,6 +684,24 @@ fn models_from_options(options: &[Value]) -> Vec<HarnessModelCapability> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_reports_only_the_http_mcp_transport_used_by_runtime() {
+        let probe = |mcp_capabilities| mews_acp::AcpProbe {
+            initialize: serde_json::json!({
+                "agentCapabilities": {"mcpCapabilities": mcp_capabilities}
+            }),
+            session: Some(serde_json::json!({})),
+            session_error: None,
+            session_error_kind: None,
+            timings: mews_acp::AcpProbeTimings::default(),
+        };
+
+        let sse_only = normalize_probe(native_mews(), probe(serde_json::json!({"sse": true})));
+        assert!(!sse_only.supports_http_mcp);
+        let http = normalize_probe(native_mews(), probe(serde_json::json!({"http": true})));
+        assert!(http.supports_http_mcp);
+    }
     use crate::harnesses::adapters::{adapter_binary, adapter_node_path};
 
     #[test]

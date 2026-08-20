@@ -279,7 +279,7 @@ fn stalled_channel_delivery_does_not_stop_inbound_intake() {
             .unwrap();
 
         // Channel delivery is intentionally ack-before-send, even while the platform call stalls.
-        let channel_db = rusqlite::Connection::open(&channel_state).unwrap();
+        let channel_db = rusqlite::Connection::open(channel_state.join("channel.db")).unwrap();
         let consumer: String = channel_db
             .query_row(
                 "SELECT value FROM metadata WHERE key = 'consumer_id'",
@@ -327,12 +327,6 @@ fn setup_agent_and_cwd_bound_tool_turn_work_end_to_end() {
     fs::write(
         project.path().join("note.txt"),
         "from the selected directory\n",
-    )
-    .unwrap();
-    fs::create_dir_all(project.path().join(".agents/prompts")).unwrap();
-    fs::write(
-        project.path().join(".agents/prompts/greet.md"),
-        "---\ndescription: Greet someone\n---\nhello $1",
     )
     .unwrap();
     let hook_marker = project.path().join("hook-ran");
@@ -412,11 +406,21 @@ fn setup_agent_and_cwd_bound_tool_turn_work_end_to_end() {
         .unwrap();
     let _restarted_hub = ChildGuard(Some(restarted_hub));
     wait_for_status(binary, state.path(), project.path());
+    let inspection = run(
+        binary,
+        state.path(),
+        project.path(),
+        &["agents", "inspect", "coder"],
+    );
+    assert!(inspection.contains("configuration:"));
+    assert!(inspection.contains("host resolution:"));
+    assert!(inspection.contains("harness: mews (ready)"));
+    assert!(inspection.contains("read (mews native)"));
     let prompted = run(
         binary,
         state.path(),
         project.path(),
-        &["agents", "coder", "-p", "/greet", "world"],
+        &["agents", "coder", "-p", "hello world"],
     );
     assert!(prompted.contains("hello world [test]"));
     assert!(hook_marker.exists());

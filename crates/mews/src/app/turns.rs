@@ -1,11 +1,8 @@
 use super::*;
 
-use super::{
-    acp::{
-        AcpReasoningAggregate, checked_acp_binding, finish_acp_turn, persist_local_acp_event,
-        persist_remote_acp_binding, persist_remote_acp_dispatch,
-    },
-    sessions::expand_prompt,
+use super::acp::{
+    AcpReasoningAggregate, checked_acp_binding, finish_acp_turn, persist_local_acp_event,
+    persist_remote_acp_binding, persist_remote_acp_dispatch,
 };
 
 struct SendRequest<'a> {
@@ -14,7 +11,6 @@ struct SendRequest<'a> {
     metadata: Value,
     source: MessageSource,
     turn_id: Option<crate::TurnId>,
-    prompt_is_expanded: bool,
     event_notify: Option<Arc<tokio::sync::Notify>>,
     cancellation: mews_agent::CancellationToken,
 }
@@ -205,7 +201,6 @@ impl Mews {
             metadata,
             source,
             turn_id: None,
-            prompt_is_expanded: false,
             event_notify: None,
             cancellation: mews_agent::CancellationToken::new(),
         })
@@ -276,7 +271,6 @@ impl Mews {
                 metadata,
                 source,
                 turn_id: None,
-                prompt_is_expanded: false,
                 event_notify: None,
                 cancellation: mews_agent::CancellationToken::new(),
             },
@@ -305,7 +299,6 @@ impl Mews {
                 metadata,
                 source,
                 turn_id: Some(turn.id),
-                prompt_is_expanded: true,
                 event_notify: Some(turn.event_notify),
                 cancellation: turn.cancellation,
             },
@@ -333,19 +326,13 @@ impl Mews {
             metadata,
             source,
             turn_id,
-            prompt_is_expanded,
             event_notify,
             cancellation,
         } = request;
         if session.host_id != *environment_host_id {
             bail!("session belongs to a different Host");
         }
-        let request_prompt = prompt.to_owned();
-        let prompt = if prompt_is_expanded {
-            prompt.to_owned()
-        } else {
-            expand_prompt(environment, &session.working_directory, prompt).await?
-        };
+        let prompt = prompt.to_owned();
         if source.id.is_empty() || source.id.len() > 256 {
             bail!("message source ID must contain 1 to 256 bytes");
         }
@@ -369,7 +356,7 @@ impl Mews {
                         &session.id,
                         &command_id,
                         MessageContent::Text {
-                            text: request_prompt,
+                            text: prompt.clone(),
                         },
                         MessageContent::Text {
                             text: prompt.clone(),
@@ -473,6 +460,7 @@ impl Mews {
             let context = mews_protocol::AcpContextSnapshot {
                 version: mews_protocol::ACP_CONTEXT_VERSION,
                 agent_slug: agent_slug.clone(),
+                system_instructions: mews_runtime::SYSTEM_INSTRUCTIONS.into(),
                 soul: system.clone(),
                 skills: skills
                     .iter()
@@ -781,6 +769,7 @@ impl Mews {
                     recovery_prompt,
                     agent_id: session.agent_id.clone(),
                     agent_slug: agent_slug.clone(),
+                    system_instructions: mews_runtime::SYSTEM_INSTRUCTIONS.into(),
                     soul: system.clone(),
                     mews_session_id: session.id.to_string(),
                     turn_id: turn.to_string(),

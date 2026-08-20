@@ -4,13 +4,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    Agent, AuthCredential, AuthStatus, ConsumerId, ConsumerKind, EventBatch, HostHarnessStatus,
-    HostId, HostStatus, Installation, JournalEntry, JournalEventType, JournalSubjectType, Message,
-    MessageSource, ModelInfo, ProviderDefaults, ReasoningEffort, Session, SessionEntry, SessionId,
-    SessionModelConfig, Turn, TurnId,
+    Agent, AgentInspection, AgentToolCursor, AuthCredential, AuthStatus, ConsumerId, ConsumerKind,
+    EventBatch, HostHarnessStatus, HostId, HostStatus, Installation, JournalEntry,
+    JournalEventType, JournalSubjectType, Message, MessageSource, ModelInfo, ProviderDefaults,
+    ReasoningEffort, Session, SessionEntry, SessionId, SessionModelConfig, Turn, TurnId,
 };
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const MAX_HUB_FRAME_BYTES: usize = 1024 * 1024;
 /// Reserved for the response tag, request ID, and JSON envelope around a
 /// paginated transcript or event response. Exact JSON overhead varies by item,
@@ -93,6 +93,15 @@ pub enum ProtocolErrorCode {
 pub enum HubRequest {
     Status,
     ListAgents,
+    InspectAgent {
+        slug: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_id: Option<HostId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_tool: Option<AgentToolCursor>,
+        #[serde(default = "default_page_limit")]
+        tool_limit: u16,
+    },
     CreateAgent {
         slug: String,
         /// Absent selects the native Harness. The empty string is deliberately
@@ -208,7 +217,12 @@ pub enum HubRequest {
         #[serde(default)]
         wait_ms: u32,
     },
-    ListHosts,
+    ListHosts {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<HostId>,
+        #[serde(default = "default_page_limit")]
+        limit: u16,
+    },
     ListHarnesses,
     RefreshHarnesses,
     RemoveHost {
@@ -228,6 +242,7 @@ pub enum HubRequest {
 pub enum HubResponse {
     Status(Installation),
     Agents(Vec<Agent>),
+    AgentInspection(Box<AgentInspection>),
     Agent(Agent),
     Sessions(Vec<Session>),
     Session(Session),
@@ -237,7 +252,7 @@ pub enum HubResponse {
     Turn(Turn),
     Events(EventBatch),
     JournalEntries(JournalPage),
-    Hosts(Vec<HostStatus>),
+    Hosts(HostPage),
     Harnesses(Vec<HostHarnessStatus>),
     Auth(Vec<AuthStatus>),
     Models(Vec<ModelInfo>),
@@ -251,6 +266,12 @@ pub enum HubResponse {
 pub struct SessionHistoryPage {
     pub messages: Vec<Message>,
     pub next: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HostPage {
+    pub hosts: Vec<HostStatus>,
+    pub next: Option<HostId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -383,7 +404,7 @@ mod tests {
         let encoded = encode_hub_frame(&Frame::with_request_id(HubRequest::Status, id)).unwrap();
         assert_eq!(
             String::from_utf8(encoded).unwrap(),
-            r#"{"protocol":2,"request_id":"req_0198f73b-9c31-7c01-8000-000000000000","body":{"type":"status"}}"#
+            r#"{"protocol":5,"request_id":"req_0198f73b-9c31-7c01-8000-000000000000","body":{"type":"status"}}"#
         );
     }
 
@@ -395,7 +416,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             encoded,
-            r#"{"type":"error","data":{"code":"unsupported_version","message":"protocol version 3 is incompatible with version 2; restart the MEWS daemon","retryable":false}}"#
+            r#"{"type":"error","data":{"code":"unsupported_version","message":"protocol version 6 is incompatible with version 5; restart the MEWS daemon","retryable":false}}"#
         );
     }
 

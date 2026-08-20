@@ -1,4 +1,9 @@
-use std::{path::Path, time::Duration};
+use std::{
+    path::Path,
+    pin::Pin,
+    task::{Context as TaskContext, Poll},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -195,9 +200,11 @@ fn openai_response_stream(
     state_model: String,
 ) -> ModelStream {
     let (sender, receiver) = tokio::sync::mpsc::channel(32);
-    tokio::spawn(async move {
+    let reader = tokio::spawn(async move {
         use futures_util::StreamExt;
-        let _ = sender.send(Ok(ModelStreamEvent::Start)).await;
+        if sender.send(Ok(ModelStreamEvent::Start)).await.is_err() {
+            return;
+        }
         let mut bytes = response.bytes_stream();
         let mut buffer = Vec::new();
         while let Some(chunk) = bytes.next().await {
@@ -344,10 +351,26 @@ fn openai_response_stream(
             )))
             .await;
     });
-    Box::pin(futures_util::stream::unfold(
-        receiver,
-        |mut receiver| async { receiver.recv().await.map(|event| (event, receiver)) },
-    ))
+    Box::pin(OpenAiResponseStream { receiver, reader })
+}
+
+struct OpenAiResponseStream {
+    receiver: tokio::sync::mpsc::Receiver<ProviderResult<ModelStreamEvent>>,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl futures_util::Stream for OpenAiResponseStream {
+    type Item = ProviderResult<ModelStreamEvent>;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.get_mut().receiver).poll_recv(context)
+    }
+}
+
+impl Drop for OpenAiResponseStream {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
 }
 
 fn sse_event_too_large() -> ProviderError {
@@ -686,7 +709,7 @@ where
 {
     let (_cancel, cancellation) = tokio::sync::watch::channel(false);
     login_with_client(
-        &Client::new(),
+        &crate::http::client(),
         &mut notify,
         &cancellation,
         &OpenAiAuthEndpoints::default(),
@@ -807,7 +830,7 @@ where
     F: FnMut(DeviceAuthorization),
 {
     login_with_client(
-        &Client::new(),
+        &crate::http::client(),
         &mut notify,
         cancellation,
         &OpenAiAuthEndpoints::default(),
@@ -989,6 +1012,56 @@ mod tests {
             .await;
         server.await.unwrap();
         events
+    }
+
+    #[tokio::test]
+    async fn dropping_stream_closes_the_upstream_response() {
+        use futures_util::StreamExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut byte = [0_u8; 1];
+            stream.read(&mut byte).await
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+        let mut events = openai_response_stream(response, "openai".into(), "gpt-test".into());
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(ModelStreamEvent::Start))
+        ));
+
+        drop(events);
+
+        let closed = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(closed, Ok(0))
+                || matches!(
+                    closed,
+                    Err(ref error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                        )
+                ),
+            "upstream connection remained open: {closed:?}"
+        );
     }
 
     #[test]

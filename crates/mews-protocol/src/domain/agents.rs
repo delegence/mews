@@ -20,6 +20,106 @@ pub struct AgentRevision {
     pub created_at: DateTime<Utc>,
 }
 
+/// Canonical Agent configuration plus one optional Host resolution.
+/// Clients inspect Hosts one at a time so a valid response always fits in one
+/// Hub frame.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentInspection {
+    pub agent: Agent,
+    pub revision_hash: String,
+    pub author_host_id: HostId,
+    pub config: AgentConfig,
+    pub host: Option<AgentHostInspection>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentHostInspection {
+    pub host: Host,
+    pub connected: bool,
+    pub harness: Option<AgentHarnessInspection>,
+    pub harness_native_authority: HarnessNativeAuthority,
+    pub acp_skill_tools: AcpSkillToolsInspection,
+    pub tool_catalog_generation: Option<u64>,
+    pub tools: AgentToolInspectionPage,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentToolInspectionPage {
+    pub tools: Vec<AgentToolInspection>,
+    pub next: Option<AgentToolCursor>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentToolCursor {
+    pub snapshot_hash: [u8; 32],
+    pub offset: u32,
+}
+
+pub const ACP_SKILL_TOOL_NAMES: [&str; 2] = ["mews_list_skills", "mews_read_skill"];
+
+pub fn is_reserved_acp_skill_tool(name: &str) -> bool {
+    ACP_SKILL_TOOL_NAMES.contains(&name)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpSkillToolsInspection {
+    pub names: Vec<String>,
+    pub state: AcpSkillToolsState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpSkillToolsState {
+    NotApplicable,
+    NoneKnown,
+    Conditional,
+    Exposed,
+    HarnessUnavailable,
+    UnsupportedTransport,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHarnessInspection {
+    pub name: String,
+    pub protocol: HarnessProtocol,
+    pub availability: HarnessAvailability,
+    pub supports_http_mcp: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentToolInspection {
+    pub name: String,
+    pub source: AgentToolSource,
+    pub allowlist_match: bool,
+    pub exposure: AgentToolExposure,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentToolSource {
+    MewsNative,
+    HarnessNative,
+    AgentExtension,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentToolExposure {
+    Exposed,
+    ExcludedByAllowlist,
+    HarnessUnavailable,
+    UnsupportedTransport,
+    HarnessControlled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessNativeAuthority {
+    NotApplicable,
+    KnownUncontrolled,
+    UnknownUncontrolled,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
@@ -135,6 +235,7 @@ mod tests {
         let context = AcpContextSnapshot {
             version: ACP_CONTEXT_VERSION,
             agent_slug: "coder".into(),
+            system_instructions: "System.".into(),
             soul: "Be useful.".into(),
             skills: vec![
                 AcpSkillInventoryItem {
@@ -150,6 +251,7 @@ mod tests {
             ],
         };
         let rendered = context.render().unwrap();
+        assert!(rendered.find("System.").unwrap() < rendered.find("Be useful.").unwrap());
         assert!(rendered.find("alpha").unwrap() < rendered.find("zeta").unwrap());
         assert_eq!(AcpContextSnapshot::hash_rendered(&rendered).len(), 64);
         assert!(rendered.contains("mews_read_skill"));
@@ -160,6 +262,7 @@ mod tests {
         let rendered = AcpContextSnapshot {
             version: ACP_CONTEXT_VERSION,
             agent_slug: "coder".into(),
+            system_instructions: "System.".into(),
             soul: "Be useful.".into(),
             skills: Vec::new(),
         }

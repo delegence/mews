@@ -7,8 +7,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use mews_agent::{
     AgentCapabilities, CancellationToken, ContextDocument, ContextSnapshot, LifecycleHook,
-    ProgressReporter, ResourceDescriptor, ToolCall, ToolDefinition, ToolResult,
+    ProgressReporter, ResourceDescriptor, ToolCall, ToolResult,
 };
+use mews_protocol::ToolCatalogSnapshot;
 use serde_json::Value;
 
 use crate::{ToolRegistry, context, resources};
@@ -49,41 +50,15 @@ impl AgentCapabilities for LocalEnvironment {
                 .into_iter()
                 .map(convert)
                 .collect(),
-            prompts: resources::discover_prompts(self.root.as_deref(), cwd)?
-                .into_iter()
-                .map(convert)
-                .collect(),
         })
     }
 
-    async fn read_prompt(&self, cwd: &Path, name: &str) -> Result<Option<String>> {
-        resources::read_prompt(self.root.as_deref(), cwd, name)
+    fn tools(&self) -> ToolCatalogSnapshot {
+        self.registry.snapshot()
     }
 
-    fn tools(&self) -> Vec<ToolDefinition> {
-        self.registry
-            .definitions()
-            .into_iter()
-            .map(|tool| ToolDefinition {
-                name: tool.name,
-                description: tool.description,
-                schema: tool.schema,
-                agent_id: tool.agent_id,
-            })
-            .collect()
-    }
-
-    fn extension_tools(&self, agent_id: &mews_protocol::AgentId) -> Vec<ToolDefinition> {
-        self.registry
-            .extension_definitions(agent_id)
-            .into_iter()
-            .map(|tool| ToolDefinition {
-                name: tool.name,
-                description: tool.description,
-                schema: tool.schema,
-                agent_id: None,
-            })
-            .collect()
+    fn extension_tools(&self, agent_id: &mews_protocol::AgentId) -> ToolCatalogSnapshot {
+        self.registry.extension_definitions(agent_id)
     }
 
     async fn execute(
@@ -97,12 +72,13 @@ impl AgentCapabilities for LocalEnvironment {
         cancellation.check()?;
         let value = self
             .registry
-            .execute(
+            .execute_at_generation(
                 agent_id,
                 &call.name,
                 call.arguments.clone(),
                 cwd,
                 cancellation,
+                call.catalog_generation,
             )
             .await?;
         Ok(ToolResult::success(value))
@@ -115,6 +91,7 @@ impl AgentCapabilities for LocalEnvironment {
         payload: Value,
         cwd: &Path,
         cancellation: &CancellationToken,
+        catalog_generation: Option<u64>,
     ) -> Result<Value> {
         let name = match hook {
             LifecycleHook::TurnStart => "turn_start",
@@ -125,7 +102,14 @@ impl AgentCapabilities for LocalEnvironment {
             LifecycleHook::TurnEnd => "turn_end",
         };
         self.registry
-            .execute_hooks(agent_id, name, payload, cwd, cancellation)
+            .execute_hooks_at_generation(
+                agent_id,
+                name,
+                payload,
+                cwd,
+                cancellation,
+                catalog_generation,
+            )
             .await
     }
 }

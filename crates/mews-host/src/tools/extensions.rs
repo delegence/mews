@@ -100,6 +100,14 @@ fn runtime_extensions_in(directory: &Path) -> Result<Vec<RuntimeExtension>> {
         if extension.name.is_empty() || extension.command.is_empty() {
             bail!("extension name and command are required");
         }
+        for tool in &extension.tools {
+            if mews_protocol::is_reserved_acp_skill_tool(&tool.name) {
+                bail!(
+                    "extension tool name {:?} is reserved for ACP skills",
+                    tool.name
+                );
+            }
+        }
         for hook in &extension.hooks {
             if !matches!(
                 hook.as_str(),
@@ -212,6 +220,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn documented_extension_manifest_parses() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("policy.toml"),
+            r#"name = "policy"
+command = ["/opt/mews-extensions/policy"]
+hooks = ["turn_start", "before_model", "before_tool", "after_tool", "after_step", "turn_end"]
+
+[[tools]]
+name = "lookup"
+description = "Look up a record"
+schema = { type = "object", properties = { id = { type = "string" } }, required = ["id"] }
+"#,
+        )
+        .unwrap();
+
+        let extensions = runtime_extensions_in(directory.path()).unwrap();
+        assert_eq!(extensions.len(), 1);
+        assert_eq!(extensions[0].hooks.len(), 6);
+        assert_eq!(extensions[0].tools[0].name, "lookup");
+    }
+
+    #[test]
     fn runtime_extensions_are_sorted_by_name() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -250,6 +281,24 @@ mod tests {
                 .to_string()
                 .contains("duplicate runtime extension name")
         );
+    }
+
+    #[test]
+    fn reserved_acp_skill_tool_names_are_rejected() {
+        for name in mews_protocol::ACP_SKILL_TOOL_NAMES {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(
+                directory.path().join("reserved.toml"),
+                format!(
+                    "name = 'reserved'\ncommand = ['true']\n\n[[tools]]\nname = '{name}'\ndescription = 'reserved'\nschema = {{ type = 'object' }}\n"
+                ),
+            )
+            .unwrap();
+
+            let error = runtime_extensions_in(directory.path()).unwrap_err();
+            assert!(error.to_string().contains(name));
+            assert!(error.to_string().contains("reserved for ACP skills"));
+        }
     }
 
     #[test]

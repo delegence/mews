@@ -1,15 +1,19 @@
 use anyhow::{Context, Result};
+use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
 use mews_agent::{
     AgentCapabilities, AgentSignal, CancellationToken, MessageContent as ModelContent,
-    MessageRole as ModelRole, ModelMessage, Provider,
+    MessageRole as ModelRole, ModelMessage, ModelRequest, Provider,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 
 use crate::{
     AgentConfig, MessageContent, MessageRole, MessageSource, Session, SourceKind, TurnStatus,
 };
 use mews_store::Store;
+
+const PREPARED_REQUEST_CHUNK_BYTES: usize = 384 * 1024;
 
 pub(crate) fn canonical_acp_prompt(store: &Store, session: &Session, soul: &str) -> Result<String> {
     let mut request = mews_agent::ModelRequest {
@@ -99,6 +103,59 @@ impl SessionStore<'_> {
             notify.notify_waiters();
         }
     }
+}
+
+fn prepared_request_observations(
+    request: &ModelRequest,
+    turn_id: &crate::TurnId,
+) -> Result<Vec<mews_store::HarnessObservationInput>> {
+    let data = serde_json::to_value(request)?;
+    let inline = mews_protocol::SessionEntryPayload::HarnessObservation {
+        turn_id: turn_id.clone(),
+        harness_session_id: None,
+        kind: "model_request_prepared".into(),
+        data: data.clone(),
+    };
+    let request_id = mews_protocol::OperationId::new().to_string();
+    if serde_json::to_vec(&inline)?.len() <= mews_protocol::MAX_SESSION_ITEM_BYTES {
+        return Ok(vec![mews_store::HarnessObservationInput {
+            harness_session_id: None,
+            kind: "model_request_prepared".into(),
+            data,
+            idempotency_key: Some(format!("model_request_prepared:{request_id}")),
+        }]);
+    }
+
+    let encoded = serde_json::to_vec(request)?;
+    let chunks = encoded.len().div_ceil(PREPARED_REQUEST_CHUNK_BYTES);
+    let checksum = format!("{:x}", Sha256::digest(&encoded));
+    let mut observations = Vec::with_capacity(chunks + 1);
+    observations.push(mews_store::HarnessObservationInput {
+        harness_session_id: None,
+        kind: "model_request_prepared".into(),
+        data: serde_json::json!({
+            "format": "chunked_json_v1",
+            "request_id": request_id,
+            "sha256": checksum,
+            "bytes": encoded.len(),
+            "chunks": chunks,
+            "model": request.model,
+        }),
+        idempotency_key: Some(format!("model_request_prepared:{request_id}")),
+    });
+    for (index, chunk) in encoded.chunks(PREPARED_REQUEST_CHUNK_BYTES).enumerate() {
+        observations.push(mews_store::HarnessObservationInput {
+            harness_session_id: None,
+            kind: "model_request_prepared_chunk".into(),
+            data: serde_json::json!({
+                "request_id": request_id,
+                "index": index,
+                "data": STANDARD_NO_PAD.encode(chunk),
+            }),
+            idempotency_key: Some(format!("model_request_prepared:{request_id}:{index}")),
+        });
+    }
+    Ok(observations)
 }
 
 impl Drop for SessionStore<'_> {
@@ -196,10 +253,46 @@ impl mews_runtime::ConversationStore for SessionStore<'_> {
             }))
     }
 
+    fn model_request_prepared(&self, request: &ModelRequest) -> Result<()> {
+        let turn_id = self.active_turn_id()?;
+        self.store.append_harness_observations(
+            &self.session.id,
+            &turn_id,
+            prepared_request_observations(request, &turn_id)?,
+        )?;
+        self.notify_event();
+        Ok(())
+    }
+
     fn append_response(&self, response: mews_protocol::AssistantResponse) -> Result<()> {
         let turn_id = self.active_turn_id()?;
         self.store
             .append_assistant_response(&self.session.id, &turn_id, response)?;
+        self.notify_event();
+        Ok(())
+    }
+
+    fn append_response_with_tool_calls(
+        &self,
+        response: mews_protocol::AssistantResponse,
+        calls: Vec<mews_agent::ToolCall>,
+    ) -> Result<()> {
+        let turn_id = self.active_turn_id()?;
+        let calls = calls
+            .into_iter()
+            .map(|call| mews_protocol::ToolCall {
+                call_id: call.id,
+                tool: call.name,
+                arguments: call.arguments,
+                thought_signature: call.thought_signature,
+            })
+            .collect();
+        self.store.append_assistant_response_with_tool_calls(
+            &self.session.id,
+            &turn_id,
+            response,
+            calls,
+        )?;
         self.notify_event();
         Ok(())
     }
@@ -765,6 +858,29 @@ fn provider_messages(messages: Vec<crate::Message>) -> Vec<ModelMessage> {
 mod tests {
     use super::*;
 
+    fn native_harness_descriptor() -> mews_protocol::HarnessDescriptor {
+        mews_protocol::HarnessDescriptor {
+            name: "mews".into(),
+            protocol: mews_protocol::HarnessProtocol::Mews,
+            definition_hash: "test".into(),
+            availability: mews_protocol::HarnessAvailability {
+                runtime: mews_protocol::HarnessReadiness::Ready,
+                adapter: mews_protocol::HarnessReadiness::NotApplicable,
+                authentication: mews_protocol::HarnessReadiness::NotApplicable,
+                catalog: mews_protocol::HarnessReadiness::Ready,
+                detail: None,
+            },
+            executable_version: None,
+            native_tools: Vec::new(),
+            modes: Vec::new(),
+            supports_http_mcp: false,
+            supports_continuation: false,
+            models: Vec::new(),
+            config_options: Vec::new(),
+            probed_at: None,
+        }
+    }
+
     #[test]
     fn canonical_acp_prompt_keeps_linear_history_in_order() {
         let mut store = Store::open_in_memory().unwrap();
@@ -834,5 +950,234 @@ mod tests {
         assert_eq!(prompt["conversation"][0]["content"]["text"], "hello");
         assert_eq!(prompt["conversation"][1]["role"], "assistant");
         assert_eq!(prompt["conversation"][1]["content"]["text"], "hi");
+    }
+
+    #[test]
+    fn injected_user_message_is_durable_without_admitting_harness_turns() {
+        let mut store = Store::open_in_memory().unwrap();
+        let installation = store
+            .initialize(
+                &mews_store::CommandContext::system(),
+                "laptop",
+                "key",
+                "noise-key",
+                "installation-key",
+            )
+            .unwrap();
+        let (agent, _) = store
+            .create_agent(
+                &mews_store::CommandContext::system(),
+                "injected-message",
+                "Soul",
+                "harness = \"mews\"\n",
+                &installation.hub_host_id,
+            )
+            .unwrap();
+        let session = store
+            .create_session(
+                &agent.id,
+                &installation.hub_host_id,
+                std::path::Path::new("/tmp"),
+            )
+            .unwrap();
+        let harness_source = MessageSource {
+            kind: SourceKind::Harness,
+            id: "default".into(),
+            channel_origin: None,
+        };
+        let content = MessageContent::Text {
+            text: "initial".into(),
+        };
+        assert!(
+            store
+                .accept_turn_idempotent(
+                    &session.id,
+                    "harness-turn",
+                    content.clone(),
+                    content.clone(),
+                    Value::Null,
+                    harness_source,
+                )
+                .is_err()
+        );
+        let (turn, _, _) = store
+            .accept_turn_idempotent(
+                &session.id,
+                "client-turn",
+                content.clone(),
+                content,
+                Value::Null,
+                MessageSource {
+                    kind: SourceKind::Client,
+                    id: "cli".into(),
+                    channel_origin: None,
+                },
+            )
+            .unwrap();
+        let scoped = SessionStore {
+            store: &store,
+            session: &session,
+            turn: Mutex::new(TurnState {
+                id: turn.id,
+                finished: true,
+            }),
+            event_notify: None,
+            harness: native_harness_descriptor(),
+        };
+
+        mews_runtime::ConversationStore::append(
+            &scoped,
+            ModelMessage {
+                role: ModelRole::User,
+                content: ModelContent::Text {
+                    text: "follow up".into(),
+                },
+            },
+        )
+        .unwrap();
+
+        let injected = store
+            .session_entries(&session.id)
+            .unwrap()
+            .into_iter()
+            .find(|entry| {
+                matches!(
+                    &entry.payload,
+                    mews_protocol::SessionEntryPayload::UserMessage {
+                        content: MessageContent::Text { text },
+                        source: MessageSource { kind: SourceKind::Harness, .. },
+                        ..
+                    } if text == "follow up"
+                )
+            });
+        assert!(injected.is_some());
+    }
+
+    #[test]
+    fn page_safe_model_request_keeps_the_direct_observation_format() {
+        let request = ModelRequest {
+            model: "openai/gpt".into(),
+            reasoning: None,
+            system: "system".into(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            continuation: None,
+        };
+
+        let observations = prepared_request_observations(&request, &crate::TurnId::new()).unwrap();
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].kind, "model_request_prepared");
+        assert_eq!(observations[0].data, serde_json::to_value(request).unwrap());
+    }
+
+    #[test]
+    fn oversized_google_request_is_recorded_in_page_safe_chunks() {
+        let mut store = Store::open_in_memory().unwrap();
+        let installation = store
+            .initialize(
+                &mews_store::CommandContext::system(),
+                "laptop",
+                "key",
+                "noise-key",
+                "installation-key",
+            )
+            .unwrap();
+        let (agent, _) = store
+            .create_agent(
+                &mews_store::CommandContext::system(),
+                "large-request",
+                "Soul",
+                "harness = \"mews\"\n",
+                &installation.hub_host_id,
+            )
+            .unwrap();
+        let session = store
+            .create_session(
+                &agent.id,
+                &installation.hub_host_id,
+                std::path::Path::new("/tmp"),
+            )
+            .unwrap();
+        let (turn, _, _) = store
+            .accept_turn_idempotent(
+                &session.id,
+                "large-request",
+                MessageContent::Text {
+                    text: "hello".into(),
+                },
+                MessageContent::Text {
+                    text: "hello".into(),
+                },
+                Value::Null,
+                MessageSource {
+                    kind: SourceKind::Client,
+                    id: "cli".into(),
+                    channel_origin: None,
+                },
+            )
+            .unwrap();
+        let mut request = ModelRequest {
+            model: "google/gemini".into(),
+            reasoning: None,
+            system: "x".repeat(800 * 1024),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            continuation: None,
+        };
+        mews_agent::apply_context_budget(&mut request).unwrap();
+
+        store
+            .append_harness_observations(
+                &session.id,
+                &turn.id,
+                prepared_request_observations(&request, &turn.id).unwrap(),
+            )
+            .unwrap();
+
+        let entries = store.session_entries(&session.id).unwrap();
+        let observations = entries
+            .iter()
+            .filter_map(|entry| match &entry.payload {
+                mews_protocol::SessionEntryPayload::HarnessObservation { kind, data, .. } => {
+                    assert!(
+                        serde_json::to_vec(&entry.payload).unwrap().len()
+                            <= mews_protocol::MAX_SESSION_ITEM_BYTES
+                    );
+                    Some((kind.as_str(), data))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let manifest = observations
+            .iter()
+            .find_map(|(kind, data)| (*kind == "model_request_prepared").then_some(*data))
+            .unwrap();
+        assert_eq!(manifest["format"], "chunked_json_v1");
+        let mut chunks = observations
+            .iter()
+            .filter(|(kind, _)| *kind == "model_request_prepared_chunk")
+            .map(|(_, data)| {
+                (
+                    data["index"].as_u64().unwrap(),
+                    data["data"].as_str().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        chunks.sort_by_key(|(index, _)| *index);
+        assert_eq!(manifest["chunks"], chunks.len());
+        let encoded = chunks
+            .into_iter()
+            .flat_map(|(_, data)| STANDARD_NO_PAD.decode(data).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(manifest["bytes"], encoded.len());
+        assert_eq!(
+            manifest["sha256"],
+            format!("{:x}", Sha256::digest(&encoded))
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&encoded).unwrap(),
+            serde_json::to_value(request).unwrap()
+        );
     }
 }

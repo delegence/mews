@@ -2,9 +2,9 @@
 
 use anyhow::{Result, bail};
 use mews_protocol::{
-    Agent, AuthStatus, EventBatch, HostHarnessStatus, HostStatus, HubResponse, Installation,
-    JournalPage, ModelInfo, ProviderDefaults, Session, SessionEntriesPage, SessionHistoryPage,
-    SessionModelConfig, Turn,
+    Agent, AgentInspection, AuthStatus, EventBatch, HostHarnessStatus, HostPage, HubResponse,
+    Installation, JournalPage, ModelInfo, ProviderDefaults, Session, SessionEntriesPage,
+    SessionHistoryPage, SessionModelConfig, Turn,
 };
 
 macro_rules! expect {
@@ -21,6 +21,12 @@ macro_rules! expect {
 expect!(status, Status, Installation);
 expect!(agents, Agents, Vec<Agent>);
 expect!(agent, Agent, Agent);
+pub fn agent_inspection(response: HubResponse) -> Result<AgentInspection> {
+    match response {
+        HubResponse::AgentInspection(value) => Ok(*value),
+        other => bail!("unexpected Hub response: {other:?}"),
+    }
+}
 expect!(sessions, Sessions, Vec<Session>);
 expect!(session, Session, Session);
 expect!(session_history, SessionHistory, SessionHistoryPage);
@@ -29,7 +35,7 @@ expect!(session_model_config, SessionModelConfig, SessionModelConfig);
 expect!(turn, Turn, Turn);
 expect!(events, Events, EventBatch);
 expect!(journal_entries, JournalEntries, JournalPage);
-expect!(hosts, Hosts, Vec<HostStatus>);
+expect!(hosts, Hosts, HostPage);
 expect!(harnesses, Harnesses, Vec<HostHarnessStatus>);
 expect!(auth, Auth, Vec<AuthStatus>);
 expect!(models, Models, Vec<ModelInfo>);

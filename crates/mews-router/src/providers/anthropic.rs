@@ -8,8 +8,8 @@ use reqwest::Client;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{TcpListener, TcpStream},
 };
 
 use crate::{
@@ -27,6 +27,8 @@ const REDIRECT_URI: &str = "http://localhost:54545/callback";
 const OAUTH_SCOPE: &str =
     "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 const OAUTH_BETAS: &str = "claude-code-20250219,oauth-2025-04-20";
+const MAX_OAUTH_REQUEST_LINE_BYTES: usize = 8 * 1024;
+const OAUTH_REQUEST_LINE_TIMEOUT: Duration = Duration::from_secs(1);
 static REFRESH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -231,7 +233,7 @@ pub async fn login_anthropic(notify: impl FnOnce(BrowserAuthorization)) -> Resul
     let code = tokio::time::timeout(Duration::from_secs(5 * 60), callback(listener, &state))
         .await
         .context("Anthropic OAuth login timed out")??;
-    exchange(&Client::new(), &code, &state, &verifier).await
+    exchange(&crate::http::client(), &code, &state, &verifier).await
 }
 
 fn pkce() -> (String, String) {
@@ -257,49 +259,76 @@ fn authorization_url(state: &str, challenge: &str) -> Result<String> {
 }
 
 async fn callback(listener: TcpListener, expected_state: &str) -> Result<String> {
-    let (mut stream, _) = listener.accept().await?;
-    let mut request = vec![0_u8; 8192];
-    let length = stream.read(&mut request).await?;
-    let first_line = std::str::from_utf8(&request[..length])?
-        .lines()
-        .next()
-        .context("OAuth callback request is empty")?;
-    let path = first_line
-        .split_whitespace()
-        .nth(1)
-        .context("OAuth callback has no path")?;
-    let url = reqwest::Url::parse(&format!("http://localhost{path}"))?;
+    loop {
+        let (mut stream, _) = listener.accept().await?;
+        let outcome = callback_outcome(&mut stream, expected_state).await;
+        let (status, message) = match &outcome {
+            CallbackOutcome::Complete(Ok(_)) => (
+                "200 OK",
+                "Anthropic authentication complete. You can close this window.",
+            ),
+            CallbackOutcome::Retry | CallbackOutcome::Complete(Err(_)) => (
+                "400 Bad Request",
+                "Anthropic authentication failed. Return to the terminal.",
+            ),
+        };
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{message}",
+            message.len()
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        if let CallbackOutcome::Complete(result) = outcome {
+            return result;
+        }
+    }
+}
+
+enum CallbackOutcome {
+    Retry,
+    Complete(Result<String>),
+}
+
+async fn callback_outcome(stream: &mut TcpStream, expected_state: &str) -> CallbackOutcome {
+    let mut line = String::new();
+    let read = {
+        let reader = BufReader::new(stream);
+        let mut bounded = reader.take((MAX_OAUTH_REQUEST_LINE_BYTES + 1) as u64);
+        tokio::time::timeout(OAUTH_REQUEST_LINE_TIMEOUT, bounded.read_line(&mut line)).await
+    };
+    if !matches!(read, Ok(Ok(length)) if length > 0 && length <= MAX_OAUTH_REQUEST_LINE_BYTES)
+        || !line.ends_with('\n')
+    {
+        return CallbackOutcome::Retry;
+    }
+    let mut parts = line.split_whitespace();
+    if parts.next() != Some("GET") {
+        return CallbackOutcome::Retry;
+    }
+    let Some(path) = parts.next() else {
+        return CallbackOutcome::Retry;
+    };
+    if !matches!(parts.next(), Some("HTTP/1.0" | "HTTP/1.1")) || parts.next().is_some() {
+        return CallbackOutcome::Retry;
+    }
+    let Ok(url) = reqwest::Url::parse(&format!("http://localhost{path}")) else {
+        return CallbackOutcome::Retry;
+    };
+    if url.path() != "/callback" {
+        return CallbackOutcome::Retry;
+    }
     let query = url
         .query_pairs()
         .collect::<std::collections::HashMap<_, _>>();
-    let state = query.get("state").context("OAuth callback has no state")?;
-    let result = if state.as_ref() != expected_state {
-        Err(anyhow::anyhow!("Anthropic OAuth state mismatch"))
-    } else if let Some(error) = query.get("error") {
-        Err(anyhow::anyhow!("Anthropic OAuth failed: {error}"))
-    } else {
-        query
-            .get("code")
-            .map(|code| code.to_string())
-            .context("OAuth callback has no authorization code")
-    };
-    let (status, message) = if result.is_ok() {
-        (
-            "200 OK",
-            "Anthropic authentication complete. You can close this window.",
-        )
-    } else {
-        (
-            "400 Bad Request",
-            "Anthropic authentication failed. Return to the terminal.",
-        )
-    };
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{message}",
-        message.len()
-    );
-    stream.write_all(response.as_bytes()).await?;
-    result
+    if query.get("state").map(|state| state.as_ref()) != Some(expected_state) {
+        return CallbackOutcome::Retry;
+    }
+    if let Some(error) = query.get("error") {
+        return CallbackOutcome::Complete(Err(anyhow::anyhow!("Anthropic OAuth failed: {error}")));
+    }
+    match query.get("code") {
+        Some(code) => CallbackOutcome::Complete(Ok(code.to_string())),
+        None => CallbackOutcome::Retry,
+    }
 }
 
 async fn exchange(
@@ -830,6 +859,137 @@ mod tests {
                 .starts_with("HTTP/1.1 200 OK")
         );
         assert_eq!(callback.await.unwrap().unwrap(), "authorization-code");
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_reads_a_fragmented_request_line() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let callback = tokio::spawn(async move { callback(listener, "expected").await });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(b"GET /callback?code=authorization-")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        client
+            .write_all(b"code&state=expected HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(
+            String::from_utf8(response)
+                .unwrap()
+                .starts_with("HTTP/1.1 200 OK")
+        );
+        assert_eq!(callback.await.unwrap().unwrap(), "authorization-code");
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_ignores_wrong_state_then_accepts_valid_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let callback = tokio::spawn(async move { callback(listener, "expected").await });
+
+        let mut wrong = tokio::net::TcpStream::connect(address).await.unwrap();
+        wrong
+            .write_all(b"GET /callback?code=wrong&state=other HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        wrong.read_to_end(&mut response).await.unwrap();
+        assert!(
+            String::from_utf8(response)
+                .unwrap()
+                .starts_with("HTTP/1.1 400 Bad Request")
+        );
+
+        let mut valid = tokio::net::TcpStream::connect(address).await.unwrap();
+        valid
+            .write_all(b"GET /callback?code=valid&state=expected HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        valid.read_to_end(&mut response).await.unwrap();
+        assert!(
+            String::from_utf8(response)
+                .unwrap()
+                .starts_with("HTTP/1.1 200 OK")
+        );
+        assert_eq!(callback.await.unwrap().unwrap(), "valid");
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_rejects_an_oversized_line_then_accepts_valid_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let callback = tokio::spawn(async move { callback(listener, "expected").await });
+
+        let mut oversized = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            "GET /callback?state=other&padding={} HTTP/1.1\r\n",
+            "x".repeat(MAX_OAUTH_REQUEST_LINE_BYTES)
+        );
+        let _ = oversized.write_all(request.as_bytes()).await;
+        let mut response = Vec::new();
+        oversized.read_to_end(&mut response).await.unwrap();
+        assert!(
+            String::from_utf8(response)
+                .unwrap()
+                .starts_with("HTTP/1.1 400 Bad Request")
+        );
+
+        let mut valid = tokio::net::TcpStream::connect(address).await.unwrap();
+        valid
+            .write_all(b"GET /callback?code=valid&state=expected HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        valid.read_to_end(&mut response).await.unwrap();
+        assert!(
+            String::from_utf8(response)
+                .unwrap()
+                .starts_with("HTTP/1.1 200 OK")
+        );
+        assert_eq!(callback.await.unwrap().unwrap(), "valid");
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_times_out_partial_line_then_accepts_valid_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let callback = tokio::spawn(async move { callback(listener, "expected").await });
+
+        let mut partial = tokio::net::TcpStream::connect(address).await.unwrap();
+        partial
+            .write_all(b"GET /callback?code=stalled&state=expected")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut valid = tokio::net::TcpStream::connect(address).await.unwrap();
+        valid
+            .write_all(b"GET /callback?code=valid&state=expected HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut response = Vec::new();
+        partial.read_to_end(&mut response).await.unwrap();
+        assert!(
+            String::from_utf8(response)
+                .unwrap()
+                .starts_with("HTTP/1.1 400 Bad Request")
+        );
+        let mut response = Vec::new();
+        valid.read_to_end(&mut response).await.unwrap();
+        assert!(
+            String::from_utf8(response)
+                .unwrap()
+                .starts_with("HTTP/1.1 200 OK")
+        );
+        assert_eq!(callback.await.unwrap().unwrap(), "valid");
     }
 
     #[tokio::test]

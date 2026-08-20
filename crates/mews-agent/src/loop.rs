@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -10,9 +12,12 @@ use crate::{
     ToolCall, ToolCatalog, ToolDecision, ToolExecutionMode, ToolProgress, ToolResult,
     TurnCancelled, apply_context_budget, effect_uncertainty,
 };
-use mews_protocol::{AssistantResponse, AssistantResponseBlock, OperationId};
+use mews_protocol::{AssistantResponse, AssistantResponseBlock, OperationId, ToolCatalogSnapshot};
 
 const MAX_TOOL_CALLS_PER_STEP: usize = 64;
+/// Provider tool-call IDs become durable correlation keys. Keep the keys
+/// bounded without depending on any provider's opaque ID format.
+pub const MAX_TOOL_CALL_ID_BYTES: usize = 256;
 const MAX_CONCURRENT_TOOLS: usize = 8;
 
 pub async fn execute_turn(
@@ -53,7 +58,8 @@ async fn execute_turn_inner(
     runtime: &dyn AgentRuntime,
     config: &AgentLoopConfig,
 ) -> Result<String> {
-    let mut request = runtime.request(runtime.tools().await?).await?;
+    let mut catalog = runtime.tools().await?;
+    let mut request = runtime.request(catalog.tools.clone()).await?;
     if let Some(cursor) = &request.continuation {
         let compatible = matches!(provider.continuation_capability(&request.model),
             crate::ContinuationCapability::ResponseId { provider, api }
@@ -67,20 +73,36 @@ async fn execute_turn_inner(
         }
     }
     let mut final_text = String::new();
+    let mut accepted_call_ids = HashSet::new();
 
     for step in 0..config.max_steps {
         config.cancellation.check()?;
         if step > 0 {
-            request.tools = runtime.tools().await?;
+            catalog = runtime.tools().await?;
+            request.tools.clone_from(&catalog.tools);
         }
         inject(runtime, &mut request, runtime.steering_messages().await?).await?;
         runtime.transform_context(&mut request).await?;
         runtime.before_model(&mut request).await?;
         apply_context_budget(&mut request)?;
-        let tools = ToolCatalog::compile(request.tools.clone())?;
+        ensure_catalog_tools(&catalog, &request.tools)?;
+        let tools = ToolCatalog::compile(ToolCatalogSnapshot {
+            generation: catalog.generation,
+            tools: request.tools.clone(),
+        })?;
 
-        let (response, calls) =
+        let (response, mut calls) =
             stream_response(provider, runtime, &request, &config.cancellation).await?;
+        if calls.len() > MAX_TOOL_CALLS_PER_STEP {
+            bail!(
+                "provider returned {} tool calls; the per-step limit is {MAX_TOOL_CALLS_PER_STEP}",
+                calls.len()
+            );
+        }
+        validate_tool_call_ids(&calls, &accepted_call_ids)?;
+        for call in &mut calls {
+            call.catalog_generation = tools.generation();
+        }
         // A response cursor identifies the response that was current when this Turn began. Once
         // the provider has produced a new response, reusing that cursor would branch subsequent
         // tool-loop steps from stale state. The accumulated messages are the canonical fallback.
@@ -132,8 +154,12 @@ async fn execute_turn_inner(
             }
         }
         runtime
-            .event(AgentEvent::AssistantResponse(response))
+            .event(AgentEvent::AssistantResponse {
+                response,
+                calls: calls.clone(),
+            })
             .await?;
+        accepted_call_ids.extend(calls.iter().map(|call| call.id.clone()));
 
         let BatchOutcome {
             mut completed,
@@ -222,6 +248,22 @@ async fn execute_turn_inner(
     .context("model/tool loop did not finish")
 }
 
+fn validate_tool_call_ids(calls: &[ToolCall], accepted: &HashSet<String>) -> Result<()> {
+    let mut ids = HashSet::with_capacity(calls.len());
+    for call in calls {
+        if call.id.is_empty() {
+            bail!("provider returned a tool call with an empty ID");
+        }
+        if call.id.len() > MAX_TOOL_CALL_ID_BYTES {
+            bail!("provider returned a tool-call ID longer than {MAX_TOOL_CALL_ID_BYTES} bytes");
+        }
+        if accepted.contains(call.id.as_str()) || !ids.insert(call.id.as_str()) {
+            bail!("provider returned duplicate tool-call ID {:?}", call.id);
+        }
+    }
+    Ok(())
+}
+
 async fn stream_response(
     provider: &dyn Provider,
     runtime: &dyn AgentRuntime,
@@ -229,7 +271,7 @@ async fn stream_response(
     cancellation: &CancellationToken,
 ) -> Result<(AssistantResponse, Vec<ToolCall>)> {
     let mut cursor_active = request.continuation.is_some();
-    let initial = start_provider_stream(provider, runtime, request.clone()).await;
+    let initial = start_provider_stream(provider, runtime, request.clone(), cancellation).await;
     let (mut stream, mut provider_operation) = match initial {
         Err(error)
             if request.continuation.is_some()
@@ -239,7 +281,7 @@ async fn stream_response(
                 ) =>
         {
             cursor_active = false;
-            start_provider_stream(provider, runtime, full_replay(request)?).await?
+            start_provider_stream(provider, runtime, full_replay(request)?, cancellation).await?
         }
         result => result?,
     };
@@ -299,7 +341,8 @@ async fn stream_response(
                 .await?;
                 cursor_active = false;
                 (stream, provider_operation) =
-                    start_provider_stream(provider, runtime, full_replay(request)?).await?;
+                    start_provider_stream(provider, runtime, full_replay(request)?, cancellation)
+                        .await?;
                 continue;
             }
             Err(error) => {
@@ -370,6 +413,7 @@ async fn stream_response(
                     name,
                     arguments,
                     thought_signature,
+                    catalog_generation: 0,
                 });
                 let call = calls.last().expect("tool call was just pushed");
                 response.blocks.push(AssistantResponseBlock::ToolCall {
@@ -426,9 +470,24 @@ async fn start_provider_stream(
     provider: &dyn Provider,
     runtime: &dyn AgentRuntime,
     request: ModelRequest,
+    cancellation: &CancellationToken,
 ) -> Result<(ModelStream, Option<OperationId>)> {
+    cancellation.check()?;
     let mut operation_id = runtime.provider_call_started(&request).await?;
-    match provider.stream(request).await {
+    let result = tokio::select! {
+        _ = cancellation.cancelled() => {
+            finish_provider_call(
+                runtime,
+                &mut operation_id,
+                ProviderCallOutcome::Uncertain(
+                    "provider call was cancelled after dispatch".into(),
+                ),
+            ).await?;
+            return Err(TurnCancelled.into());
+        }
+        result = provider.stream(request) => result,
+    };
+    match result {
         Ok(stream) => Ok((stream, operation_id)),
         Err(error) => {
             finish_provider_call(runtime, &mut operation_id, provider_error_outcome(&error))
@@ -485,25 +544,70 @@ async fn prepare_and_execute(
     tools: &ToolCatalog,
     config: &AgentLoopConfig,
 ) -> Result<BatchOutcome> {
-    if calls.len() > MAX_TOOL_CALLS_PER_STEP {
-        bail!(
-            "provider returned {} tool calls; the per-step limit is {MAX_TOOL_CALLS_PER_STEP}",
-            calls.len()
-        );
-    }
     let mut prepared = Vec::new();
-    for mut call in calls {
-        config.cancellation.check()?;
-        let decision = runtime.before_tool(&mut call).await?;
-        runtime.event(AgentEvent::ToolCall(call.clone())).await?;
-        let result = match decision {
-            ToolDecision::Block(reason) => Some(ToolResult::error(reason)),
-            ToolDecision::Allow => tools.validate(&call).err().map(ToolResult::error),
+    let mut terminal_error = None;
+    let mut preparation_cancelled = false;
+    for call in calls {
+        let result = if preparation_cancelled || config.cancellation.is_cancelled() {
+            if terminal_error.is_none() {
+                terminal_error = Some(anyhow::Error::from(TurnCancelled));
+            }
+            preparation_cancelled = true;
+            Some(ToolResult::error(
+                "tool call did not start because the Turn was cancelled",
+            ))
+        } else if terminal_error.is_some() {
+            Some(ToolResult::error(
+                "tool call did not start because preparation stopped",
+            ))
+        } else if let Err(error) = tools.validate(&call) {
+            Some(ToolResult::error(error))
+        } else {
+            match runtime.before_tool(&call).await {
+                Ok(ToolDecision::Block(reason)) => Some(ToolResult::error(reason)),
+                Ok(ToolDecision::Allow) => None,
+                Err(error) => {
+                    let result = match effect_uncertainty(&error) {
+                        Some(uncertain) => {
+                            let reason = uncertain.reason().to_owned();
+                            terminal_error = Some(error);
+                            ToolResult::uncertain(format!(
+                                "before_tool outcome is uncertain: {}",
+                                reason
+                            ))
+                        }
+                        None if crate::is_turn_cancelled(&error) => {
+                            terminal_error = Some(error);
+                            preparation_cancelled = true;
+                            ToolResult::error("before_tool was cancelled")
+                        }
+                        None => ToolResult::error(format!("before_tool failed: {error:#}")),
+                    };
+                    Some(result)
+                }
+            }
         };
         prepared.push(match result {
             Some(result) => Prepared::Immediate(call, result),
             None => Prepared::Execute(call),
         });
+    }
+
+    if terminal_error.is_some() {
+        prepared = prepared
+            .into_iter()
+            .map(|item| match item {
+                Prepared::Immediate(call, result) => Prepared::Immediate(call, result),
+                Prepared::Execute(call) => Prepared::Immediate(
+                    call,
+                    ToolResult::error(if preparation_cancelled {
+                        "tool call did not start because the Turn was cancelled"
+                    } else {
+                        "tool call did not start because preparation stopped"
+                    }),
+                ),
+            })
+            .collect();
     }
 
     match config.tool_execution {
@@ -522,7 +626,7 @@ async fn prepare_and_execute(
             }
             Ok(BatchOutcome {
                 completed,
-                terminal_error: None,
+                terminal_error,
             })
         }
         ToolExecutionMode::Parallel => {
@@ -532,20 +636,38 @@ async fn prepare_and_execute(
                 .collect::<Vec<_>>()
                 .await;
             let mut completed = Vec::new();
-            let mut terminal_error = None;
+            let mut execution_error = terminal_error;
             for outcome in outcomes {
                 match outcome {
                     Ok(result) => completed.push(result),
-                    Err(error) if terminal_error.is_none() => terminal_error = Some(error),
+                    Err(error) if execution_error.is_none() => execution_error = Some(error),
                     Err(_) => {}
                 }
             }
             Ok(BatchOutcome {
                 completed,
-                terminal_error,
+                terminal_error: execution_error,
             })
         }
     }
+}
+
+fn ensure_catalog_tools(
+    catalog: &ToolCatalogSnapshot,
+    visible: &[mews_protocol::ToolDefinition],
+) -> Result<()> {
+    for tool in visible {
+        let Some(source) = catalog.tools.iter().find(|source| source.name == tool.name) else {
+            bail!("before_model introduced unavailable tool {:?}", tool.name);
+        };
+        if source != tool {
+            bail!(
+                "before_model changed the definition of tool {:?}",
+                tool.name
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn execute_prepared(
@@ -699,10 +821,168 @@ mod tests {
         uncertain_tools: AtomicBool,
         cancel_after_first_tool: AtomicBool,
         fail_after_tool: AtomicBool,
+        fail_before_tool: AtomicBool,
+        uncertain_before_tool: AtomicBool,
+        before_tool_calls: AtomicUsize,
+        cancel_on_response: Mutex<Option<CancellationToken>>,
         transform_after_tool: AtomicBool,
         after_steps: AtomicUsize,
         turns_finished: AtomicUsize,
         fail_turn_start: AtomicBool,
+    }
+
+    struct StoreRuntime {
+        store: mews_store::Store,
+        session_id: mews_protocol::SessionId,
+        turn_id: mews_protocol::TurnId,
+    }
+
+    impl StoreRuntime {
+        fn new() -> Self {
+            let mut store = mews_store::Store::open_in_memory().unwrap();
+            let installation = store
+                .initialize(
+                    &mews_store::CommandContext::system(),
+                    "test-host",
+                    "test-public-key",
+                    "test-noise-key",
+                    "test-installation-key",
+                )
+                .unwrap();
+            let (agent, _) = store
+                .create_agent(
+                    &mews_store::CommandContext::system(),
+                    "tool-id-test",
+                    "Test agent",
+                    "harness = \"mews\"\ntools = [\"work\"]\n",
+                    &installation.hub_host_id,
+                )
+                .unwrap();
+            let session = store
+                .create_session(
+                    &agent.id,
+                    &installation.hub_host_id,
+                    std::path::Path::new("/tmp"),
+                )
+                .unwrap();
+            let source = mews_protocol::MessageSource {
+                kind: mews_protocol::SourceKind::Client,
+                id: "tool-id-test".into(),
+                channel_origin: None,
+            };
+            let content = mews_protocol::MessageContent::Text {
+                text: "test".into(),
+            };
+            let (turn, _, _) = store
+                .accept_turn_idempotent(
+                    &session.id,
+                    "tool-id-test",
+                    content.clone(),
+                    content,
+                    Value::Null,
+                    source,
+                )
+                .unwrap();
+            Self {
+                store,
+                session_id: session.id,
+                turn_id: turn.id,
+            }
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl AgentRuntime for StoreRuntime {
+        async fn request(&self, tools: Vec<ToolDefinition>) -> Result<ModelRequest> {
+            Ok(ModelRequest {
+                model: "test/model".into(),
+                reasoning: None,
+                system: String::new(),
+                messages: Vec::new(),
+                tools,
+                continuation: None,
+            })
+        }
+
+        async fn tools(&self) -> Result<ToolCatalogSnapshot> {
+            Ok(ToolCatalogSnapshot {
+                generation: 1,
+                tools: vec![ToolDefinition {
+                    name: "work".into(),
+                    description: "Work".into(),
+                    schema: json!({"type":"object"}),
+                    agent_id: None,
+                }],
+            })
+        }
+
+        async fn execute(
+            &self,
+            call: &ToolCall,
+            _: &CancellationToken,
+            _: &dyn ProgressReporter,
+        ) -> Result<ToolResult> {
+            Ok(ToolResult::success(json!({"id": call.id})))
+        }
+
+        async fn event(&self, event: AgentEvent) -> Result<()> {
+            match event {
+                AgentEvent::AssistantResponse { response, calls } => {
+                    self.store.append_assistant_response_with_tool_calls(
+                        &self.session_id,
+                        &self.turn_id,
+                        response,
+                        calls.into_iter().map(stored_call).collect(),
+                    )?;
+                }
+                AgentEvent::ToolExecutionStarted(call) => {
+                    self.store.start_tool_effect(
+                        &self.session_id,
+                        &self.turn_id,
+                        stored_call(call),
+                    )?;
+                }
+                AgentEvent::ToolExecutionCompleted { call, result } => {
+                    self.store.complete_tool_execution(
+                        &self.session_id,
+                        &self.turn_id,
+                        stored_result(call, result),
+                    )?;
+                }
+                AgentEvent::ToolResultRecorded { call, result } => {
+                    self.store.append_tool_result(
+                        &self.session_id,
+                        &self.turn_id,
+                        stored_result(call, result),
+                    )?;
+                }
+                AgentEvent::MessageInjected(_) => {}
+            }
+            Ok(())
+        }
+
+        async fn signal(&self, _: AgentSignal) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn stored_call(call: ToolCall) -> mews_protocol::ToolCall {
+        mews_protocol::ToolCall {
+            call_id: call.id,
+            tool: call.name,
+            arguments: call.arguments,
+            thought_signature: call.thought_signature,
+        }
+    }
+
+    fn stored_result(call: ToolCall, result: ToolResult) -> mews_protocol::ToolResult {
+        mews_protocol::ToolResult {
+            call_id: call.id,
+            tool: call.name,
+            result: result.value,
+            is_error: result.is_error,
+            uncertain: result.uncertain,
+        }
     }
 
     impl Runtime {
@@ -720,6 +1000,10 @@ mod tests {
                 uncertain_tools: AtomicBool::new(false),
                 cancel_after_first_tool: AtomicBool::new(false),
                 fail_after_tool: AtomicBool::new(false),
+                fail_before_tool: AtomicBool::new(false),
+                uncertain_before_tool: AtomicBool::new(false),
+                before_tool_calls: AtomicUsize::new(0),
+                cancel_on_response: Mutex::new(None),
                 transform_after_tool: AtomicBool::new(false),
                 after_steps: AtomicUsize::new(0),
                 turns_finished: AtomicUsize::new(0),
@@ -746,14 +1030,17 @@ mod tests {
                 continuation: None,
             })
         }
-        async fn tools(&self) -> Result<Vec<ToolDefinition>> {
+        async fn tools(&self) -> Result<ToolCatalogSnapshot> {
             self.tool_snapshots.fetch_add(1, Ordering::SeqCst);
-            Ok(vec![ToolDefinition {
-                name: "work".into(),
-                description: "work".into(),
-                schema: json!({"type":"object","properties":{"value":{"type":"integer"}},"required":["value"]}),
-                agent_id: None,
-            }])
+            Ok(ToolCatalogSnapshot {
+                generation: 1,
+                tools: vec![ToolDefinition {
+                    name: "work".into(),
+                    description: "work".into(),
+                    schema: json!({"type":"object","properties":{"value":{"type":"integer"}},"required":["value"]}),
+                    agent_id: None,
+                }],
+            })
         }
         async fn execute(
             &self,
@@ -779,6 +1066,11 @@ mod tests {
             Ok(result)
         }
         async fn event(&self, event: AgentEvent) -> Result<()> {
+            if matches!(event, AgentEvent::AssistantResponse { .. })
+                && let Some(cancellation) = self.cancel_on_response.lock().unwrap().take()
+            {
+                cancellation.cancel();
+            }
             self.events.lock().unwrap().push(event);
             Ok(())
         }
@@ -816,6 +1108,16 @@ mod tests {
         async fn after_step(&self, _: &ModelRequest) -> Result<StepDecision> {
             self.after_steps.fetch_add(1, Ordering::SeqCst);
             Ok(StepDecision::Continue)
+        }
+        async fn before_tool(&self, _: &ToolCall) -> Result<ToolDecision> {
+            self.before_tool_calls.fetch_add(1, Ordering::SeqCst);
+            if self.uncertain_before_tool.swap(false, Ordering::SeqCst) {
+                return Err(EffectUncertain::new("before-tool reply was lost").into());
+            }
+            if self.fail_before_tool.load(Ordering::SeqCst) {
+                bail!("before-tool hook failed");
+            }
+            Ok(ToolDecision::Allow)
         }
         async fn after_tool(&self, _: &ToolCall, result: &mut ToolResult) -> Result<()> {
             if self.fail_after_tool.load(Ordering::SeqCst) {
@@ -911,7 +1213,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|event| !matches!(event, AgentEvent::AssistantResponse(_)))
+                .all(|event| !matches!(event, AgentEvent::AssistantResponse { .. }))
         );
         assert!(matches!(
             runtime.provider_outcomes.lock().unwrap().as_slice(),
@@ -1105,8 +1407,8 @@ mod tests {
             Ok(request)
         }
 
-        async fn tools(&self) -> Result<Vec<ToolDefinition>> {
-            Ok(Vec::new())
+        async fn tools(&self) -> Result<ToolCatalogSnapshot> {
+            Ok(ToolCatalogSnapshot::default())
         }
 
         async fn execute(
@@ -1341,7 +1643,7 @@ mod tests {
         assert_eq!(runtime.max_active.load(Ordering::SeqCst), 2);
         assert_eq!(runtime.tool_snapshots.load(Ordering::SeqCst), 2);
         assert!(runtime.events.lock().unwrap().iter().any(|event| {
-            matches!(event, AgentEvent::AssistantResponse(response)
+            matches!(event, AgentEvent::AssistantResponse { response, .. }
                 if response.blocks.iter().any(|block| matches!(block,
                     AssistantResponseBlock::OpaqueState { data, .. } if data["opaque"] == "state")))
         }));
@@ -1379,6 +1681,316 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(runtime.max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_tool_batch_is_rejected_before_response_durability() {
+        let runtime = Runtime::new();
+        let provider = TestProvider {
+            turn: AtomicUsize::new(0),
+            first: std::iter::once(ModelStreamEvent::Start)
+                .chain(
+                    (0..=MAX_TOOL_CALLS_PER_STEP).map(|index| ModelStreamEvent::ToolCall {
+                        id: index.to_string(),
+                        name: "work".into(),
+                        arguments: json!({"value": index}),
+                        thought_signature: None,
+                    }),
+                )
+                .chain([
+                    ModelStreamEvent::ResponseCompleted {
+                        usage: None,
+                        stop_reason: None,
+                    },
+                    ModelStreamEvent::Done,
+                ])
+                .collect(),
+            later: text_events(),
+        };
+
+        let error = execute_turn(&provider, &runtime, 4).await.unwrap_err();
+
+        assert!(error.to_string().contains("per-step limit"));
+        assert!(
+            runtime
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| !matches!(event, AgentEvent::AssistantResponse { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_call_ids_are_rejected_before_response_durability() {
+        for (ids, detail) in [
+            (vec![String::new()], "empty ID"),
+            (
+                vec!["x".repeat(MAX_TOOL_CALL_ID_BYTES + 1)],
+                "longer than 256 bytes",
+            ),
+            (vec!["same".into(), "same".into()], "duplicate tool-call ID"),
+        ] {
+            let runtime = Runtime::new();
+            let provider = TestProvider {
+                turn: AtomicUsize::new(0),
+                first: std::iter::once(ModelStreamEvent::Start)
+                    .chain(ids.into_iter().map(|id| ModelStreamEvent::ToolCall {
+                        id,
+                        name: "work".into(),
+                        arguments: json!({"value": 1}),
+                        thought_signature: None,
+                    }))
+                    .chain([
+                        ModelStreamEvent::ResponseCompleted {
+                            usage: None,
+                            stop_reason: Some("tool_use".into()),
+                        },
+                        ModelStreamEvent::Done,
+                    ])
+                    .collect(),
+                later: text_events(),
+            };
+
+            let error = execute_turn(&provider, &runtime, 4).await.unwrap_err();
+
+            assert!(error.to_string().contains(detail), "{error:#}");
+            assert_eq!(runtime.executed.load(Ordering::SeqCst), 0);
+            assert!(runtime.events.lock().unwrap().iter().all(|event| {
+                !matches!(
+                    event,
+                    AgentEvent::AssistantResponse { .. }
+                        | AgentEvent::ToolExecutionStarted(_)
+                        | AgentEvent::ToolResultRecorded { .. }
+                )
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_tool_call_ids_leave_store_replay_unchanged() {
+        let runtime = StoreRuntime::new();
+        let provider = TestProvider {
+            turn: AtomicUsize::new(0),
+            first: vec![
+                ModelStreamEvent::Start,
+                ModelStreamEvent::ToolCall {
+                    id: "same".into(),
+                    name: "work".into(),
+                    arguments: json!({}),
+                    thought_signature: None,
+                },
+                ModelStreamEvent::ToolCall {
+                    id: "same".into(),
+                    name: "work".into(),
+                    arguments: json!({}),
+                    thought_signature: None,
+                },
+                ModelStreamEvent::ResponseCompleted {
+                    usage: None,
+                    stop_reason: Some("tool_use".into()),
+                },
+                ModelStreamEvent::Done,
+            ],
+            later: text_events(),
+        };
+
+        let error = execute_turn(&provider, &runtime, 4).await.unwrap_err();
+
+        assert!(error.to_string().contains("duplicate tool-call ID"));
+        let entries = runtime.store.session_entries(&runtime.session_id).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            entries[0].payload,
+            mews_protocol::SessionEntryPayload::UserMessage { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn turn_scoped_tool_call_ids_keep_store_replay_paired() {
+        let runtime = StoreRuntime::new();
+        let call_events = || {
+            vec![
+                ModelStreamEvent::Start,
+                ModelStreamEvent::ToolCall {
+                    id: "same".into(),
+                    name: "work".into(),
+                    arguments: json!({}),
+                    thought_signature: None,
+                },
+                ModelStreamEvent::ResponseCompleted {
+                    usage: None,
+                    stop_reason: Some("tool_use".into()),
+                },
+                ModelStreamEvent::Done,
+            ]
+        };
+        let provider = TestProvider {
+            turn: AtomicUsize::new(0),
+            first: call_events(),
+            later: call_events(),
+        };
+
+        let error = execute_turn(&provider, &runtime, 4).await.unwrap_err();
+
+        assert!(error.to_string().contains("duplicate tool-call ID"));
+        assert_eq!(provider.turn.load(Ordering::SeqCst), 2);
+        runtime
+            .store
+            .finish_turn(
+                &runtime.turn_id,
+                mews_protocol::TurnStatus::Failed,
+                Some("provider reused a tool-call ID"),
+            )
+            .unwrap();
+        let entries = runtime.store.session_entries(&runtime.session_id).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| matches!(
+                    entry.payload,
+                    mews_protocol::SessionEntryPayload::AssistantResponse { .. }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| matches!(
+                    entry.payload,
+                    mews_protocol::SessionEntryPayload::ToolStarted { .. }
+                ))
+                .count(),
+            1
+        );
+
+        let active = runtime.store.active_entries(&runtime.session_id).unwrap();
+        let replay = mews_protocol::portable_history(&active);
+        let calls = replay
+            .iter()
+            .filter_map(|item| match &item.content {
+                mews_protocol::MessageContent::ToolCall { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let results = replay
+            .iter()
+            .filter_map(|item| match &item.content {
+                mews_protocol::MessageContent::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls, ["same"]);
+        assert_eq!(results, calls);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_response_pairs_every_registered_call() {
+        let runtime = Runtime::new();
+        let cancellation = CancellationToken::new();
+        *runtime.cancel_on_response.lock().unwrap() = Some(cancellation.clone());
+        let provider = TestProvider {
+            turn: AtomicUsize::new(0),
+            first: tool_events(),
+            later: text_events(),
+        };
+
+        let error = execute_turn_with_config(
+            &provider,
+            &runtime,
+            AgentLoopConfig {
+                cancellation,
+                ..AgentLoopConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(crate::is_turn_cancelled(&error));
+        let events = runtime.events.lock().unwrap();
+        let registered = events.iter().find_map(|event| match event {
+            AgentEvent::AssistantResponse { calls, .. } => Some(
+                calls
+                    .iter()
+                    .map(|call| call.id.as_str())
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        });
+        let completed = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolResultRecorded { call, .. } => Some(call.id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(registered.unwrap(), completed);
+    }
+
+    #[tokio::test]
+    async fn before_tool_failures_are_paired_call_errors() {
+        let runtime = Runtime::new();
+        runtime.fail_before_tool.store(true, Ordering::SeqCst);
+        let provider = TestProvider {
+            turn: AtomicUsize::new(0),
+            first: tool_events(),
+            later: text_events(),
+        };
+
+        assert_eq!(execute_turn(&provider, &runtime, 4).await.unwrap(), "done");
+        let events = runtime.events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolResultRecorded { result, .. } if result.is_error))
+                .count(),
+            2
+        );
+        assert_eq!(runtime.before_tool_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn uncertain_before_tool_stops_later_preparation_without_claiming_cancellation() {
+        let runtime = Runtime::new();
+        runtime.uncertain_before_tool.store(true, Ordering::SeqCst);
+        let provider = TestProvider {
+            turn: AtomicUsize::new(0),
+            first: tool_events(),
+            later: text_events(),
+        };
+
+        let error = execute_turn(&provider, &runtime, 4).await.unwrap_err();
+
+        assert!(effect_uncertainty(&error).is_some());
+        assert_eq!(runtime.before_tool_calls.load(Ordering::SeqCst), 1);
+        let events = runtime.events.lock().unwrap();
+        let results = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolResultRecorded { call, result } => {
+                    Some((call.id.as_str(), &result.value, result.uncertain))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0],
+            (
+                "a",
+                &json!("before_tool outcome is uncertain: before-tool reply was lost"),
+                true
+            )
+        );
+        assert_eq!(
+            results[1],
+            (
+                "b",
+                &json!("tool call did not start because preparation stopped"),
+                false
+            )
+        );
     }
 
     #[tokio::test]
@@ -1563,6 +2175,7 @@ mod tests {
         };
         assert_eq!(execute_turn(&provider, &runtime, 4).await.unwrap(), "done");
         assert_eq!(runtime.executed.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.before_tool_calls.load(Ordering::SeqCst), 0);
         assert!(
             runtime
                 .events
@@ -1680,6 +2293,73 @@ mod tests {
         assert_eq!(runtime.turns_finished.load(Ordering::SeqCst), 1);
     }
 
+    struct PendingStartupProvider {
+        started: std::sync::Arc<tokio::sync::Notify>,
+        dropped: std::sync::Arc<AtomicBool>,
+    }
+
+    struct StartupGuard(std::sync::Arc<AtomicBool>);
+
+    impl Drop for StartupGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for PendingStartupProvider {
+        async fn generate(
+            &self,
+            _request: ModelRequest,
+        ) -> std::result::Result<ModelResponse, ProviderError> {
+            unreachable!()
+        }
+
+        async fn stream(
+            &self,
+            _request: ModelRequest,
+        ) -> std::result::Result<crate::ModelStream, ProviderError> {
+            let _guard = StartupGuard(self.dropped.clone());
+            self.started.notify_one();
+            futures_util::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_pending_provider_startup() {
+        let runtime = Runtime::new();
+        let cancellation = CancellationToken::new();
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let dropped = std::sync::Arc::new(AtomicBool::new(false));
+        let provider = PendingStartupProvider {
+            started: started.clone(),
+            dropped: dropped.clone(),
+        };
+        let trigger = cancellation.clone();
+        tokio::spawn(async move {
+            started.notified().await;
+            trigger.cancel();
+        });
+
+        let error = execute_turn_with_config(
+            &provider,
+            &runtime,
+            AgentLoopConfig {
+                cancellation,
+                ..AgentLoopConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(crate::is_turn_cancelled(&error));
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(matches!(
+            runtime.provider_outcomes.lock().unwrap().as_slice(),
+            [ProviderCallOutcome::Uncertain(_)]
+        ));
+    }
+
     struct RecordingProvider(Mutex<Vec<ModelRequest>>);
 
     #[async_trait::async_trait]
@@ -1731,8 +2411,8 @@ mod tests {
                 }),
             })
         }
-        async fn tools(&self) -> Result<Vec<ToolDefinition>> {
-            Ok(Vec::new())
+        async fn tools(&self) -> Result<ToolCatalogSnapshot> {
+            Ok(ToolCatalogSnapshot::default())
         }
         async fn execute(
             &self,

@@ -34,11 +34,18 @@ pub struct ToolRegistry {
 }
 
 struct RegistryInner {
-    tools: RwLock<Tools>,
-    catalog: tokio::sync::watch::Sender<Vec<mews_protocol::ToolDefinition>>,
+    state: RwLock<RegistryState>,
+    catalog: tokio::sync::watch::Sender<mews_protocol::ToolCatalogSnapshot>,
+    extension_fingerprint: RwLock<Option<String>>,
     root: Option<PathBuf>,
-    hooks: RwLock<Vec<ExternalHook>>,
     acp_pool: mews_acp::AcpRuntimePool,
+}
+
+#[derive(Clone, Default)]
+struct RegistryState {
+    generation: u64,
+    tools: Tools,
+    hooks: Vec<ExternalHook>,
 }
 
 /// Native tools are shared; extension tools and hooks are owned by one Agent.
@@ -50,13 +57,14 @@ struct Tools {
 
 impl Default for ToolRegistry {
     fn default() -> Self {
-        let (catalog, _) = tokio::sync::watch::channel(Vec::new());
+        let (catalog, _) =
+            tokio::sync::watch::channel(mews_protocol::ToolCatalogSnapshot::default());
         Self {
             inner: Arc::new(RegistryInner {
-                tools: RwLock::new(Tools::default()),
+                state: RwLock::new(RegistryState::default()),
                 catalog,
+                extension_fingerprint: RwLock::new(None),
                 root: None,
-                hooks: RwLock::new(Vec::new()),
                 acp_pool: mews_acp::AcpRuntimePool::default(),
             }),
         }
@@ -91,24 +99,37 @@ impl ToolRegistry {
     }
 
     pub async fn watch_agent_extensions(&self, root: PathBuf) {
-        let mut fingerprint = String::new();
         loop {
             // A short-lived in-process Host owns one watcher; let it finish
             // when the Host link and every other registry handle are gone.
             if Arc::strong_count(&self.inner) == 1 {
                 return;
             }
-            if let Ok(next) = resource_fingerprint(&root)
-                && next != fingerprint
-                && self.reload_extensions(&root).is_ok()
-            {
-                fingerprint = next;
-            }
+            let _ = self.reload_agent_extensions_if_changed(&root);
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
 
-    fn reload_extensions(&self, root: &Path) -> Result<()> {
+    fn reload_agent_extensions_if_changed(&self, root: &Path) -> Result<bool> {
+        let next = resource_fingerprint(root)?;
+        if self
+            .inner
+            .extension_fingerprint
+            .read()
+            .expect("extension fingerprint poisoned")
+            .as_ref()
+            == Some(&next)
+        {
+            return Ok(false);
+        }
+        self.reload_extensions(root)?;
+        Ok(true)
+    }
+
+    fn reload_extensions(&self, root: &Path) -> Result<String> {
+        // Keep the fingerprint from before the load. If a file changes while
+        // loading, the watcher observes the newer fingerprint and reloads it.
+        let fingerprint = resource_fingerprint(root)?;
         let extensions = runtime_extensions(root)?;
         let mut tools = BTreeMap::new();
         for extension in &extensions {
@@ -133,8 +154,7 @@ impl ToolRegistry {
                 }
             }
         }
-        self.apply_extensions(tools)?;
-        *self.inner.hooks.write().expect("extension hooks poisoned") = extensions
+        let hooks = extensions
             .into_iter()
             .flat_map(|extension| {
                 extension.hooks.into_iter().map(move |hook| ExternalHook {
@@ -145,23 +165,46 @@ impl ToolRegistry {
                 })
             })
             .collect();
-        Ok(())
+        self.apply_extensions(tools, hooks)?;
+        *self
+            .inner
+            .extension_fingerprint
+            .write()
+            .expect("extension fingerprint poisoned") = Some(fingerprint.clone());
+        Ok(fingerprint)
     }
 
+    #[cfg(test)]
     pub async fn execute_hooks(
+        &self,
+        agent_id: &mews_protocol::AgentId,
+        hook: &str,
+        payload: Value,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Value> {
+        self.execute_hooks_at_generation(agent_id, hook, payload, cwd, cancellation, None)
+            .await
+    }
+
+    pub async fn execute_hooks_at_generation(
         &self,
         agent_id: &mews_protocol::AgentId,
         hook: &str,
         mut payload: Value,
         cwd: &Path,
         cancellation: &CancellationToken,
+        catalog_generation: Option<u64>,
     ) -> Result<Value> {
-        let hooks = self
-            .inner
-            .hooks
-            .read()
-            .expect("extension hooks poisoned")
-            .clone();
+        let hooks = {
+            let state = self.inner.state.read().expect("tool registry poisoned");
+            if let Some(generation) = catalog_generation
+                && generation != state.generation
+            {
+                bail!("tool catalog changed before its hook could run; retry with the new catalog");
+            }
+            state.hooks.clone()
+        };
         for extension in hooks
             .into_iter()
             .filter(|item| &item.agent_id == agent_id && item.hook == hook)
@@ -183,24 +226,25 @@ impl ToolRegistry {
     /// separate so external Harnesses receive only extension tools through MCP.
     fn register(&self, agent_id: mews_protocol::AgentId, tool: impl Tool + 'static) {
         let name = tool.name().to_owned();
-        self.inner
+        let mut state = self.inner.state.write().expect("tool registry poisoned");
+        state
             .tools
-            .write()
-            .expect("tool registry poisoned")
             .extensions
             .insert((agent_id.to_string(), name), Arc::new(tool));
-        self.publish_catalog();
+        state.generation += 1;
+        let snapshot = snapshot(&state);
+        drop(state);
+        self.inner.catalog.send_replace(snapshot);
     }
 
     fn register_native(&self, tool: impl Tool + 'static) {
         let name = tool.name().to_owned();
-        self.inner
-            .tools
-            .write()
-            .expect("tool registry poisoned")
-            .native
-            .insert(name, Arc::new(tool));
-        self.publish_catalog();
+        let mut state = self.inner.state.write().expect("tool registry poisoned");
+        state.tools.native.insert(name, Arc::new(tool));
+        state.generation += 1;
+        let snapshot = snapshot(&state);
+        drop(state);
+        self.inner.catalog.send_replace(snapshot);
     }
 
     fn restore_default(&self, name: &str) -> bool {
@@ -217,14 +261,16 @@ impl ToolRegistry {
     fn apply_extensions(
         &self,
         manifests: BTreeMap<(String, String), ExtensionManifest>,
+        hooks: Vec<ExternalHook>,
     ) -> Result<()> {
         let candidate = Self::with_defaults();
         for manifest in manifests.into_values() {
             if candidate
                 .inner
-                .tools
+                .state
                 .read()
                 .expect("tool registry poisoned")
+                .tools
                 .native
                 .contains_key(&manifest.name)
             {
@@ -237,32 +283,58 @@ impl ToolRegistry {
             candidate.register(agent_id, ExternalTool(manifest));
         }
         let definitions = candidate.definitions();
+        let next_generation = self
+            .inner
+            .state
+            .read()
+            .expect("tool registry poisoned")
+            .generation
+            + 1;
+        let candidate_snapshot = mews_protocol::ToolCatalogSnapshot {
+            generation: next_generation,
+            tools: definitions,
+        };
         mews_protocol::encode(mews_protocol::HostToHub::ToolCatalogChanged {
-            tools: definitions.clone(),
+            tools: candidate_snapshot.clone(),
         })?;
         let tools = candidate
             .inner
-            .tools
+            .state
             .read()
             .expect("tool registry poisoned")
+            .tools
             .clone();
-        *self.inner.tools.write().expect("tool registry poisoned") = tools;
-        self.inner.catalog.send_replace(definitions);
+        let mut state = self.inner.state.write().expect("tool registry poisoned");
+        state.generation += 1;
+        state.tools = tools;
+        state.hooks = hooks;
+        let snapshot = snapshot(&state);
+        drop(state);
+        self.inner.catalog.send_replace(snapshot);
         Ok(())
     }
 
     pub fn names(&self) -> Vec<String> {
-        let tools = self.inner.tools.read().expect("tool registry poisoned");
-        tools
+        let state = self.inner.state.read().expect("tool registry poisoned");
+        state
+            .tools
             .native
             .keys()
-            .chain(tools.extensions.keys().map(|(_, name)| name))
+            .chain(state.tools.extensions.keys().map(|(_, name)| name))
             .cloned()
             .collect()
     }
 
     pub fn definitions(&self) -> Vec<mews_protocol::ToolDefinition> {
-        let tools = self.inner.tools.read().expect("tool registry poisoned");
+        self.snapshot().tools
+    }
+
+    pub fn snapshot(&self) -> mews_protocol::ToolCatalogSnapshot {
+        let state = self.inner.state.read().expect("tool registry poisoned");
+        snapshot(&state)
+    }
+
+    fn definitions_from(tools: &Tools) -> Vec<mews_protocol::ToolDefinition> {
         tools
             .native
             .values()
@@ -288,11 +360,10 @@ impl ToolRegistry {
     pub fn extension_definitions(
         &self,
         agent_id: &mews_protocol::AgentId,
-    ) -> Vec<mews_protocol::ToolDefinition> {
-        self.inner
+    ) -> mews_protocol::ToolCatalogSnapshot {
+        let state = self.inner.state.read().expect("tool registry poisoned");
+        let tools = state
             .tools
-            .read()
-            .expect("tool registry poisoned")
             .extensions
             .iter()
             .filter(|((owner, _), _)| owner == agent_id.as_str())
@@ -302,17 +373,31 @@ impl ToolRegistry {
                 schema: tool.schema(),
                 agent_id: None,
             })
-            .collect()
+            .collect();
+        mews_protocol::ToolCatalogSnapshot {
+            generation: state.generation,
+            tools,
+        }
     }
 
-    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Vec<mews_protocol::ToolDefinition>> {
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<mews_protocol::ToolCatalogSnapshot> {
         self.inner.catalog.subscribe()
     }
 
-    fn publish_catalog(&self) {
-        self.inner.catalog.send_replace(self.definitions());
+    /// Subscribes before reading the Ready snapshot. A catalog update that
+    /// follows this read remains pending on the returned receiver.
+    pub fn subscribe_with_snapshot(
+        &self,
+    ) -> (
+        tokio::sync::watch::Receiver<mews_protocol::ToolCatalogSnapshot>,
+        mews_protocol::ToolCatalogSnapshot,
+    ) {
+        let mut catalog = self.subscribe();
+        let snapshot = catalog.borrow_and_update().clone();
+        (catalog, snapshot)
     }
 
+    #[cfg(test)]
     pub async fn execute(
         &self,
         agent_id: &mews_protocol::AgentId,
@@ -321,16 +406,47 @@ impl ToolRegistry {
         cwd: &Path,
         cancellation: &CancellationToken,
     ) -> Result<Value> {
+        self.execute_at_generation(
+            agent_id,
+            name,
+            arguments,
+            cwd,
+            cancellation,
+            self.snapshot().generation,
+        )
+        .await
+    }
+
+    pub async fn execute_at_generation(
+        &self,
+        agent_id: &mews_protocol::AgentId,
+        name: &str,
+        arguments: Value,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+        catalog_generation: u64,
+    ) -> Result<Value> {
         let tool = {
-            let tools = self.inner.tools.read().expect("tool registry poisoned");
-            tools
+            let state = self.inner.state.read().expect("tool registry poisoned");
+            if catalog_generation != state.generation {
+                bail!("tool catalog changed before the call could run; retry with the new catalog");
+            }
+            state
+                .tools
                 .extensions
                 .get(&(agent_id.to_string(), name.to_owned()))
-                .or_else(|| tools.native.get(name))
+                .or_else(|| state.tools.native.get(name))
                 .with_context(|| format!("Host does not provide tool {name:?}"))?
                 .clone()
         };
         tool.execute(arguments, cwd, cancellation).await
+    }
+}
+
+fn snapshot(state: &RegistryState) -> mews_protocol::ToolCatalogSnapshot {
+    mews_protocol::ToolCatalogSnapshot {
+        generation: state.generation,
+        tools: ToolRegistry::definitions_from(&state.tools),
     }
 }
 
@@ -346,6 +462,94 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join(".agent-id"), agent_id.as_str()).unwrap();
         agent_id
+    }
+
+    #[tokio::test]
+    async fn subscribed_ready_snapshot_preserves_a_concurrent_catalog_update() {
+        let registry = ToolRegistry::default();
+        let (mut catalog, ready) = registry.subscribe_with_snapshot();
+
+        registry.restore_default("read");
+
+        catalog.changed().await.unwrap();
+        assert_eq!(ready.generation, 0);
+        assert_eq!(catalog.borrow_and_update().generation, 1);
+    }
+
+    #[test]
+    fn loaded_extensions_do_not_reload_until_the_fingerprint_changes() {
+        let root = tempfile::tempdir().unwrap();
+        agent_replica(root.path(), "coder");
+        let directory = root.path().join("agents/coder/extensions");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("one.toml"),
+            "name = 'one'\ncommand = ['true']\n",
+        )
+        .unwrap();
+        let registry = ToolRegistry::with_agent_extensions(root.path()).unwrap();
+        let loaded = registry.snapshot().generation;
+
+        assert!(
+            !registry
+                .reload_agent_extensions_if_changed(root.path())
+                .unwrap()
+        );
+        assert_eq!(registry.snapshot().generation, loaded);
+
+        std::fs::write(
+            directory.join("two.toml"),
+            "name = 'two'\ncommand = ['true']\n",
+        )
+        .unwrap();
+        assert!(
+            registry
+                .reload_agent_extensions_if_changed(root.path())
+                .unwrap()
+        );
+        assert_eq!(registry.snapshot().generation, loaded + 1);
+    }
+
+    #[tokio::test]
+    async fn before_tool_conflicting_identity_aliases_are_blocked() {
+        let root = tempfile::tempdir().unwrap();
+        let agent_id = agent_replica(root.path(), "coder");
+        let directory = root.path().join("agents/coder/extensions");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("policy.toml"),
+            r#"name = "policy"
+command = ["sh", "-c", "cat >/dev/null; printf '{\"name\":\"read\",\"tool\":\"other\",\"arguments\":{}}'"]
+hooks = ["before_tool"]
+"#,
+        )
+        .unwrap();
+        let registry = ToolRegistry::with_agent_extensions(root.path()).unwrap();
+
+        let output = registry
+            .execute_hooks(
+                &agent_id,
+                "before_tool",
+                json!({"name":"read","arguments":{}}),
+                root.path(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let call = mews_agent::ToolCall {
+            id: "call".into(),
+            name: "read".into(),
+            arguments: json!({}),
+            thought_signature: None,
+            catalog_generation: registry.snapshot().generation,
+        };
+        assert_eq!(
+            mews_agent::before_tool_decision(&call, output).unwrap(),
+            mews_agent::ToolDecision::Block(
+                "before_tool hooks may block a call but may not change its tool name".into()
+            )
+        );
     }
 
     #[tokio::test]
@@ -707,7 +911,7 @@ schema = {{ type = "object" }}
             json!({"changed": true})
         );
         let other = mews_protocol::AgentId::new();
-        assert!(registry.extension_definitions(&other).is_empty());
+        assert!(registry.extension_definitions(&other).tools.is_empty());
         assert!(
             registry
                 .execute(
@@ -720,5 +924,56 @@ schema = {{ type = "object" }}
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn stale_catalog_generation_never_runs_a_reloaded_tool() {
+        struct Marker {
+            ran: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        #[async_trait]
+        impl Tool for Marker {
+            fn name(&self) -> &str {
+                "marker"
+            }
+            fn description(&self) -> &str {
+                "marker"
+            }
+            fn schema(&self) -> Value {
+                json!({"type": "object"})
+            }
+            async fn execute(&self, _: Value, _: &Path, _: &CancellationToken) -> Result<Value> {
+                self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(json!({"ok": true}))
+            }
+        }
+
+        let registry = ToolRegistry::with_defaults();
+        let old_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        registry.register_native(Marker {
+            ran: Arc::clone(&old_ran),
+        });
+        let advertised = registry.snapshot();
+        let new_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        registry.register_native(Marker {
+            ran: Arc::clone(&new_ran),
+        });
+
+        let error = registry
+            .execute_at_generation(
+                &mews_protocol::AgentId::new(),
+                "marker",
+                json!({}),
+                Path::new("."),
+                &CancellationToken::new(),
+                advertised.generation,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("tool catalog changed"));
+        assert!(!old_ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!new_ran.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

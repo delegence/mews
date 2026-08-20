@@ -38,7 +38,7 @@ pub fn snapshot_agent_skills(root: &Path, agent_slug: &str) -> Result<Vec<AcpSki
     let directory = root.join("agents").join(agent_slug).join("skills");
     let mut resources = Vec::new();
     if directory.is_dir() {
-        collect(&directory, true, &mut resources)?;
+        collect(&directory, &mut resources)?;
     }
     let mut snapshots = std::collections::BTreeMap::new();
     for resource in resources {
@@ -82,28 +82,19 @@ pub fn discover_skills(root: Option<&Path>, agent_slug: &str, cwd: &Path) -> Res
     ) {
         bail!("invalid Agent slug {agent_slug:?}");
     }
-    discover(
-        root.map(|root| root.join("agents").join(agent_slug)),
-        cwd,
-        "skills",
-        true,
-    )
+    discover(root.map(|root| root.join("agents").join(agent_slug)), cwd)
 }
 
-pub fn discover_prompts(root: Option<&Path>, cwd: &Path) -> Result<Vec<Resource>> {
-    discover(root.map(Path::to_path_buf), cwd, "prompts", false)
-}
-
-fn discover(root: Option<PathBuf>, cwd: &Path, kind: &str, skill: bool) -> Result<Vec<Resource>> {
+fn discover(root: Option<PathBuf>, cwd: &Path) -> Result<Vec<Resource>> {
     let mut directories = Vec::new();
     if let Some(root) = root {
-        directories.push(root.join(kind));
+        directories.push(root.join("skills"));
     }
     let ancestors = project_ancestors(cwd);
     directories.extend(
         ancestors
             .into_iter()
-            .map(|path| path.join(".agents").join(kind)),
+            .map(|path| path.join(".agents/skills")),
     );
 
     let mut resources = Vec::new();
@@ -111,7 +102,7 @@ fn discover(root: Option<PathBuf>, cwd: &Path, kind: &str, skill: bool) -> Resul
         if !directory.is_dir() {
             continue;
         }
-        collect(&directory, skill, &mut resources)?;
+        collect(&directory, &mut resources)?;
     }
     // Later, more project-specific resources override broader/global ones.
     let mut unique = std::collections::BTreeMap::new();
@@ -131,7 +122,7 @@ pub(crate) fn project_ancestors(cwd: &Path) -> Vec<&Path> {
     ancestors
 }
 
-fn collect(directory: &Path, skill: bool, resources: &mut Vec<Resource>) -> Result<()> {
+fn collect(directory: &Path, resources: &mut Vec<Resource>) -> Result<()> {
     for entry in fs::read_dir(directory)? {
         let path = entry?.path();
         let metadata = fs::symlink_metadata(&path)?;
@@ -140,19 +131,17 @@ fn collect(directory: &Path, skill: bool, resources: &mut Vec<Resource>) -> Resu
         }
         if metadata.is_dir() {
             let manifest = path.join("SKILL.md");
-            if skill && manifest.is_file() {
-                resources.push(parse(&manifest, true)?);
+            if manifest.is_file() {
+                resources.push(parse(&manifest)?);
             } else {
-                collect(&path, skill, resources)?;
+                collect(&path, resources)?;
             }
-        } else if !skill && path.extension().and_then(|value| value.to_str()) == Some("md") {
-            resources.push(parse(&path, false)?);
         }
     }
     Ok(())
 }
 
-fn parse(path: &Path, require_description: bool) -> Result<Resource> {
+fn parse(path: &Path) -> Result<Resource> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() || metadata.len() > MAX_RESOURCE_FILE {
         bail!(
@@ -161,14 +150,12 @@ fn parse(path: &Path, require_description: bool) -> Result<Resource> {
         );
     }
     let content = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let mut name = (if require_description {
-        path.parent().and_then(Path::file_name)
-    } else {
-        path.file_stem()
-    })
-    .and_then(|value| value.to_str())
-    .unwrap_or_default()
-    .to_owned();
+    let mut name = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_owned();
     let mut description = String::new();
     if let Some(frontmatter) = content
         .strip_prefix("---\n")
@@ -183,7 +170,7 @@ fn parse(path: &Path, require_description: bool) -> Result<Resource> {
             }
         }
     }
-    if name.is_empty() || (require_description && description.is_empty()) {
+    if name.is_empty() || description.is_empty() {
         bail!(
             "resource needs name and description frontmatter: {}",
             path.display()
@@ -196,9 +183,8 @@ fn parse(path: &Path, require_description: bool) -> Result<Resource> {
     })
 }
 
-pub fn prompt_context(root: Option<&Path>, agent_slug: &str, cwd: &Path) -> Result<String> {
+pub fn skill_context(root: Option<&Path>, agent_slug: &str, cwd: &Path) -> Result<String> {
     let skills = discover_skills(root, agent_slug, cwd)?;
-    let prompts = discover_prompts(root, cwd)?;
     let mut output = String::new();
     if !skills.is_empty() {
         output.push_str("\n\n<available_skills>\n");
@@ -211,27 +197,7 @@ pub fn prompt_context(root: Option<&Path>, agent_slug: &str, cwd: &Path) -> Resu
         }
         output.push_str("</available_skills>");
     }
-    if !prompts.is_empty() {
-        output.push_str("\n\n<available_prompts>\n");
-        output.push_str("When a user message begins /name, read the matching prompt file, substitute $ARGUMENTS with the remaining text, and follow the expanded prompt.\n");
-        for item in prompts {
-            output.push_str(&format!(
-                "<prompt name={:?} description={:?} path={:?} />\n",
-                item.name, item.description, item.path
-            ));
-        }
-        output.push_str("</available_prompts>");
-    }
     Ok(output)
-}
-
-pub fn read_prompt(root: Option<&Path>, cwd: &Path, name: &str) -> Result<Option<String>> {
-    let prompt = discover_prompts(root, cwd)?
-        .into_iter()
-        .find(|prompt| prompt.name == name);
-    prompt
-        .map(|prompt| fs::read_to_string(prompt.path).map_err(Into::into))
-        .transpose()
 }
 
 #[cfg(test)]
@@ -267,13 +233,7 @@ mod tests {
             "---\nname: review\ndescription: project\n---\n",
         )
         .unwrap();
-        fs::create_dir_all(project.path().join(".agents/prompts")).unwrap();
         fs::create_dir_all(&cwd).unwrap();
-        fs::write(
-            project.path().join(".agents/prompts/check.md"),
-            "---\nname: check\ndescription: Check it\n---\n$ARGUMENTS",
-        )
-        .unwrap();
         let skills = discover_skills(Some(root.path()), "coder", &cwd).unwrap();
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].description, "project");
@@ -283,15 +243,9 @@ mod tests {
         assert!(snapshot[0].content.contains("description: agent"));
         assert_ne!(snapshot[0].hash, "");
         assert!(
-            prompt_context(Some(root.path()), "coder", &cwd)
+            skill_context(Some(root.path()), "coder", &cwd)
                 .unwrap()
-                .contains("check.md")
-        );
-        assert!(
-            read_prompt(Some(root.path()), &cwd, "check")
-                .unwrap()
-                .unwrap()
-                .contains("$ARGUMENTS")
+                .contains("review")
         );
     }
 }

@@ -16,7 +16,7 @@ use mews_agent::{
 };
 use mews_protocol::{
     AcpEvent, Agent, AgentReplica, AgentRevision, HarnessDescriptor, HostId, HostToHub, HubToHost,
-    HubTransferStart, RequestId, ToolDefinition,
+    HubTransferStart, RequestId, ToolCatalogSnapshot, ToolDefinition,
 };
 
 use crate::lifecycle::handle_host_request_streaming;
@@ -28,7 +28,6 @@ enum HostReply {
     AgentReplica(Option<AgentReplica>),
     ProjectContext(String),
     Hook(Value),
-    Prompt(Option<String>),
     HubTransfer(Option<u64>),
     Configured,
     Harnesses(Vec<HarnessDescriptor>),
@@ -59,6 +58,7 @@ pub struct RemoteAcpTurn {
     pub recovery_prompt: String,
     pub agent_id: mews_protocol::AgentId,
     pub agent_slug: String,
+    pub system_instructions: String,
     pub soul: String,
     pub mews_session_id: String,
     pub turn_id: String,
@@ -116,7 +116,7 @@ impl<T: HostControl + AgentCapabilities> HostExecutor for T {
 /// cross this boundary; tools remain owned by the Host.
 pub struct ConnectedHost {
     id: HostId,
-    tools: Arc<RwLock<Vec<ToolDefinition>>>,
+    tools: Arc<RwLock<ToolCatalogSnapshot>>,
     harnesses: Arc<RwLock<Vec<HarnessDescriptor>>>,
     sender: mpsc::Sender<HubToHost>,
     pending: PendingRequests,
@@ -124,7 +124,7 @@ pub struct ConnectedHost {
 }
 
 impl ConnectedHost {
-    pub(crate) fn tool_catalog(&self) -> Vec<ToolDefinition> {
+    pub(crate) fn tool_catalog(&self) -> ToolCatalogSnapshot {
         self.tools
             .read()
             .expect("Host tool catalog poisoned")
@@ -149,6 +149,7 @@ impl ConnectedHost {
             .expect("Host Harness catalog poisoned") = harnesses;
     }
 
+    #[cfg(test)]
     pub(crate) async fn execute_tool(
         &self,
         agent_id: &mews_protocol::AgentId,
@@ -156,12 +157,31 @@ impl ConnectedHost {
         arguments: Value,
         cwd: &Path,
     ) -> Result<Value> {
+        self.execute_tool_at_generation(
+            agent_id,
+            tool,
+            arguments,
+            cwd,
+            self.tool_catalog().generation,
+        )
+        .await
+    }
+
+    async fn execute_tool_at_generation(
+        &self,
+        agent_id: &mews_protocol::AgentId,
+        tool: &str,
+        arguments: Value,
+        cwd: &Path,
+        catalog_generation: u64,
+    ) -> Result<Value> {
         let request_id = RequestId::new();
         match self
             .request_inner(
                 HubToHost::ExecuteTool {
                     request_id: request_id.clone(),
                     agent_id: agent_id.clone(),
+                    catalog_generation,
                     tool: tool.to_owned(),
                     arguments,
                     canonical_cwd: cwd.to_path_buf(),
@@ -176,6 +196,7 @@ impl ConnectedHost {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn execute_hook(
         &self,
         agent_id: &mews_protocol::AgentId,
@@ -183,6 +204,19 @@ impl ConnectedHost {
         payload: Value,
         cwd: &Path,
         cancellation: &CancellationToken,
+    ) -> Result<Value> {
+        self.execute_hook_at_generation(agent_id, hook, payload, cwd, cancellation, None)
+            .await
+    }
+
+    async fn execute_hook_at_generation(
+        &self,
+        agent_id: &mews_protocol::AgentId,
+        hook: &str,
+        payload: Value,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+        catalog_generation: Option<u64>,
     ) -> Result<Value> {
         cancellation.check()?;
         let request_id = RequestId::new();
@@ -193,6 +227,7 @@ impl ConnectedHost {
                 hook: hook.to_owned(),
                 payload,
                 canonical_cwd: cwd.to_path_buf(),
+                catalog_generation,
             },
             None,
             Some(request_id),
@@ -225,22 +260,8 @@ impl ConnectedHost {
         }
     }
 
-    async fn fetch_prompt(&self, cwd: &Path, name: &str) -> Result<Option<String>> {
-        match self
-            .request(HubToHost::ReadPrompt {
-                request_id: RequestId::new(),
-                name: name.to_owned(),
-                canonical_cwd: cwd.to_path_buf(),
-            })
-            .await?
-        {
-            HostReply::Prompt(content) => Ok(content),
-            _ => bail!("Host returned the wrong response type"),
-        }
-    }
-
     pub async fn in_process(id: HostId, registry: ToolRegistry) -> Result<Self> {
-        let tools = registry.definitions();
+        let tools = registry.snapshot();
         let harnesses = crate::HarnessCatalog::discover(registry.root())?.descriptors();
         if let Some(root) = registry.root().map(Path::to_path_buf) {
             tokio::spawn({
@@ -256,7 +277,7 @@ impl ConnectedHost {
             host_receiver,
             host_sender,
         ));
-        Self::from_channels_with_catalog(id, tools, harnesses, hub_sender, hub_receiver).await
+        Self::from_channels_with_snapshot(id, tools, harnesses, hub_sender, hub_receiver).await
     }
 
     pub async fn from_channels(
@@ -271,6 +292,26 @@ impl ConnectedHost {
     pub async fn from_channels_with_catalog(
         id: HostId,
         initial_tools: Vec<ToolDefinition>,
+        initial_harnesses: Vec<HarnessDescriptor>,
+        sender: mpsc::Sender<HubToHost>,
+        receiver: mpsc::Receiver<HostToHub>,
+    ) -> Result<Self> {
+        Self::from_channels_with_snapshot(
+            id,
+            ToolCatalogSnapshot {
+                generation: 0,
+                tools: initial_tools,
+            },
+            initial_harnesses,
+            sender,
+            receiver,
+        )
+        .await
+    }
+
+    async fn from_channels_with_snapshot(
+        id: HostId,
+        initial_tools: ToolCatalogSnapshot,
         initial_harnesses: Vec<HarnessDescriptor>,
         sender: mpsc::Sender<HubToHost>,
         mut receiver: mpsc::Receiver<HostToHub>,
@@ -473,21 +514,6 @@ impl ConnectedHost {
                             let _ = reply.reply.send(definitive(response));
                         }
                     }
-                    HostToHub::Prompt {
-                        request_id,
-                        content,
-                        error,
-                    } => {
-                        if let Some(reply) = response_pending
-                            .lock()
-                            .expect("Host pending requests poisoned")
-                            .remove(&request_id)
-                        {
-                            let _ = reply.reply.send(definitive(
-                                error.map_or(Ok(HostReply::Prompt(content)), Err),
-                            ));
-                        }
-                    }
                     HostToHub::HubTransferResult {
                         request_id,
                         next_offset,
@@ -553,7 +579,6 @@ impl HostControl for ConnectedHost {
             HostReply::Hook(_) => bail!("Host returned the wrong response type"),
             HostReply::HubTransfer(_) => bail!("Host returned the wrong response type"),
             HostReply::Configured => bail!("Host returned the wrong response type"),
-            HostReply::Prompt(_) => bail!("Host returned the wrong response type"),
             HostReply::Harnesses(_) => bail!("Host returned the wrong response type"),
             HostReply::Acp(_) => bail!("Host returned the wrong response type"),
         }
@@ -719,6 +744,7 @@ impl HostControl for ConnectedHost {
                 recovery_prompt: turn.recovery_prompt,
                 agent_id: turn.agent_id,
                 agent_slug: turn.agent_slug,
+                system_instructions: turn.system_instructions,
                 soul: turn.soul,
                 mews_session_id: turn.mews_session_id,
                 turn_id: turn.turn_id,
@@ -771,26 +797,24 @@ impl AgentCapabilities for ConnectedHost {
         })
     }
 
-    async fn read_prompt(&self, cwd: &Path, name: &str) -> Result<Option<String>> {
-        self.fetch_prompt(cwd, name).await
-    }
-
-    fn tools(&self) -> Vec<mews_agent::ToolDefinition> {
+    fn tools(&self) -> ToolCatalogSnapshot {
         self.tool_catalog()
     }
 
-    fn extension_tools(
-        &self,
-        agent_id: &mews_protocol::AgentId,
-    ) -> Vec<mews_agent::ToolDefinition> {
-        self.tool_catalog()
-            .into_iter()
-            .filter(|tool| tool.agent_id.as_ref() == Some(agent_id))
-            .map(|mut tool| {
-                tool.agent_id = None;
-                tool
-            })
-            .collect()
+    fn extension_tools(&self, agent_id: &mews_protocol::AgentId) -> ToolCatalogSnapshot {
+        let snapshot = self.tool_catalog();
+        ToolCatalogSnapshot {
+            generation: snapshot.generation,
+            tools: snapshot
+                .tools
+                .into_iter()
+                .filter(|tool| tool.agent_id.as_ref() == Some(agent_id))
+                .map(|mut tool| {
+                    tool.agent_id = None;
+                    tool
+                })
+                .collect(),
+        }
     }
 
     async fn execute(
@@ -802,7 +826,13 @@ impl AgentCapabilities for ConnectedHost {
         _progress: &dyn ProgressReporter,
     ) -> Result<ToolResult> {
         cancellation.check()?;
-        let execution = self.execute_tool(agent_id, &call.name, call.arguments.clone(), cwd);
+        let execution = self.execute_tool_at_generation(
+            agent_id,
+            &call.name,
+            call.arguments.clone(),
+            cwd,
+            call.catalog_generation,
+        );
         tokio::pin!(execution);
         let result = tokio::select! {
             result = &mut execution => result?,
@@ -821,6 +851,7 @@ impl AgentCapabilities for ConnectedHost {
         payload: Value,
         cwd: &Path,
         cancellation: &CancellationToken,
+        catalog_generation: Option<u64>,
     ) -> Result<Value> {
         let name = match hook {
             LifecycleHook::TurnStart => "turn_start",
@@ -830,8 +861,15 @@ impl AgentCapabilities for ConnectedHost {
             LifecycleHook::AfterStep => "after_step",
             LifecycleHook::TurnEnd => "turn_end",
         };
-        self.execute_hook(agent_id, name, payload, cwd, cancellation)
-            .await
+        self.execute_hook_at_generation(
+            agent_id,
+            name,
+            payload,
+            cwd,
+            cancellation,
+            catalog_generation,
+        )
+        .await
     }
 }
 
@@ -868,7 +906,6 @@ impl ConnectedHost {
             HubToHost::SynchronizeAgent { request_id, .. } => request_id.clone(),
             HubToHost::ReadAgentReplica { request_id, .. } => request_id.clone(),
             HubToHost::ReadProjectContext { request_id, .. } => request_id.clone(),
-            HubToHost::ReadPrompt { request_id, .. } => request_id.clone(),
             HubToHost::RefreshHarnessCatalog { request_id } => request_id.clone(),
             HubToHost::ExecuteAcpTurn { request_id, .. } => request_id.clone(),
             HubToHost::CancelAcp { .. } => {
@@ -1007,9 +1044,10 @@ async fn serve_host(
     mut receiver: mpsc::Receiver<HubToHost>,
     sender: mpsc::Sender<HostToHub>,
 ) {
+    let (mut catalog, ready_tools) = registry.subscribe_with_snapshot();
     if sender
         .send(HostToHub::Ready {
-            tools: registry.definitions(),
+            tools: ready_tools,
             harnesses,
         })
         .await
@@ -1017,7 +1055,6 @@ async fn serve_host(
     {
         return;
     }
-    let mut catalog = registry.subscribe();
     let binding_waiters: crate::AcpBindingWaiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let acp_cancellations = Arc::new(std::sync::Mutex::new(
         HashMap::<RequestId, CancellationToken>::new(),

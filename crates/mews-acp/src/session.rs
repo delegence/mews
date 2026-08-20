@@ -290,6 +290,10 @@ impl LiveAcpProcess {
             terminate_process_tree(&mut self.child).await;
         }
     }
+
+    async fn terminate(mut self) {
+        terminate_process_tree(&mut self.child).await;
+    }
 }
 
 impl Drop for LiveAcpProcess {
@@ -1183,6 +1187,7 @@ async fn invoke_turn_start(
             payload,
             cwd,
             cancellation,
+            None,
         )
         .await
     {
@@ -1279,7 +1284,14 @@ async fn execute_acp_attempt(
     )
     .await;
     if owns_process && let Some(live) = owned_live.take() {
-        live.shutdown().await;
+        if result.is_ok() {
+            live.shutdown().await;
+        } else {
+            // A failed Harness can be stuck and unable to complete the graceful
+            // shutdown protocol. Do not add the shutdown grace period to the
+            // request deadline observed by the caller.
+            live.terminate().await;
+        }
     }
     result
 }
@@ -1365,7 +1377,7 @@ async fn record_telemetry_hook(
         cancellation
     };
     match environment
-        .hook(agent_id, lifecycle, payload, cwd, cancellation)
+        .hook(agent_id, lifecycle, payload, cwd, cancellation, None)
         .await
     {
         Ok(_) => events(AcpStreamEvent::HookOutcome {
@@ -1779,6 +1791,7 @@ async fn before_model(
             payload,
             cwd,
             cancellation,
+            None,
         )
         .await
     {
@@ -1970,7 +1983,7 @@ mod tests {
     use async_trait::async_trait;
     use mews_agent::{
         AgentCapabilities, CancellationToken, ContextSnapshot, LifecycleHook, ProgressReporter,
-        ToolCall, ToolDefinition, ToolResult,
+        ToolCall, ToolResult,
     };
     use mews_protocol::{AcpBindingTransition, AcpInstructionChannel, AcpReplacementReason};
     use serde_json::{Value, json};
@@ -2294,8 +2307,10 @@ done
             tokio::select! {
                 result = &mut execution => panic!("adapter exited before cancellation: {result:?}"),
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                    if let Ok(pid) = fs::read_to_string(&descendant_path) {
-                        break pid.parse::<i32>().unwrap();
+                    if let Ok(pid) = fs::read_to_string(&descendant_path)
+                        && let Ok(pid) = pid.trim().parse::<i32>()
+                    {
+                        break pid;
                     }
                 }
             }
@@ -2357,8 +2372,10 @@ done
                 }
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {}
             }
-            if let Ok(pid) = fs::read_to_string(&descendant_path) {
-                break pid.parse::<i32>().unwrap();
+            if let Ok(pid) = fs::read_to_string(&descendant_path)
+                && let Ok(pid) = pid.trim().parse::<i32>()
+            {
+                break pid;
             }
         };
         drop(execution);
@@ -2585,8 +2602,8 @@ done
         async fn context(&self, _: &str, _: &Path) -> Result<ContextSnapshot> {
             Ok(ContextSnapshot::default())
         }
-        fn tools(&self) -> Vec<ToolDefinition> {
-            Vec::new()
+        fn tools(&self) -> mews_protocol::ToolCatalogSnapshot {
+            mews_protocol::ToolCatalogSnapshot::default()
         }
         async fn execute(
             &self,
@@ -2605,6 +2622,7 @@ done
             _: serde_json::Value,
             _: &Path,
             _: &CancellationToken,
+            _: Option<u64>,
         ) -> Result<serde_json::Value> {
             Ok(serde_json::Value::Null)
         }
@@ -2653,8 +2671,8 @@ done
             Ok(ContextSnapshot::default())
         }
 
-        fn tools(&self) -> Vec<ToolDefinition> {
-            Vec::new()
+        fn tools(&self) -> mews_protocol::ToolCatalogSnapshot {
+            mews_protocol::ToolCatalogSnapshot::default()
         }
 
         async fn execute(
@@ -2675,6 +2693,7 @@ done
             payload: Value,
             _: &Path,
             _: &CancellationToken,
+            _: Option<u64>,
         ) -> Result<Value> {
             self.hooks.lock().unwrap().push((hook, payload));
             Ok(Value::Null)

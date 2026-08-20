@@ -29,6 +29,23 @@ impl MewsClient {
         response::agents(self.request(HubRequest::ListAgents).await?)
     }
 
+    pub async fn inspect_agent(
+        &mut self,
+        slug: String,
+        host_id: Option<HostId>,
+        after_tool: Option<mews_protocol::AgentToolCursor>,
+    ) -> Result<mews_protocol::AgentInspection> {
+        response::agent_inspection(
+            self.request(HubRequest::InspectAgent {
+                slug,
+                host_id,
+                after_tool,
+                tool_limit: 100,
+            })
+            .await?,
+        )
+    }
+
     pub async fn create_agent(
         &mut self,
         slug: String,
@@ -133,7 +150,19 @@ impl MewsClient {
     }
 
     pub async fn hosts(&mut self) -> Result<Vec<mews_protocol::HostStatus>> {
-        response::hosts(self.request(HubRequest::ListHosts).await?)
+        let mut hosts = Vec::new();
+        let mut after = None;
+        loop {
+            let page = response::hosts(
+                self.request(HubRequest::ListHosts { after, limit: 100 })
+                    .await?,
+            )?;
+            hosts.extend(page.hosts);
+            let Some(next) = page.next else {
+                return Ok(hosts);
+            };
+            after = Some(next);
+        }
     }
 
     pub async fn harnesses(&mut self) -> Result<Vec<mews_protocol::HostHarnessStatus>> {

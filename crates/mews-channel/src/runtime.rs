@@ -11,15 +11,18 @@ use mews_protocol::{
     ChannelOrigin, ClientEvent, ClientEventKind, HostId, MessageContent, MessageSource, SessionId,
     SourceKind,
 };
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch};
 
 use crate::{
     Channel, ChannelInbound, ChannelOutbound, ChannelSubscription, DeliveryOutcome, InboundMessage,
-    OutboundEvent, OutboundMessage, TerminalDeliveryOutcome, mapping::MappingStore,
+    InboundRejection, OutboundEvent, OutboundMessage, TerminalDeliveryOutcome,
+    mapping::MappingStore,
 };
 
 const DEFAULT_DELIVERY_WORKERS: usize = 4;
 const DEFAULT_PENDING_DELIVERIES: usize = 256;
+const MAX_EXTERNAL_ID_BYTES: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct ChannelConfig {
@@ -137,14 +140,18 @@ impl ChannelHandle {
 }
 
 impl<C: Channel> ChannelRuntime<C> {
+    /// Opens one Channel identity in an owner-only state directory.
     pub async fn open(
         channel: C,
         mews_root: &Path,
-        state_path: &Path,
+        state_directory: &Path,
         config: ChannelConfig,
     ) -> Result<Self> {
         config.validate()?;
         let channel_name = channel.name().to_owned();
+        if channel_name.is_empty() || channel_name.len() > 256 {
+            bail!("Channel name must contain 1 to 256 bytes");
+        }
         let subscriptions = channel.subscriptions().iter().copied().collect();
         validate_negotiation(channel.subscriptions(), channel.capabilities())?;
         let (inbound, outbound) = channel.split();
@@ -159,7 +166,7 @@ impl<C: Channel> ChannelRuntime<C> {
             subscriptions,
             requests: MewsClient::connect(mews_root).await?,
             events: MewsClient::connect(mews_root).await?,
-            mappings: MappingStore::open(state_path)?,
+            mappings: MappingStore::open(state_directory)?,
             config,
             delivery_tx,
             delivery_rx: Some(delivery_rx),
@@ -168,8 +175,12 @@ impl<C: Channel> ChannelRuntime<C> {
         };
         let consumer = runtime.mappings.consumer_id()?;
         runtime.origin_consumer = consumer.clone();
-        for (_, session) in runtime.mappings.mappings()? {
-            runtime.events.subscribe(consumer.clone(), session).await?;
+        let mapped_sessions = runtime.mappings.mappings()?;
+        for (_, session) in &mapped_sessions {
+            runtime
+                .events
+                .subscribe(consumer.clone(), session.clone())
+                .await?;
         }
         for (session, turn_id) in runtime.mappings.active_turns()? {
             let turn = runtime
@@ -180,6 +191,9 @@ impl<C: Channel> ChannelRuntime<C> {
                 runtime.mappings.finish_turn(&turn.id.to_string())?;
                 runtime.launch_next(&session).await?;
             }
+        }
+        for (_, session) in mapped_sessions {
+            runtime.launch_next(&session).await?;
         }
         Ok(runtime)
     }
@@ -326,7 +340,46 @@ impl<C: Channel> ChannelRuntime<C> {
     }
 
     async fn handle_inbound(&mut self, inbound: InboundMessage) -> Result<()> {
+        if let Err(reason) = validate_external_id(&inbound.external_id) {
+            return self
+                .inbound
+                .reject_inbound(
+                    &inbound.external_id,
+                    InboundRejection::InvalidTurnInput {
+                        reason: reason.into(),
+                    },
+                )
+                .await;
+        }
         let consumer = self.mappings.consumer_id()?;
+        let key = channel_turn_key(
+            &self.origin_consumer,
+            &inbound.conversation,
+            &inbound.external_id,
+        );
+        let source = channel_source(
+            &self.channel_name,
+            &self.origin_consumer,
+            &inbound.conversation,
+        );
+        if let Err(error) = mews_protocol::validate_turn_input(
+            &key,
+            &MessageContent::Text {
+                text: inbound.text.clone(),
+            },
+            &inbound.metadata,
+            &source,
+        ) {
+            return self
+                .inbound
+                .reject_inbound(
+                    &inbound.external_id,
+                    InboundRejection::InvalidTurnInput {
+                        reason: error.to_string(),
+                    },
+                )
+                .await;
+        }
         let session = match self.mappings.session(&inbound.conversation)? {
             Some(session) => session,
             None => {
@@ -373,38 +426,86 @@ impl<C: Channel> ChannelRuntime<C> {
         if self.mappings.active(session)? {
             return Ok(());
         }
-        let Some((pending_id, external_id, text, metadata)) = self.mappings.next(session)? else {
-            return Ok(());
-        };
-        let turn = self
-            .requests
-            .start_turn_idempotent(
-                format!(
-                    "channel:{}:{}:{external_id}",
-                    self.origin_consumer.as_str(),
-                    self.mappings
-                        .conversation(session)?
-                        .context("Channel Session has no conversation mapping")?
-                ),
-                session.clone(),
-                text,
-                metadata,
-                MessageSource {
-                    kind: SourceKind::Channel,
-                    id: self.channel_name.clone(),
-                    channel_origin: Some(ChannelOrigin {
-                        consumer_id: self.origin_consumer.clone(),
-                        conversation: self
-                            .mappings
-                            .conversation(session)?
-                            .context("Channel Session has no conversation mapping")?,
-                    }),
-                },
+        let conversation = self
+            .mappings
+            .conversation(session)?
+            .context("Channel Session has no conversation mapping")?;
+        loop {
+            let Some((pending_id, external_id, text, metadata)) = self.mappings.next(session)?
+            else {
+                return Ok(());
+            };
+            if validate_external_id(&external_id).is_err() {
+                self.mappings.discard_pending(pending_id)?;
+                continue;
+            }
+            let key = channel_turn_key(&self.origin_consumer, &conversation, &external_id);
+            let source = channel_source(&self.channel_name, &self.origin_consumer, &conversation);
+            if mews_protocol::validate_turn_input(
+                &key,
+                &MessageContent::Text { text: text.clone() },
+                &metadata,
+                &source,
             )
-            .await?;
-        self.mappings
-            .mark_started(pending_id, session, &turn.id.to_string())?;
-        Ok(())
+            .is_err()
+            {
+                self.mappings.discard_pending(pending_id)?;
+                continue;
+            }
+            let turn = self
+                .requests
+                .start_turn_idempotent(key, session.clone(), text, metadata, source)
+                .await?;
+            // The Hub can return the original terminal Turn when an external
+            // platform delivers the same message again. Its terminal event can
+            // already be behind this consumer's checkpoint, so do not wait for
+            // that event a second time.
+            if turn.status != mews_protocol::TurnStatus::Running {
+                self.mappings.discard_pending(pending_id)?;
+                continue;
+            }
+            self.mappings
+                .mark_started(pending_id, session, &turn.id.to_string())?;
+            return Ok(());
+        }
+    }
+}
+
+fn validate_external_id(external_id: &str) -> std::result::Result<(), &'static str> {
+    if external_id.is_empty() {
+        return Err("external message ID cannot be empty");
+    }
+    if external_id.len() > MAX_EXTERNAL_ID_BYTES {
+        return Err("external message ID exceeds 256 bytes");
+    }
+    Ok(())
+}
+
+fn channel_turn_key(
+    consumer: &mews_protocol::ConsumerId,
+    conversation: &str,
+    external_id: &str,
+) -> String {
+    let mut hash = Sha256::new();
+    for value in [consumer.as_str(), conversation, external_id] {
+        hash.update(value.len().to_be_bytes());
+        hash.update(value.as_bytes());
+    }
+    format!("channel:{:x}", hash.finalize())
+}
+
+fn channel_source(
+    channel_name: &str,
+    consumer: &mews_protocol::ConsumerId,
+    conversation: &str,
+) -> MessageSource {
+    MessageSource {
+        kind: SourceKind::Channel,
+        id: channel_name.to_owned(),
+        channel_origin: Some(ChannelOrigin {
+            consumer_id: consumer.clone(),
+            conversation: conversation.to_owned(),
+        }),
     }
 }
 
@@ -551,10 +652,117 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
     struct TestOutbound {
         sent: mpsc::UnboundedSender<(String, String, u32)>,
         concurrent: AtomicUsize,
         maximum: AtomicUsize,
+    }
+
+    struct RecoveryChannel;
+
+    struct IdleInbound;
+
+    struct IdleOutbound;
+
+    struct RetainedChannel {
+        inbound: RetainedInbound,
+    }
+
+    struct RetainedInbound {
+        messages: VecDeque<InboundMessage>,
+        settlements: mpsc::UnboundedSender<InboundSettlement>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum InboundSettlement {
+        Acknowledged(String),
+        Rejected(String, InboundRejection),
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelInbound for IdleInbound {
+        async fn receive(&mut self) -> Result<InboundMessage> {
+            std::future::pending().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelInbound for RetainedInbound {
+        async fn receive(&mut self) -> Result<InboundMessage> {
+            let message = self
+                .messages
+                .front()
+                .context("no retained inbound message")?;
+            Ok(InboundMessage {
+                external_id: message.external_id.clone(),
+                conversation: message.conversation.clone(),
+                text: message.text.clone(),
+                metadata: message.metadata.clone(),
+            })
+        }
+
+        async fn acknowledge_inbound(&mut self, external_id: &str) -> Result<()> {
+            let message = self.messages.front().context("no inbound to acknowledge")?;
+            if message.external_id != external_id {
+                bail!("acknowledged a different inbound message");
+            }
+            self.messages.pop_front();
+            self.settlements
+                .send(InboundSettlement::Acknowledged(external_id.to_owned()))?;
+            Ok(())
+        }
+
+        async fn reject_inbound(
+            &mut self,
+            external_id: &str,
+            rejection: InboundRejection,
+        ) -> Result<()> {
+            let message = self.messages.front().context("no inbound to reject")?;
+            if message.external_id != external_id {
+                bail!("rejected a different inbound message");
+            }
+            self.messages.pop_front();
+            self.settlements.send(InboundSettlement::Rejected(
+                external_id.to_owned(),
+                rejection,
+            ))?;
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelOutbound for IdleOutbound {
+        async fn send(&self, _conversation: &str, _message: OutboundMessage) -> DeliveryOutcome {
+            DeliveryOutcome::Delivered(crate::DeliveryReceipt { external_id: None })
+        }
+    }
+
+    impl Channel for RecoveryChannel {
+        type Inbound = IdleInbound;
+        type Outbound = IdleOutbound;
+
+        fn name(&self) -> &str {
+            "recovery"
+        }
+
+        fn split(self) -> (Self::Inbound, Self::Outbound) {
+            (IdleInbound, IdleOutbound)
+        }
+    }
+
+    impl Channel for RetainedChannel {
+        type Inbound = RetainedInbound;
+        type Outbound = IdleOutbound;
+
+        fn name(&self) -> &str {
+            "retained"
+        }
+
+        fn split(self) -> (Self::Inbound, Self::Outbound) {
+            (self.inbound, IdleOutbound)
+        }
     }
 
     #[async_trait::async_trait]
@@ -593,6 +801,396 @@ mod tests {
             attempt: 1,
             _capacity: permit,
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_inbound_is_terminally_rejected_before_valid_input() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("channel-state");
+        let session = mews_protocol::Session {
+            id: SessionId::new(),
+            agent_id: mews_protocol::AgentId::new(),
+            host_id: mews_protocol::HostId::new(),
+            working_directory: root.path().to_path_buf(),
+            model_override: None,
+            leaf_entry_id: None,
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+        };
+        let session_for_server = session.clone();
+        let started_sessions = Arc::new(AtomicUsize::new(0));
+        let started_sessions_for_server = Arc::clone(&started_sessions);
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let listener = tokio::net::UnixListener::bind(root.path().join("hub.sock")).unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let session = session_for_server.clone();
+                let started_sessions = Arc::clone(&started_sessions_for_server);
+                let started_tx = started_tx.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Some(line) = lines.next_line().await.unwrap() {
+                        let request = mews_protocol::decode_hub_frame::<mews_protocol::HubRequest>(
+                            line.as_bytes(),
+                        )
+                        .unwrap();
+                        let response = match request.body {
+                            mews_protocol::HubRequest::StartSession { .. } => {
+                                started_sessions.fetch_add(1, Ordering::SeqCst);
+                                mews_protocol::HubResponse::Session(session.clone())
+                            }
+                            mews_protocol::HubRequest::SubscribeSession { .. } => {
+                                mews_protocol::HubResponse::Ack
+                            }
+                            mews_protocol::HubRequest::StartTurn {
+                                session_id, prompt, ..
+                            } => {
+                                started_tx.send((session_id.clone(), prompt)).unwrap();
+                                mews_protocol::HubResponse::Turn(mews_protocol::Turn {
+                                    id: mews_protocol::TurnId::new(),
+                                    session_id,
+                                    agent_revision: 1,
+                                    harness: None,
+                                    harness_definition_hash: None,
+                                    harness_version: None,
+                                    status: mews_protocol::TurnStatus::Running,
+                                    error: None,
+                                    created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                                    completed_at: None,
+                                })
+                            }
+                            other => panic!("unexpected request: {other:?}"),
+                        };
+                        let response =
+                            mews_protocol::Frame::with_request_id(response, request.request_id);
+                        writer
+                            .write_all(&mews_protocol::encode_hub_frame(&response).unwrap())
+                            .await
+                            .unwrap();
+                        writer.write_all(b"\n").await.unwrap();
+                    }
+                });
+            }
+        });
+        let (settlements_tx, mut settlements_rx) = mpsc::unbounded_channel();
+        let oversized_external_id = "x".repeat(MAX_EXTERNAL_ID_BYTES + 1);
+        let inbound = RetainedInbound {
+            messages: VecDeque::from([
+                InboundMessage {
+                    external_id: String::new(),
+                    conversation: "empty-id-conversation".into(),
+                    text: "hello".into(),
+                    metadata: serde_json::Value::Null,
+                },
+                InboundMessage {
+                    external_id: oversized_external_id.clone(),
+                    conversation: "oversized-id-conversation".into(),
+                    text: "hello".into(),
+                    metadata: serde_json::Value::Null,
+                },
+                InboundMessage {
+                    external_id: "invalid".into(),
+                    conversation: "invalid-conversation".into(),
+                    text: " ".into(),
+                    metadata: serde_json::Value::Null,
+                },
+                InboundMessage {
+                    external_id: "valid".into(),
+                    conversation: "valid-conversation".into(),
+                    text: "hello".into(),
+                    metadata: serde_json::Value::Null,
+                },
+            ]),
+            settlements: settlements_tx,
+        };
+        let mut runtime = ChannelRuntime::open(
+            RetainedChannel { inbound },
+            root.path(),
+            &state,
+            ChannelConfig::new("coder"),
+        )
+        .await
+        .unwrap();
+
+        let empty_id = runtime.inbound.receive().await.unwrap();
+        runtime.handle_inbound(empty_id).await.unwrap();
+        assert!(matches!(
+            settlements_rx.recv().await.unwrap(),
+            InboundSettlement::Rejected(id, InboundRejection::InvalidTurnInput { reason })
+                if id.is_empty() && reason == "external message ID cannot be empty"
+        ));
+
+        let oversized_id = runtime.inbound.receive().await.unwrap();
+        runtime.handle_inbound(oversized_id).await.unwrap();
+        assert!(matches!(
+            settlements_rx.recv().await.unwrap(),
+            InboundSettlement::Rejected(id, InboundRejection::InvalidTurnInput { reason })
+                if id == oversized_external_id && reason == "external message ID exceeds 256 bytes"
+        ));
+
+        let invalid = runtime.inbound.receive().await.unwrap();
+        runtime.handle_inbound(invalid).await.unwrap();
+        assert!(matches!(
+            settlements_rx.recv().await.unwrap(),
+            InboundSettlement::Rejected(id, InboundRejection::InvalidTurnInput { reason })
+                if id == "invalid" && reason == "message text cannot be empty"
+        ));
+        assert!(
+            runtime
+                .mappings
+                .session("invalid-conversation")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            runtime
+                .mappings
+                .session("empty-id-conversation")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            runtime
+                .mappings
+                .session("oversized-id-conversation")
+                .unwrap()
+                .is_none()
+        );
+        let database = rusqlite::Connection::open(state.join("channel.db")).unwrap();
+        let rejected_pending: usize = database
+            .query_row("SELECT COUNT(*) FROM pending", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rejected_pending, 0);
+
+        let valid = runtime.inbound.receive().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), runtime.handle_inbound(valid))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            settlements_rx.recv().await.unwrap(),
+            InboundSettlement::Acknowledged("valid".into())
+        );
+        assert_eq!(started_sessions.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            started_rx.recv().await.unwrap(),
+            (session.id.clone(), "hello".into())
+        );
+        assert_eq!(
+            runtime.mappings.session("valid-conversation").unwrap(),
+            Some(session.id.clone())
+        );
+        assert!(runtime.mappings.active(&session.id).unwrap());
+        assert!(runtime.mappings.next(&session.id).unwrap().is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn opening_launches_idle_pending_work_without_new_inbound() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("channel-state");
+        let session = SessionId::new();
+        let mut mappings = MappingStore::open(&state).unwrap();
+        mappings.consumer_id().unwrap();
+        mappings.insert("conversation", &session).unwrap();
+        mappings
+            .enqueue(
+                "invalid-message",
+                "conversation",
+                " ",
+                &serde_json::Value::Null,
+            )
+            .unwrap();
+        mappings
+            .enqueue(
+                "valid-message",
+                "conversation",
+                "hello",
+                &serde_json::Value::Null,
+            )
+            .unwrap();
+        drop(mappings);
+
+        let listener = tokio::net::UnixListener::bind(root.path().join("hub.sock")).unwrap();
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let started_tx = started_tx.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Some(line) = lines.next_line().await.unwrap() {
+                        let request = mews_protocol::decode_hub_frame::<mews_protocol::HubRequest>(
+                            line.as_bytes(),
+                        )
+                        .unwrap();
+                        let response = match request.body {
+                            mews_protocol::HubRequest::SubscribeSession { .. } => {
+                                mews_protocol::HubResponse::Ack
+                            }
+                            mews_protocol::HubRequest::StartTurn {
+                                session_id, prompt, ..
+                            } => {
+                                started_tx.send((session_id.clone(), prompt)).unwrap();
+                                mews_protocol::HubResponse::Turn(mews_protocol::Turn {
+                                    id: mews_protocol::TurnId::new(),
+                                    session_id,
+                                    agent_revision: 1,
+                                    harness: None,
+                                    harness_definition_hash: None,
+                                    harness_version: None,
+                                    status: mews_protocol::TurnStatus::Running,
+                                    error: None,
+                                    created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                                    completed_at: None,
+                                })
+                            }
+                            other => panic!("unexpected request: {other:?}"),
+                        };
+                        let response =
+                            mews_protocol::Frame::with_request_id(response, request.request_id);
+                        writer
+                            .write_all(&mews_protocol::encode_hub_frame(&response).unwrap())
+                            .await
+                            .unwrap();
+                        writer.write_all(b"\n").await.unwrap();
+                    }
+                });
+            }
+        });
+
+        let runtime = ChannelRuntime::open(
+            RecoveryChannel,
+            root.path(),
+            &state,
+            ChannelConfig::new("coder"),
+        )
+        .await
+        .unwrap();
+
+        let started = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(started, (session.clone(), "hello".into()));
+        assert!(runtime.mappings.active(&session).unwrap());
+        assert!(runtime.mappings.next(&session).unwrap().is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn terminal_turn_replay_does_not_block_the_next_pending_message() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("channel-state");
+        let session = SessionId::new();
+        let mut mappings = MappingStore::open(&state).unwrap();
+        mappings.consumer_id().unwrap();
+        mappings.insert("conversation", &session).unwrap();
+        mappings
+            .enqueue(
+                "duplicate-message",
+                "conversation",
+                "duplicate",
+                &serde_json::Value::Null,
+            )
+            .unwrap();
+        mappings
+            .enqueue(
+                "next-message",
+                "conversation",
+                "next",
+                &serde_json::Value::Null,
+            )
+            .unwrap();
+        drop(mappings);
+
+        let listener = tokio::net::UnixListener::bind(root.path().join("hub.sock")).unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        let completed_turn_id = mews_protocol::TurnId::new();
+        let running_turn_id = mews_protocol::TurnId::new();
+        let expected_running_turn_id = running_turn_id.clone();
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let requests = Arc::clone(&server_requests);
+                let started_tx = started_tx.clone();
+                let completed_turn_id = completed_turn_id.clone();
+                let running_turn_id = running_turn_id.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Some(line) = lines.next_line().await.unwrap() {
+                        let request = mews_protocol::decode_hub_frame::<mews_protocol::HubRequest>(
+                            line.as_bytes(),
+                        )
+                        .unwrap();
+                        let response = match request.body {
+                            mews_protocol::HubRequest::SubscribeSession { .. } => {
+                                mews_protocol::HubResponse::Ack
+                            }
+                            mews_protocol::HubRequest::StartTurn {
+                                session_id, prompt, ..
+                            } => {
+                                started_tx.send(prompt).unwrap();
+                                let replayed = requests.fetch_add(1, Ordering::SeqCst) == 0;
+                                mews_protocol::HubResponse::Turn(mews_protocol::Turn {
+                                    id: if replayed {
+                                        completed_turn_id.clone()
+                                    } else {
+                                        running_turn_id.clone()
+                                    },
+                                    session_id,
+                                    agent_revision: 1,
+                                    harness: None,
+                                    harness_definition_hash: None,
+                                    harness_version: None,
+                                    status: if replayed {
+                                        mews_protocol::TurnStatus::Completed
+                                    } else {
+                                        mews_protocol::TurnStatus::Running
+                                    },
+                                    error: None,
+                                    created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                                    completed_at: replayed
+                                        .then(|| "2026-01-01T00:00:01Z".parse().unwrap()),
+                                })
+                            }
+                            other => panic!("unexpected request: {other:?}"),
+                        };
+                        let response =
+                            mews_protocol::Frame::with_request_id(response, request.request_id);
+                        writer
+                            .write_all(&mews_protocol::encode_hub_frame(&response).unwrap())
+                            .await
+                            .unwrap();
+                        writer.write_all(b"\n").await.unwrap();
+                    }
+                });
+            }
+        });
+
+        let runtime = ChannelRuntime::open(
+            RecoveryChannel,
+            root.path(),
+            &state,
+            ChannelConfig::new("coder"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(started_rx.recv().await.unwrap(), "duplicate");
+        assert_eq!(started_rx.recv().await.unwrap(), "next");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            runtime.mappings.active_turns().unwrap(),
+            vec![(session.clone(), expected_running_turn_id.to_string())]
+        );
+        assert!(runtime.mappings.next(&session).unwrap().is_none());
+        server.abort();
     }
 
     #[tokio::test]
@@ -863,5 +1461,17 @@ mod tests {
             .is_ok()
         );
         assert!(validate_negotiation(&[ChannelSubscription::CompletedMessages], &[]).is_ok());
+    }
+
+    #[test]
+    fn channel_turn_keys_are_fixed_size_and_unambiguous() {
+        let consumer = mews_protocol::ConsumerId::new();
+        let first = channel_turn_key(&consumer, "ab", "c");
+        let second = channel_turn_key(&consumer, "a", "bc");
+        let long = channel_turn_key(&consumer, &"x".repeat(10_000), &"y".repeat(10_000));
+
+        assert_eq!(first.len(), "channel:".len() + 64);
+        assert_eq!(long.len(), first.len());
+        assert_ne!(first, second);
     }
 }

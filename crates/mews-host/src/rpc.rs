@@ -31,22 +31,6 @@ pub async fn handle_execution_request(
                 error: Some(error.to_string()),
             },
         },
-        HubToHost::ReadPrompt {
-            request_id,
-            name,
-            canonical_cwd,
-        } => match resources::read_prompt(registry.root(), canonical_cwd, name) {
-            Ok(content) => HostToHub::Prompt {
-                request_id: request_id.clone(),
-                content,
-                error: None,
-            },
-            Err(error) => HostToHub::Prompt {
-                request_id: request_id.clone(),
-                content: None,
-                error: Some(error.to_string()),
-            },
-        },
         HubToHost::AttestDirectory { request_id, path } => {
             let attested = path
                 .canonicalize()
@@ -71,6 +55,7 @@ pub async fn handle_execution_request(
         HubToHost::ExecuteTool {
             request_id,
             agent_id,
+            catalog_generation,
             tool,
             arguments,
             canonical_cwd,
@@ -85,7 +70,14 @@ pub async fn handle_execution_request(
                 let cancellation = cancellation
                     .ok_or_else(|| anyhow::anyhow!("tool request has no cancellation scope"))?;
                 registry
-                    .execute(agent_id, tool, arguments.clone(), &resolved, cancellation)
+                    .execute_at_generation(
+                        agent_id,
+                        tool,
+                        arguments.clone(),
+                        &resolved,
+                        cancellation,
+                        *catalog_generation,
+                    )
                     .await
             }
             .await;
@@ -106,6 +98,7 @@ pub async fn handle_execution_request(
             hook,
             payload,
             canonical_cwd,
+            catalog_generation,
         } => {
             let result = async {
                 let resolved = canonical_cwd.canonicalize()?;
@@ -115,7 +108,14 @@ pub async fn handle_execution_request(
                 let cancellation = cancellation
                     .ok_or_else(|| anyhow::anyhow!("hook request has no cancellation scope"))?;
                 registry
-                    .execute_hooks(agent_id, hook, payload.clone(), &resolved, cancellation)
+                    .execute_hooks_at_generation(
+                        agent_id,
+                        hook,
+                        payload.clone(),
+                        &resolved,
+                        cancellation,
+                        *catalog_generation,
+                    )
                     .await
             }
             .await;
@@ -149,7 +149,7 @@ fn project_context(root: Option<&Path>, agent_slug: &str, cwd: &Path) -> Result<
         }
         output.push_str(&section);
     }
-    let discovered = resources::prompt_context(root, agent_slug, &resolved)?;
+    let discovered = resources::skill_context(root, agent_slug, &resolved)?;
     if output.len() + discovered.len() > MAX_PROJECT_CONTEXT_BYTES {
         bail!("combined project and resource context exceeds 192 KiB");
     }

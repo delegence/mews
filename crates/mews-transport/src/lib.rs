@@ -155,7 +155,10 @@ impl EncryptedRelayPeer {
         let message_id = uuid::Uuid::now_v7().into_bytes();
         let chunk_size = MAX_ENCRYPTED_RECORD_PLAINTEXT - CHUNK_HEADER;
         let total = message.len().div_ceil(chunk_size).max(1);
-        for (index, data) in message.chunks(chunk_size).enumerate() {
+        for index in 0..total {
+            let start = index * chunk_size;
+            let end = (start + chunk_size).min(message.len());
+            let data = &message[start..end];
             let mut plaintext = Vec::with_capacity(CHUNK_HEADER + data.len());
             plaintext.extend_from_slice(&message_id);
             plaintext.extend_from_slice(&(index as u16).to_be_bytes());
@@ -314,4 +317,100 @@ async fn receive_relay(
         bail!("invalid relay handshake frame");
     }
     Ok(frame.ciphertext)
+}
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+    use mews_relay::RelayError;
+    use tokio::sync::mpsc;
+
+    use super::*;
+
+    struct MemoryRelay {
+        sender: mpsc::Sender<RelayFrame>,
+        receiver: mpsc::Receiver<RelayFrame>,
+    }
+
+    #[async_trait]
+    impl RelayLink for MemoryRelay {
+        async fn send_frame(&self, frame: RelayFrame) -> Result<(), RelayError> {
+            self.sender
+                .send(frame)
+                .await
+                .map_err(|_| RelayError::DestinationOffline)
+        }
+
+        async fn receive_frame(&mut self) -> Option<RelayFrame> {
+            self.receiver.recv().await
+        }
+    }
+
+    fn relay_pair() -> (MemoryRelay, MemoryRelay) {
+        let (left_sender, right_receiver) = mpsc::channel(8);
+        let (right_sender, left_receiver) = mpsc::channel(8);
+        (
+            MemoryRelay {
+                sender: left_sender,
+                receiver: left_receiver,
+            },
+            MemoryRelay {
+                sender: right_sender,
+                receiver: right_receiver,
+            },
+        )
+    }
+
+    fn encrypted_peer_pair() -> (EncryptedRelayPeer, EncryptedRelayPeer) {
+        let root = tempfile::tempdir().unwrap();
+        let left_identity = NoiseIdentity::load_or_create(&root.path().join("left.noise")).unwrap();
+        let right_identity =
+            NoiseIdentity::load_or_create(&root.path().join("right.noise")).unwrap();
+        let mut left = NoiseHandshake::initiator(&left_identity, b"test-prologue").unwrap();
+        let mut right = NoiseHandshake::responder(&right_identity, b"test-prologue").unwrap();
+        let message = left.write(b"").unwrap();
+        right.read(&message).unwrap();
+        let message = right.write(b"").unwrap();
+        left.read(&message).unwrap();
+        let message = left.write(b"").unwrap();
+        right.read(&message).unwrap();
+
+        let installation_id = InstallationId::new();
+        let left_id = RelayPeerId::new("left").unwrap();
+        let right_id = RelayPeerId::new("right").unwrap();
+        let (left_relay, right_relay) = relay_pair();
+        (
+            EncryptedRelayPeer {
+                relay: Box::new(left_relay),
+                transport: left.into_transport().unwrap(),
+                installation_id: installation_id.clone(),
+                local_peer: left_id.clone(),
+                remote_peer: right_id.clone(),
+                subject_id: "test".into(),
+                send_sequence: 0,
+                receive_sequence: 0,
+            },
+            EncryptedRelayPeer {
+                relay: Box::new(right_relay),
+                transport: right.into_transport().unwrap(),
+                installation_id,
+                local_peer: right_id,
+                remote_peer: left_id,
+                subject_id: "test".into(),
+                send_sequence: 0,
+                receive_sequence: 0,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn empty_message_is_a_distinct_encrypted_record() {
+        let (mut sender, mut receiver) = encrypted_peer_pair();
+
+        sender.send_bytes(&[]).await.unwrap();
+        assert_eq!(receiver.receive_bytes().await.unwrap(), Vec::<u8>::new());
+
+        sender.send_bytes(b"next").await.unwrap();
+        assert_eq!(receiver.receive_bytes().await.unwrap(), b"next");
+    }
 }

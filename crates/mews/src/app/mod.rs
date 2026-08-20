@@ -78,9 +78,6 @@ mod turns;
 pub(crate) use turns::StartedTurn;
 
 #[cfg(test)]
-use sessions::{parse_prompt_arguments, substitute_prompt_arguments};
-
-#[cfg(test)]
 impl Mews {
     fn test_commands(&mut self) -> MewsCommands<'_> {
         self.commands(CommandContext::system())
@@ -694,18 +691,5 @@ mod tests {
         let recovered = Mews::open(root.path()).unwrap().installation().unwrap();
         assert_eq!(recovered.hub_host_id, original);
         assert_eq!(recovered.generation, 3);
-    }
-
-    #[test]
-    fn prompt_arguments_expand_supported_placeholders() {
-        let arguments = parse_prompt_arguments("Button \"click handler\" optional");
-        assert_eq!(arguments, ["Button", "click handler", "optional"]);
-        assert_eq!(
-            substitute_prompt_arguments(
-                "$1 | $2 | $@ | ${3:-fallback} | ${4:-fallback} | ${@:2:2}",
-                &arguments,
-            ),
-            "Button | click handler | Button click handler optional | optional | fallback | click handler optional"
-        );
     }
 }

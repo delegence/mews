@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::Result;
 use async_trait::async_trait;
-use mews_protocol::ToolDefinition;
+use mews_protocol::ToolCatalogSnapshot;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Notify;
@@ -20,6 +20,10 @@ pub struct ToolCall {
     pub arguments: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thought_signature: Option<String>,
+    /// Host catalog generation whose schema the model used for this call.
+    /// This is execution metadata, not part of hook or conversation payloads.
+    #[serde(skip)]
+    pub catalog_generation: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -77,7 +81,6 @@ pub struct ContextDocument {
 pub struct ContextSnapshot {
     pub documents: Vec<ContextDocument>,
     pub skills: Vec<ResourceDescriptor>,
-    pub prompts: Vec<ResourceDescriptor>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,19 +183,21 @@ pub trait ProgressReporter {
     async fn report(&self, progress: Value) -> Result<()>;
 }
 
-/// Everything the generic harness may observe or invoke outside the model.
+/// Agent-plane capabilities exposed by a Host to a generic Harness.
+///
+/// This boundary deliberately excludes platform-plane authority: Hub
+/// ownership, durable transactions, journal projection, delivery, enrollment,
+/// transport security, and recovery cannot be supplied or replaced by an
+/// Agent or extension.
 #[async_trait]
 pub trait AgentCapabilities: Send + Sync {
     async fn context(&self, agent_slug: &str, cwd: &Path) -> Result<ContextSnapshot>;
-    async fn read_prompt(&self, _cwd: &Path, _name: &str) -> Result<Option<String>> {
-        Ok(None)
-    }
-    fn tools(&self) -> Vec<ToolDefinition>;
+    fn tools(&self) -> ToolCatalogSnapshot;
     /// Agent extensions are distinct from the native MEWS tools. External
     /// Harnesses receive only the selected Agent's catalog through MCP.
     /// Returning no tools by default is intentionally least-authority.
-    fn extension_tools(&self, _agent_id: &mews_protocol::AgentId) -> Vec<ToolDefinition> {
-        Vec::new()
+    fn extension_tools(&self, _agent_id: &mews_protocol::AgentId) -> ToolCatalogSnapshot {
+        ToolCatalogSnapshot::default()
     }
     async fn execute(
         &self,
@@ -209,6 +214,7 @@ pub trait AgentCapabilities: Send + Sync {
         payload: Value,
         cwd: &Path,
         cancellation: &CancellationToken,
+        catalog_generation: Option<u64>,
     ) -> Result<Value>;
 }
 

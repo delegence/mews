@@ -48,7 +48,7 @@ impl ProviderRegistry {
         Self {
             root,
             catalog_lock: tokio::sync::Mutex::new(()),
-            client: Client::new(),
+            client: crate::http::client(),
             adapters,
         }
     }

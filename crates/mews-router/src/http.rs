@@ -1,11 +1,27 @@
 use futures_util::StreamExt;
-use reqwest::{RequestBuilder, Response, StatusCode};
+use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
+use std::time::Duration;
 
 use crate::{ProviderError, ProviderResult};
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
+const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const PROVIDER_IDLE_READ_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+pub(crate) fn client() -> Client {
+    client_with_timeouts(PROVIDER_CONNECT_TIMEOUT, PROVIDER_IDLE_READ_TIMEOUT)
+}
+
+fn client_with_timeouts(connect_timeout: Duration, read_timeout: Duration) -> Client {
+    // Reqwest resets this read deadline after each frame, so active streams have no total limit.
+    Client::builder()
+        .connect_timeout(connect_timeout)
+        .read_timeout(read_timeout)
+        .build()
+        .expect("provider HTTP client configuration is valid")
+}
 
 pub(crate) async fn send_with_retry(request: RequestBuilder) -> ProviderResult<Response> {
     let response = request
@@ -191,5 +207,52 @@ mod tests {
 
         assert!(error.to_string().contains("exceeds 65536 bytes"));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_response_body_times_out_and_closes_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut byte = [0_u8; 1];
+            stream.read(&mut byte).await
+        });
+        let response = send_with_retry(
+            client_with_timeouts(Duration::from_secs(1), Duration::from_millis(50))
+                .get(format!("http://{address}")),
+        )
+        .await
+        .unwrap();
+
+        let error = response_json::<serde_json::Value>(response)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ProviderError::Http(_)));
+        let closed = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(closed, Ok(0))
+                || matches!(
+                    closed,
+                    Err(ref error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                        )
+                ),
+            "provider connection remained open: {closed:?}"
+        );
     }
 }
